@@ -19,3 +19,4 @@ Idea: apply a self-supervised classification
 
  - [Lochner and Rudnick 2025](https://iopscience.iop.org/article/10.3847/1538-3881/ada14c): BYOL applied on MGCLS data.
  - [Perez et al. 2025](https://www.aanda.org/articles/aa/full_html/2025/07/aa54735-25/aa54735-25.html): SimCLR applied to LoTSS-DR2 data.
+# Test
