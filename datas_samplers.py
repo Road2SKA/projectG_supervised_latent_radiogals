@@ -12,7 +12,7 @@ def weights_ponderate(pi):
     return weights/weights.sum()
 
 
-class CustomImageDataset(Dataset):
+class BYOLSupDataset(Dataset):
     def __init__(self, tags_file, img_data, transform=None, target_transform=None,
                  weightfunc=weights_closest):
         self.all_labels = pd.read_csv(tags_file)
