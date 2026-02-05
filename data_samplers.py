@@ -28,7 +28,7 @@ class BYOLSupDataset(Dataset):
         self.p_pair_from_class = p_pair_from_class
 
     def __len__(self):
-        return len(self.all_labels.shape[0])
+        return self.all_labels.shape[0]
 
     def __getitem__(self, idx):
         img = self.img_data[idx]
