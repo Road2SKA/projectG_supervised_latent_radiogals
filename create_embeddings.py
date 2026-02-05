@@ -52,7 +52,7 @@ def parse_args():
     
     # Data configuration
     ap.add_argument("--data-dir", type=Path, 
-                    default=Path('/users/markusbredberg/workspace/projectG_supervised_latent_radiogals'),
+                    default=Path('/idia/projects/roadtoska/projectG/projectG_supervised_latent_radiogals'),
                     help="Root directory containing images.npy and labels.npy")
     ap.add_argument("--dataset", type=str, default="LOTSS",
                     choices=["LOTSS", "MOCK"],
@@ -83,7 +83,7 @@ def parse_args():
     
     # Output configuration
     ap.add_argument("--output-dir", type=Path,
-                    default=Path('/users/markusbredberg/workspace/projectG_supervised_latent_radiogals/outputs'),
+                    default=Path('/idia/projects/roadtoska/projectG/projectG_supervised_latent_radiogals/outputs'),
                     help="Base output directory for checkpoints and embeddings")
     ap.add_argument("--run-name", type=str, default=None,
                     help="Custom run name (default: timestamp)")
