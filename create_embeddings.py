@@ -40,8 +40,8 @@ def parse_args():
                     help="Batch size for training (default: 32)")
     ap.add_argument("--lr", type=float, default=3e-4,
                     help="Learning rate (default: 0.0003)")
-    ap.add_argument("--epochs", type=int, default=50,
-                    help="Number of training epochs (default: 50)")
+    ap.add_argument("--epochs", type=int, default=100,
+                    help="Number of training epochs (default: 100)")
     ap.add_argument("--ema-decay", type=float, default=0.996,
                     help="EMA decay rate for target network (default: 0.996)")
     
@@ -172,8 +172,8 @@ print(f"{'='*70}\n")
 # =============================================================================
 
 # Data paths
-IMAGES_PATH = DATA_DIR / 'images.npy'
-LABELS_PATH = DATA_DIR / 'labels.npy'
+IMAGES_PATH = DATA_DIR / 'data/images-ashley.npy'
+LABELS_PATH = DATA_DIR / 'data/labels.npy'
 
 print(f"Attempting to load {DATASET_NAME} data...")
 print(f"  Images: {IMAGES_PATH}")

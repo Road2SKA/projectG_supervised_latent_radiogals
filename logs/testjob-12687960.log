@@ -1,9 +1,0 @@
-✓ Using device: cuda
-  GPU: Tesla P100-PCIE-12GB
-  Memory: 12.78 GB
-Traceback (most recent call last):
-  File "/idia/users/markusbredberg/projectG_supervised_latent_radiogals/create_embeddings.py", line 145, in <module>
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-  File "/usr/lib/python3.10/pathlib.py", line 1175, in mkdir
-    self._accessor.mkdir(self, mode)
-PermissionError: [Errno 13] Permission denied: '/idia/projects/roadtoska/projectG/projectG_supervised_latent_radiogals/outputs/run_20260205_163401_wclosest_p0.5'
