@@ -20,29 +20,6 @@ from tqdm import tqdm
 import copy
 from sklearn.model_selection import train_test_split
 
-
-# =============================================================================
-# OUTPUT CONFIGURATION
-# =============================================================================
-# Set explicit output directory (not relative to execution location)
-OUTPUT_BASE = args.output_dir
-OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
-
-# Create run directory (timestamped or custom name)
-from datetime import datetime
-if args.run_name:
-    RUN_ID = args.run_name
-else:
-    RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if DATASET_NAME != "LOTSS":
-        RUN_ID += f"_{DATASET_NAME}"
-    RUN_ID += f"_w{args.weighting}_p{P_PAIR_FROM_CLASS}"
-
-OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-print(f"Output directory: {OUTPUT_DIR}")
-
 # =============================================================================
 # ARGUMENT PARSING
 # =============================================================================
@@ -118,7 +95,6 @@ HIDDEN_DIM = args.hidden_dim
 # Dataset configuration
 DATA_DIR = args.data_dir
 DATASET_NAME = args.dataset
-WEIGHTING_FUNC = weights_closest if args.weighting == "closest" else weights_ponderate
 P_PAIR_FROM_CLASS = args.prob
 
 # Data subsampling
@@ -127,10 +103,54 @@ MOCK_DATA_SIZE = args.subsample
 # Random seed
 SEED = args.seed
 torch.manual_seed(SEED)
-np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+    torch.backends.cudnn.deterministic = True
+
+# Force CUDA if available
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+    torch.cuda.set_device(0) # Use first GPU
+
+    print(f"✓ Using device: {device}")
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+    # Clear any existing GPU cache
+    torch.cuda.empty_cache()
+
+else:
+    device = torch.device('cpu')
+    print(f" CUDA not available, using CPU")
+    print(f"  This will be VERY slow and may crash with large batches")
+
+use_cuda = torch.cuda.is_available()
+
+
+# Set explicit output directory (not relative to execution location)
+OUTPUT_BASE = args.output_dir
+OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+
+# Create run directory (timestamped or custom name)
+from datetime import datetime
+if args.run_name:
+    RUN_ID = args.run_name
+else:
+    RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if DATASET_NAME != "LOTSS":
+        RUN_ID += f"_{DATASET_NAME}"
+    RUN_ID += f"_w{args.weighting}_p{P_PAIR_FROM_CLASS}"
+
+OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+checkpoint_path = OUTPUT_DIR / 'byol_model_best.pt'
 
 print(f"\n{'='*70}")
 print(f"CONFIGURATION")
+print(f"Output directory: {OUTPUT_DIR}")
+print(f" PyTorch version: {torch.__version__}")
+print(f" CUDA available: {torch.cuda.is_available()}")
+print(f" CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
 print(f"{'='*70}")
 print(f"Dataset:        {DATASET_NAME}")
 print(f"Data dir:       {DATA_DIR}")
@@ -144,6 +164,8 @@ print(f"Device:         {device}")
 if MOCK_DATA_SIZE:
     print(f"Subsampling:    {MOCK_DATA_SIZE} samples")
 print(f"{'='*70}\n")
+
+
 
 # =============================================================================
 # DATASET LOADING
@@ -164,7 +186,7 @@ if not LABELS_PATH.exists():
     raise FileNotFoundError(f"Labels file not found: {LABELS_PATH}")
 
 # Load data
-images = np.load(IMAGES_PATH)
+images = np.load(IMAGES_PATH).astype(np.float32)/255
 labels = np.load(LABELS_PATH)
 
 # Validate
@@ -228,6 +250,8 @@ def weights_ponderate(pi):
     """Weight function: inverse square distance weighting"""
     weights = 1/(pi-pi.min()+1).squeeze()**2
     return weights/weights.sum()
+
+WEIGHTING_FUNC = weights_closest if args.weighting == "closest" else weights_ponderate
 
 class BYOLSupDataset(Dataset):
     """
@@ -629,7 +653,7 @@ for epoch in range(NUM_EPOCHS):
             'optimizer_state_dict': optimizer.state_dict(),
             'epoch': NUM_EPOCHS,
             'best_val_loss': best_val_loss,
-            'test_loss': avg_test_loss,
+            'avg_val_loss': avg_val_loss,
             'history': history,
             'config': {
                 'batch_size': BATCH_SIZE,
@@ -695,11 +719,8 @@ history['test_loss'] = avg_test_loss
 # =============================================================================
 # SAVE MODEL AND HISTORY
 # =============================================================================
-output_dir = OUTPUT_DIR
-output_dir.mkdir(exist_ok=True)
 
 # Save model checkpoint
-checkpoint_path = output_dir / 'byol_model_best.pt'
 torch.save({
     'model_state_dict': best_model_state,
     'optimizer_state_dict': optimizer.state_dict(),
@@ -718,8 +739,8 @@ torch.save({
 print(f"✓ Model checkpoint saved to {checkpoint_path}")
 
 # Save training history
-np.save(output_dir / 'training_history.npy', history)
-print(f"✓ Training history saved to {output_dir / 'training_history.npy'}")
+np.save(OUTPUT_DIR / 'training_history.npy', history)
+print(f"✓ Training history saved to {OUTPUT_DIR / 'training_history.npy'}")
 
 # =============================================================================
 # EXTRACT EMBEDDINGS
@@ -789,7 +810,7 @@ print(f"    Embeddings: {test_embeddings.shape}")
 print(f"    Projections: {test_projections.shape}")
 
 # Save embeddings
-embeddings_dir = output_dir / 'embeddings'
+embeddings_dir = OUTPUT_DIR / 'embeddings'
 embeddings_dir.mkdir(exist_ok=True)
 
 np.save(embeddings_dir / 'train_embeddings.npy', train_embeddings)
@@ -804,7 +825,7 @@ print(f"\n✓ Embeddings saved to {embeddings_dir}/")
 print(f"\n{'='*70}")
 print(f"SCRIPT COMPLETE")
 print(f"{'='*70}")
-print(f"All outputs saved to: {output_dir.absolute()}")
+print(f"All outputs saved to: {OUTPUT_DIR.absolute()}")
 print(f"{'='*70}\n")
 
 # Save corresponding labels
