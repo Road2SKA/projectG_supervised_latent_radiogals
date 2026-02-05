@@ -14,13 +14,13 @@ def weights_ponderate(pi):
 
 class BYOLSupDataset(Dataset):
     def __init__(self, 
-                 tags_file, 
+                 tags_data, 
                  img_data, 
                  transform=None, 
                  friend_transform=None,
                  weightfunc=weights_closest,
                  p_pair_from_class=0.5):
-        self.all_labels = pd.read_csv(tags_file)
+        self.all_labels = tags_data
         self.img_data = img_data
         self.transform = transform
         self.friend_transform = friend_transform
