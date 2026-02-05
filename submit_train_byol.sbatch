@@ -10,7 +10,7 @@
 
 ## IF YOU WANT TO CHANGE WEIGHTING, PROB, ADD THESE OPTIONS TO THE PYTHON CALL:
 ## --weighting=my_choice --prob=my_value
-singularity exec /idia/software/containers/ASTRO-GPU-PyTorch.simg python create_embeddings.py --run-name=$1 --prob=0.5
+singularity exec /idia/software/containers/ASTRO-GPU-PyTorch.simg python create_embeddings.py --run-name=$1 --prob=1
 
 ## TO SUBMIT A JOB DO:
 ## sbatch submit_train_byol.sbatch <this_run_name>

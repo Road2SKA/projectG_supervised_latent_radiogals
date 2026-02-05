@@ -18,7 +18,108 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import copy
+import random
+from functools import wraps
 from sklearn.model_selection import train_test_split
+
+# =============================================================================
+# HELPER FUNCTIONS (from snippet)
+# =============================================================================
+
+def default(val, def_val):
+    """Return default value if val is None"""
+    return def_val if val is None else val
+
+def flatten(t):
+    """Flatten tensor to (batch_size, features)"""
+    return t.reshape(t.shape[0], -1)
+
+def singleton(cache_key):
+    """Decorator for singleton pattern - creates instance once and caches it"""
+    def inner_fn(fn):
+        @wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            instance = getattr(self, cache_key)
+            if instance is not None:
+                return instance
+            instance = fn(self, *args, **kwargs)
+            setattr(self, cache_key, instance)
+            return instance
+        return wrapper
+    return inner_fn
+
+def get_module_device(module):
+    """Get device of first parameter in module"""
+    return next(module.parameters()).device
+
+def set_requires_grad(model, val):
+    """Set requires_grad for all parameters in model"""
+    for p in model.parameters():
+        p.requires_grad = val
+
+# =============================================================================
+# AUGMENTATION UTILS (from snippet)
+# =============================================================================
+
+class RandomApply(nn.Module):
+    """Apply augmentation with probability p"""
+    def __init__(self, fn, p):
+        super().__init__()
+        self.fn = fn
+        self.p = p
+    
+    def forward(self, x):
+        if random.random() > self.p:
+            return x
+        return self.fn(x)
+
+# =============================================================================
+# EMA CLASS (from snippet)
+# =============================================================================
+
+class EMA():
+    """Exponential moving average updater"""
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+    
+    def update_average(self, old, new):
+        """Update EMA: new_avg = beta * old + (1 - beta) * new"""
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
+
+def update_moving_average(ema_updater, ma_model, current_model):
+    """Update all parameters in ma_model using EMA from current_model"""
+    for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+        old_weight, up_weight = ma_params.data, current_params.data
+        ma_params.data = ema_updater.update_average(old_weight, up_weight)
+
+# =============================================================================
+# MLP HEADS (from snippet)
+# =============================================================================
+
+def MLP(dim, projection_size, hidden_size=4096):
+    """Standard MLP projection head for BYOL"""
+    return nn.Sequential(
+        nn.Linear(dim, hidden_size),
+        nn.BatchNorm1d(hidden_size),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_size, projection_size)
+    )
+
+# =============================================================================
+# LOSS FUNCTION (from snippet)
+# =============================================================================
+
+def loss_fn(x, y):
+    """
+    BYOL loss: normalized MSE between prediction and target
+    Returns per-sample loss (not reduced)
+    """
+    x = F.normalize(x, dim=-1, p=2)
+    y = F.normalize(y, dim=-1, p=2)
+    return 2 - 2 * (x * y).sum(dim=-1)
 
 # =============================================================================
 # ARGUMENT PARSING
@@ -42,8 +143,8 @@ def parse_args():
                     help="Learning rate (default: 0.0003)")
     ap.add_argument("--epochs", type=int, default=100,
                     help="Number of training epochs (default: 100)")
-    ap.add_argument("--ema-decay", type=float, default=0.996,
-                    help="EMA decay rate for target network (default: 0.996)")
+    ap.add_argument("--ema-decay", type=float, default=0.99,
+                    help="EMA decay rate for target network (default: 0.99)")
     
     # Dataset pairing strategy
     ap.add_argument("--weighting", type=str, default="closest",
@@ -104,34 +205,32 @@ MOCK_DATA_SIZE = args.subsample
 SEED = args.seed
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed(SEED)
     torch.backends.cudnn.deterministic = True
 
 # Force CUDA if available
 if torch.cuda.is_available():
     device = torch.device('cuda')
-    torch.cuda.set_device(0) # Use first GPU
+    torch.cuda.set_device(0)
 
     print(f"✓ Using device: {device}")
     print(f"  GPU: {torch.cuda.get_device_name(0)}")
     print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
-    # Clear any existing GPU cache
     torch.cuda.empty_cache()
 
 else:
     device = torch.device('cpu')
-    print(f" CUDA not available, using CPU")
+    print(f"⚠ CUDA not available, using CPU")
     print(f"  This will be VERY slow and may crash with large batches")
 
 use_cuda = torch.cuda.is_available()
 
-
-# Set explicit output directory (not relative to execution location)
+# Set explicit output directory
 OUTPUT_BASE = args.output_dir
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
-# Create run directory (timestamped or custom name)
+# Create run directory
 from datetime import datetime
 if args.run_name:
     RUN_ID = args.run_name
@@ -148,9 +247,9 @@ checkpoint_path = OUTPUT_DIR / 'byol_model_best.pt'
 print(f"\n{'='*70}")
 print(f"CONFIGURATION")
 print(f"Output directory: {OUTPUT_DIR}")
-print(f" PyTorch version: {torch.__version__}")
-print(f" CUDA available: {torch.cuda.is_available()}")
-print(f" CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
 print(f"{'='*70}")
 print(f"Dataset:        {DATASET_NAME}")
 print(f"Data dir:       {DATA_DIR}")
@@ -164,8 +263,6 @@ print(f"Device:         {device}")
 if MOCK_DATA_SIZE:
     print(f"Subsampling:    {MOCK_DATA_SIZE} samples")
 print(f"{'='*70}\n")
-
-
 
 # =============================================================================
 # DATASET LOADING
@@ -194,14 +291,14 @@ assert len(images) == len(labels), f"Mismatch: {len(images)} images, {len(labels
 assert images.ndim == 3, f"Expected 3D images, got {images.ndim}D: {images.shape}"
 assert images.shape[1] == images.shape[2] == 89, f"Expected 89×89, got {images.shape[1:3]}"
 
-# CPU mode: subsample for speed
+# Subsample if requested
 if MOCK_DATA_SIZE is not None and len(images) > MOCK_DATA_SIZE:
-    print(f"\n⚠ CPU mode: Subsampling {MOCK_DATA_SIZE}/{len(images)} samples")
+    print(f"\n⚠ Subsampling {MOCK_DATA_SIZE}/{len(images)} samples")
     indices = np.random.choice(len(images), MOCK_DATA_SIZE, replace=False)
     images = images[indices]
     labels = labels[indices]
 
-print(f"\n✓ Real data loaded")
+print(f"\n✓ Data loaded")
 print(f"  Images: {images.shape} ({images.dtype})")
 print(f"  Labels: {labels.shape} ({labels.dtype})")
 print(f"  Range: [{images.min():.2f}, {images.max():.2f}]")
@@ -292,7 +389,7 @@ class BYOLSupDataset(Dataset):
             img_friend = self.img_data[idx_friend]
         else:
             # Use same image (will be augmented differently)
-            img_friend = img.copy()  # Copy to avoid in-place modification
+            img_friend = img.copy()
             mdist = 0.0
         
         # Convert numpy arrays to tensors BEFORE transforms
@@ -308,33 +405,30 @@ class BYOLSupDataset(Dataset):
         return img, img_friend, mdist
 
 # =============================================================================
-# CREATE DATASETS
+# CREATE DATASETS WITH SNIPPET-STYLE AUGMENTATIONS
 # =============================================================================
 print("\nCreating datasets...")
 
-# Convert numpy arrays to DataFrames (required by BYOLSupDataset)
+# Convert numpy arrays to DataFrames
 train_labels_df = pd.DataFrame(train_labels)
 val_labels_df = pd.DataFrame(val_labels)
 test_labels_df = pd.DataFrame(test_labels)
 
 print(f"  Converted labels to DataFrames")
 
-# Transforms
-base_transform = T.Compose([
-    # Empty - tensors already created in __getitem__
-])
-
-byol_strong_aug = T.Compose([
+# Default augmentation from snippet (adapted for greyscale)
+# Note: ColorJitter and Normalize are designed for RGB, so we skip them for greyscale
+DEFAULT_AUG = torch.nn.Sequential(
     T.RandomHorizontalFlip(),
     T.RandomVerticalFlip(),
     T.RandomRotation(180),
-])
+)
 
 train_dataset = BYOLSupDataset(
     tags_data=train_labels_df,
     img_data=train_images,
-    transform=base_transform,
-    friend_transform=byol_strong_aug,
+    transform=DEFAULT_AUG,
+    friend_transform=DEFAULT_AUG,
     weightfunc=WEIGHTING_FUNC,
     p_pair_from_class=P_PAIR_FROM_CLASS
 )
@@ -342,8 +436,8 @@ train_dataset = BYOLSupDataset(
 val_dataset = BYOLSupDataset(
     tags_data=val_labels_df,
     img_data=val_images,
-    transform=base_transform,
-    friend_transform=byol_strong_aug,
+    transform=DEFAULT_AUG,
+    friend_transform=DEFAULT_AUG,
     weightfunc=WEIGHTING_FUNC,  
     p_pair_from_class=P_PAIR_FROM_CLASS
 )
@@ -351,13 +445,13 @@ val_dataset = BYOLSupDataset(
 test_dataset = BYOLSupDataset(
     tags_data=test_labels_df,
     img_data=test_images,
-    transform=base_transform,
-    friend_transform=byol_strong_aug,
+    transform=DEFAULT_AUG,
+    friend_transform=DEFAULT_AUG,
     weightfunc=WEIGHTING_FUNC,
     p_pair_from_class=P_PAIR_FROM_CLASS
 )
 
-# DATA LOADERS 
+# DATA LOADERS
 train_loader = DataLoader(
     train_dataset, batch_size=BATCH_SIZE,
     shuffle=True, num_workers=4 if use_cuda else 0,
@@ -377,7 +471,7 @@ test_loader = DataLoader(
 )
 
 print(f"\n{'='*70}")
-print(f"✓ REAL DATA LOADED")
+print(f"✓ DATA LOADED")
 print(f"{'='*70}")
 print(f"Train: {len(train_loader)} batches × {BATCH_SIZE}")
 print(f"Val:   {len(val_loader)} batches × {BATCH_SIZE}")
@@ -390,7 +484,7 @@ print(f"✓ Test batch: {x1.shape}, {x2.shape}")
 print(f"  Different: {not torch.allclose(x1, x2)}")
 
 # =============================================================================
-# MODEL ARCHITECTURE
+# BASE ENCODER (ResNet-style for 89x89 greyscale)
 # =============================================================================
 class BYOLEncoder(nn.Module):
     """ResNet-style encoder for 89x89 greyscale images"""
@@ -402,14 +496,14 @@ class BYOLEncoder(nn.Module):
         self.bn1 = nn.BatchNorm2d(64)
         
         # Residual blocks: 45x45 -> 23x23 -> 12x12 -> 6x6
-        self.layer1 = self._make_layer(64, 128, stride=2)   # 23x23
-        self.layer2 = self._make_layer(128, 256, stride=2)  # 12x12
-        self.layer3 = self._make_layer(256, 512, stride=2)  # 6x6
+        self.layer1 = self._make_layer(64, 128, stride=2)
+        self.layer2 = self._make_layer(128, 256, stride=2)
+        self.layer3 = self._make_layer(256, 512, stride=2)
         
         # Global pooling: 6x6 -> 1x1
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         
-        # Final projection
+        # Final projection to match expected feature dimension
         self.fc = nn.Linear(512, 1280)
         
     def _make_layer(self, in_channels, out_channels, stride=1):
@@ -440,109 +534,170 @@ class BYOLEncoder(nn.Module):
         x = self.fc(x)
         return x
 
-
-class MLPHead(nn.Module):
-    """MLP projection/prediction head"""
-    def __init__(self, in_dim=1280, hidden_dim=4096, out_dim=256):
+# =============================================================================
+# NET WRAPPER (from snippet - adapted for direct encoder)
+# =============================================================================
+class NetWrapper(nn.Module):
+    """
+    Wrapper for base network following snippet pattern.
+    Manages projection head and representation extraction.
+    """
+    def __init__(self, net, projection_size, projection_hidden_size):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim)
-        )
+        self.net = net
+        self.projector = None
+        self.projection_size = projection_size
+        self.projection_hidden_size = projection_hidden_size
     
-    def forward(self, x):
+    @singleton('projector')
+    def _get_projector(self, hidden):
+        """Create projector on first forward pass (singleton pattern)"""
+        _, dim = hidden.shape
+        projector = MLP(dim, self.projection_size, self.projection_hidden_size)
+        return projector.to(hidden)
+    
+    def get_representation(self, x):
+        """Extract features from encoder"""
         return self.net(x)
+    
+    def forward(self, x, return_projection=True):
+        """
+        Forward pass through encoder and optionally projector.
+        
+        Args:
+            x: Input tensor
+            return_projection: If True, return (projection, representation)
+                             If False, return representation only
+        
+        Returns:
+            If return_projection=True: (projection, representation) tuple
+            If return_projection=False: representation tensor
+        """
+        representation = self.get_representation(x)
+        
+        if not return_projection:
+            return representation
+        
+        # Get or create projector (singleton pattern ensures single creation)
+        projector = self._get_projector(representation)
+        projection = projector(representation)
+        return projection, representation
 
-
+# =============================================================================
+# BYOL MODEL (following snippet architecture exactly)
+# =============================================================================
 class BYOL(nn.Module):
-    """Bootstrap Your Own Latent (BYOL) model"""
-    def __init__(self, encoder, projection_dim=256, hidden_dim=4096):
+    """
+    Bootstrap Your Own Latent (BYOL) following original implementation.
+    Uses EMA for target network update.
+    """
+    def __init__(
+        self,
+        net,
+        image_size,
+        projection_size=256,
+        projection_hidden_size=4096,
+        moving_average_decay=0.99,
+        use_momentum=True
+    ):
         super().__init__()
+        self.net = net
         
-        # Online network
-        self.online_encoder = encoder
-        self.online_projector = MLPHead(
-            in_dim=1280, hidden_dim=hidden_dim, out_dim=projection_dim
+        # Online encoder with projection head
+        self.online_encoder = NetWrapper(
+            net,
+            projection_size,
+            projection_hidden_size
         )
-        self.online_predictor = MLPHead(
-            in_dim=projection_dim, hidden_dim=hidden_dim, out_dim=projection_dim
-        )
         
-        # Target network (EMA of online)
-        self.target_encoder = copy.deepcopy(self.online_encoder)
-        self.target_projector = copy.deepcopy(self.online_projector)
+        # Target encoder (EMA of online)
+        self.use_momentum = use_momentum
+        self.target_encoder = None
+        self.target_ema_updater = EMA(moving_average_decay)
         
-        # Freeze target network
-        for param in self.target_encoder.parameters():
-            param.requires_grad = False
-        for param in self.target_projector.parameters():
-            param.requires_grad = False
+        # Predictor (only for online network)
+        self.online_predictor = MLP(projection_size, projection_size, projection_hidden_size)
+        
+        # Move to correct device
+        device = get_module_device(net)
+        self.to(device)
+        
+        # Initialize singleton parameters with mock forward pass
+        self.forward(torch.randn(2, 1, image_size, image_size, device=device))
     
-    def forward(self, x1, x2):
+    @singleton('target_encoder')
+    def _get_target_encoder(self):
+        """Create target encoder as deepcopy of online encoder (singleton)"""
+        target_encoder = copy.deepcopy(self.online_encoder)
+        set_requires_grad(target_encoder, False)
+        return target_encoder
+    
+    def reset_moving_average(self):
+        """Reset target encoder (forces recreation on next forward)"""
+        del self.target_encoder
+        self.target_encoder = None
+    
+    def update_moving_average(self):
+        """Update target network using EMA"""
+        assert self.use_momentum, 'you do not need to update the moving average, since you have turned off momentum for the target encoder'
+        assert self.target_encoder is not None, 'target encoder has not been created yet'
+        update_moving_average(self.target_ema_updater, self.target_encoder, self.online_encoder)
+    
+    def forward(self, x, return_embedding=False, return_projection=True):
         """
-        Forward pass for two augmented views.
-        Returns: predictions (p1, p2) and targets (t1, t2)
+        Forward pass for BYOL.
+        
+        Args:
+            x: Input batch (can be single view or will be augmented internally)
+            return_embedding: If True, return embeddings instead of loss
+            return_projection: If True (with return_embedding), return projections too
+        
+        Returns:
+            If return_embedding=True: (projection, representation) or representation
+            If return_embedding=False: BYOL loss (scalar)
         """
-        # Online network
-        z1 = self.online_encoder(x1)
-        z2 = self.online_encoder(x2)
+        # If requesting embeddings, just return from online encoder
+        if return_embedding:
+            return self.online_encoder(x, return_projection=return_projection)
         
-        proj1 = self.online_projector(z1)
-        proj2 = self.online_projector(z2)
+        # Training mode: x should be concatenated pair [view1; view2]
+        assert not (self.training and x.shape[0] == 1), 'you must have greater than 1 sample when training, due to the batchnorm in the projection layer'
         
-        p1 = self.online_predictor(proj1)
-        p2 = self.online_predictor(proj2)
+        # Forward through online network
+        online_projections, _ = self.online_encoder(x)
+        online_predictions = self.online_predictor(online_projections)
         
-        # Target network (no gradients)
+        # Split predictions into two views
+        online_pred_one, online_pred_two = online_predictions.chunk(2, dim=0)
+        
+        # Forward through target network (no gradients)
         with torch.no_grad():
-            t1 = self.target_projector(self.target_encoder(x1))
-            t2 = self.target_projector(self.target_encoder(x2))
+            target_encoder = self._get_target_encoder() if self.use_momentum else self.online_encoder
+            target_projections, _ = target_encoder(x)
+            target_projections = target_projections.detach()
+            
+            target_proj_one, target_proj_two = target_projections.chunk(2, dim=0)
         
-        return p1, p2, t1, t2
-    
-    @torch.no_grad()
-    def update_target_network(self, momentum=0.996):
-        """EMA update of target network"""
-        for online_params, target_params in zip(
-            self.online_encoder.parameters(), self.target_encoder.parameters()
-        ):
-            target_params.data = (
-                momentum * target_params.data + (1 - momentum) * online_params.data
-            )
+        # Compute symmetric loss: predict1 -> target2, predict2 -> target1
+        loss_one = loss_fn(online_pred_one, target_proj_two.detach())
+        loss_two = loss_fn(online_pred_two, target_proj_one.detach())
         
-        for online_params, target_params in zip(
-            self.online_projector.parameters(), self.target_projector.parameters()
-        ):
-            target_params.data = (
-                momentum * target_params.data + (1 - momentum) * online_params.data
-            )
-
-
-def byol_loss(p1, p2, t1, t2):
-    """
-    BYOL loss: normalized MSE between predictions and targets.
-    Symmetric: loss(p1, t2) + loss(p2, t1)
-    """
-    # Normalize
-    p1 = F.normalize(p1, dim=-1, p=2)
-    p2 = F.normalize(p2, dim=-1, p=2)
-    t1 = F.normalize(t1, dim=-1, p=2)
-    t2 = F.normalize(t2, dim=-1, p=2)
-    
-    # MSE loss
-    loss = (2 - 2 * (p1 * t2).sum(dim=-1)).mean() + \
-           (2 - 2 * (p2 * t1).sum(dim=-1)).mean()
-    
-    return loss
+        loss = loss_one + loss_two
+        return loss.mean()
 
 # =============================================================================
 # MODEL INITIALIZATION
 # =============================================================================
 print("\nInitializing model...")
 encoder = BYOLEncoder()
-model = BYOL(encoder, projection_dim=PROJECTION_DIM, hidden_dim=HIDDEN_DIM)
+model = BYOL(
+    encoder, 
+    image_size=89,
+    projection_size=PROJECTION_DIM, 
+    projection_hidden_size=HIDDEN_DIM,
+    moving_average_decay=EMA_DECAY,
+    use_momentum=True
+)
 model = model.to(device)
 
 # Count parameters
@@ -555,7 +710,8 @@ print(f"{'='*70}")
 print(f"Total parameters:     {total_params:,}")
 print(f"Trainable parameters: {trainable_params:,}")
 print(f"Encoder output dim:   1280")
-print(f"Projection dim:       256")
+print(f"Projection dim:       {PROJECTION_DIM}")
+print(f"Hidden dim:           {HIDDEN_DIM}")
 print(f"{'='*70}\n")
 
 if use_cuda:
@@ -580,7 +736,7 @@ best_model_state = None
 
 print(f"✓ Optimizer: Adam (lr={LEARNING_RATE})")
 print(f"✓ Scheduler: CosineAnnealingLR (T_max={NUM_EPOCHS})")
-print(f"✓ Loss: BYOL symmetric MSE")
+print(f"✓ Loss: BYOL symmetric MSE (from snippet)")
 
 # =============================================================================
 # TRAINING LOOP
@@ -600,17 +756,19 @@ for epoch in range(NUM_EPOCHS):
     for x1, x2, _ in pbar:
         x1, x2 = x1.to(device), x2.to(device)
         
-        # Forward pass
-        p1, p2, t1, t2 = model(x1, x2)
-        loss = byol_loss(p1, p2, t1, t2)
+        # Concatenate views as expected by snippet's forward method
+        images = torch.cat((x1, x2), dim=0)
+        
+        # Forward pass (returns loss directly)
+        loss = model(images)
         
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
-        # Update target network
-        model.update_target_network(momentum=EMA_DECAY)
+        # Update target network using EMA
+        model.update_moving_average()
         
         # Track loss
         train_loss += loss.item()
@@ -627,8 +785,8 @@ for epoch in range(NUM_EPOCHS):
     with torch.no_grad():
         for x1, x2, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]  ", leave=False):
             x1, x2 = x1.to(device), x2.to(device)
-            p1, p2, t1, t2 = model(x1, x2)
-            val_loss += byol_loss(p1, p2, t1, t2).item()
+            images = torch.cat((x1, x2), dim=0)
+            val_loss += model(images).item()
     
     avg_val_loss = val_loss / len(val_loader)
     
@@ -645,13 +803,13 @@ for epoch in range(NUM_EPOCHS):
     print(f"  Val Loss:   {avg_val_loss:.4f}")
     print(f"  LR:         {current_lr:.6f}")
     
-    # Save checkpoint every 10 epochs
-    if (epoch + 1) % 10 == 0:
+    # Save checkpoint periodically
+    if (epoch + 1) % args.checkpoint_freq == 0:
         checkpoint_periodic = OUTPUT_DIR / f'checkpoint_epoch_{epoch+1}.pt'
         torch.save({
-            'model_state_dict': best_model_state,
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'epoch': NUM_EPOCHS,
+            'epoch': epoch + 1,
             'best_val_loss': best_val_loss,
             'avg_val_loss': avg_val_loss,
             'history': history,
@@ -666,7 +824,7 @@ for epoch in range(NUM_EPOCHS):
                 'p_pair_from_class': P_PAIR_FROM_CLASS,
                 'dataset': DATASET_NAME,
             }
-        }, checkpoint_path)
+        }, checkpoint_periodic)
         print(f"  Checkpoint saved: {checkpoint_periodic}")
     
     # Save best model
@@ -700,8 +858,8 @@ test_loss = 0.0
 with torch.no_grad():
     for x1, x2, _ in tqdm(test_loader, desc="Test"):
         x1, x2 = x1.to(device), x2.to(device)
-        p1, p2, t1, t2 = model(x1, x2)
-        test_loss += byol_loss(p1, p2, t1, t2).item()
+        images = torch.cat((x1, x2), dim=0)
+        test_loss += model(images).item()
 
 avg_test_loss = test_loss / len(test_loader)
 
@@ -720,7 +878,7 @@ history['test_loss'] = avg_test_loss
 # SAVE MODEL AND HISTORY
 # =============================================================================
 
-# Save model checkpoint
+# Save final model checkpoint
 torch.save({
     'model_state_dict': best_model_state,
     'optimizer_state_dict': optimizer.state_dict(),
@@ -733,6 +891,11 @@ torch.save({
         'learning_rate': LEARNING_RATE,
         'num_epochs': NUM_EPOCHS,
         'ema_decay': EMA_DECAY,
+        'projection_dim': PROJECTION_DIM,
+        'hidden_dim': HIDDEN_DIM,
+        'weighting': args.weighting,
+        'p_pair_from_class': P_PAIR_FROM_CLASS,
+        'dataset': DATASET_NAME,
     }
 }, checkpoint_path)
 
@@ -751,7 +914,7 @@ def extract_embeddings_from_loader(model, dataloader, max_batches=None):
     
     Args:
         model: Trained BYOL model
-        dataloader: DataLoader that yields (x1, x2, mdist) tuples
+        dataloader: DataLoader yielding (x1, x2, mdist) tuples
         max_batches: Limit number of batches (None = all)
     
     Returns:
@@ -768,12 +931,11 @@ def extract_embeddings_from_loader(model, dataloader, max_batches=None):
             if max_batches and batch_idx >= max_batches:
                 break
             
-            # Use x1 (could use x2, doesn't matter - just need features)
+            # Use x1 (either view works for feature extraction)
             x1 = x1.to(device)
             
-            # Extract features
-            features = model.online_encoder(x1)       # (B, 1280)
-            projections = model.online_projector(features)  # (B, 256)
+            # Extract features using return_embedding=True
+            projections, features = model(x1, return_embedding=True, return_projection=True)
             
             all_embeddings.append(features.cpu().numpy())
             all_projections.append(projections.cpu().numpy())
@@ -785,7 +947,7 @@ def extract_embeddings_from_loader(model, dataloader, max_batches=None):
 
 print("\nExtracting embeddings from DataLoaders...")
 
-# Extract from train loader (all batches)
+# Extract from train loader
 print("\n  Train set:")
 train_embeddings, train_projections = extract_embeddings_from_loader(
     model, train_loader, max_batches=None
@@ -820,6 +982,11 @@ np.save(embeddings_dir / 'val_projections.npy', val_projections)
 np.save(embeddings_dir / 'test_embeddings.npy', test_embeddings)
 np.save(embeddings_dir / 'test_projections.npy', test_projections)
 
+# Save corresponding labels
+np.save(embeddings_dir / 'train_labels.npy', train_labels[:len(train_embeddings)])
+np.save(embeddings_dir / 'val_labels.npy', val_labels[:len(val_embeddings)])
+np.save(embeddings_dir / 'test_labels.npy', test_labels[:len(test_embeddings)])
+
 print(f"\n✓ Embeddings saved to {embeddings_dir}/")
 
 print(f"\n{'='*70}")
@@ -827,8 +994,3 @@ print(f"SCRIPT COMPLETE")
 print(f"{'='*70}")
 print(f"All outputs saved to: {OUTPUT_DIR.absolute()}")
 print(f"{'='*70}\n")
-
-# Save corresponding labels
-np.save(embeddings_dir / 'train_labels.npy', train_labels[:len(train_embeddings)])
-np.save(embeddings_dir / 'val_labels.npy', val_labels[:len(val_embeddings)])
-np.save(embeddings_dir / 'test_labels.npy', test_labels[:len(test_embeddings)])
