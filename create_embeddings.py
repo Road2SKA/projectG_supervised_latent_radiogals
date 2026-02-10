@@ -2,6 +2,7 @@
 """
 BYOL Implementation for Radio Galaxy Classification
 Training script for SLURM GPU submission
+Supports both efficient and original (snippet-style) architectures
 """
 
 # =============================================================================
@@ -21,9 +22,11 @@ import copy
 import random
 from functools import wraps
 from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import umap
 
 # =============================================================================
-# HELPER FUNCTIONS (from snippet)
+# HELPER FUNCTIONS (for original model)
 # =============================================================================
 
 def default(val, def_val):
@@ -58,7 +61,7 @@ def set_requires_grad(model, val):
         p.requires_grad = val
 
 # =============================================================================
-# AUGMENTATION UTILS (from snippet)
+# AUGMENTATION UTILS
 # =============================================================================
 
 class RandomApply(nn.Module):
@@ -74,7 +77,7 @@ class RandomApply(nn.Module):
         return self.fn(x)
 
 # =============================================================================
-# EMA CLASS (from snippet)
+# EMA CLASS (for original model)
 # =============================================================================
 
 class EMA():
@@ -96,7 +99,7 @@ def update_moving_average(ema_updater, ma_model, current_model):
         ma_params.data = ema_updater.update_average(old_weight, up_weight)
 
 # =============================================================================
-# MLP HEADS (from snippet)
+# MLP HEADS
 # =============================================================================
 
 def MLP(dim, projection_size, hidden_size=4096, bn_momentum=0.1):
@@ -109,7 +112,7 @@ def MLP(dim, projection_size, hidden_size=4096, bn_momentum=0.1):
     )
 
 # =============================================================================
-# LOSS FUNCTION (from snippet)
+# LOSS FUNCTION (for original model)
 # =============================================================================
 
 def loss_fn(x, y):
@@ -128,17 +131,41 @@ def parse_args():
     """Parse command-line arguments for BYOL training configuration"""
     ap = argparse.ArgumentParser(description="BYOL training for radio galaxy classification")
     
+    # Random seed
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Random seed for reproducibility (default: 42)")
+    
     # Data configuration
     ap.add_argument("--data-dir", type=Path, 
-                    default=Path('/idia/projects/roadtoska/projectG/projectG_supervised_latent_radiogals'),
+                    default=Path('/users/mbredber/supervised_latent/'),
                     help="Root directory containing images.npy and labels.npy")
     ap.add_argument("--dataset", type=str, default="LOTSS",
                     choices=["LOTSS", "MOCK"],
                     help="Dataset to use: LOTSS (real data) or MOCK (synthetic data)")
     
     # Label configuration
-    ap.add_argument("--use-initial-only", action="store_true",
-                    help="Use only first 5 label indices (FRI, FRII, Hybrid, Spiral, Restart) instead of all 20")
+    ap.add_argument("--label-type", type=str, default="full",
+                    choices=["full", "initial", "morphology", "environment", "derived"],
+                    help="Label subset to use: 'full' (all 20), 'initial' (0-4: FRI, FRII, Hybrids, Spirals, Relaxed doubles), "
+                        "'morphology' (5-14: C-curve, S-curve, Misalignment, Wings, X-shaped, Straight jets, Multiple hotspots, "
+                        "Continuous jets, Banding, One-sided, Restarted), 'environment' (15-18: Cluster, Merger, Diffuse emission, Unknown), "
+                        "'derived' (19-23: Compact+hybrids, Hybrid FRI/FRII, Curved FRIs, Curved FRIIs, Straight+multi hotspots)")
+    
+    # Dataset pairing strategy
+    ap.add_argument("--weighting", type=str, default="closest",
+                    choices=["closest", "ponderate"],
+                    help="Weight function for sampling pairs: 'closest' or 'ponderate' (default: closest)")
+    ap.add_argument("--prob", type=float, default=0.5,
+                    help="Probability of pairing from same class (default: 0.5)")
+    
+    # Data subsampling
+    ap.add_argument("--subsample", type=int, default=None,
+                    help="Subsample dataset to N samples (for quick testing)")
+    
+    # Model selection
+    ap.add_argument("--model-type", type=str, default="efficient",
+                    choices=["efficient", "original"],
+                    help="Model architecture: 'efficient' (simple forward) or 'original' (snippet-style NetWrapper)")
     
     # Training hyperparameters
     ap.add_argument("--batch-size", type=int, default=32,
@@ -147,8 +174,8 @@ def parse_args():
                     help="Learning rate (default: 0.0003)")
     ap.add_argument("--epochs", type=int, default=100,
                     help="Number of training epochs (default: 100)")
-    ap.add_argument("--ema-decay", type=float, default=0.99,
-                    help="EMA decay rate for target network (default: 0.99)")
+    ap.add_argument("--ema-decay", type=float, default=0.996,
+                    help="EMA decay rate for target network (default: 0.996)")
     
     # Gradient and optimization
     ap.add_argument("--grad-clip", type=float, default=None,
@@ -164,17 +191,10 @@ def parse_args():
     ap.add_argument("--ema-decay-schedule", type=str, default="constant",
                     choices=["constant", "cosine"],
                     help="EMA decay scheduling strategy (default: constant)")
-    ap.add_argument("--ema-decay-start", type=float, default=0.99,
-                    help="Starting EMA decay for scheduled decay (default: 0.99)")
+    ap.add_argument("--ema-decay-start", type=float, default=0.996,
+                    help="Starting EMA decay for scheduled decay (default: 0.996)")
     ap.add_argument("--ema-decay-end", type=float, default=0.9999,
                     help="Ending EMA decay for scheduled decay (default: 0.9999)")
-    
-    # Dataset pairing strategy
-    ap.add_argument("--weighting", type=str, default="closest",
-                    choices=["closest", "ponderate"],
-                    help="Weight function for sampling pairs: 'closest' or 'ponderate' (default: closest)")
-    ap.add_argument("--prob", type=float, default=0.5,
-                    help="Probability of pairing from same class (default: 0.5)")
     
     # Model architecture
     ap.add_argument("--projection-dim", type=int, default=256,
@@ -184,22 +204,22 @@ def parse_args():
     
     # Output configuration
     ap.add_argument("--output-dir", type=Path,
-                    default=Path('/idia/projects/roadtoska/projectG/projectG_supervised_latent_radiogals/outputs'),
+                    default=Path('/users/mbredber/supervised_latent/outputs'),
                     help="Base output directory for checkpoints and embeddings")
     ap.add_argument("--run-name", type=str, default=None,
                     help="Custom run name (default: timestamp)")
+    # Visualization
+    ap.add_argument("--no-plot-history", action="store_true",
+                    help="Disable training curve plots (enabled by default)")
     
-    # Data subsampling
-    ap.add_argument("--subsample", type=int, default=None,
-                    help="Subsample dataset to N samples (for quick testing)")
+    # UMAP visualization
+    ap.add_argument("--no-plot-umap", action="store_true",
+                    help="Disable UMAP plots (enabled by default)")
+    ap.add_argument("--umap-n-neighbors", type=int, default=15,
+                    help="UMAP n_neighbors parameter (default: 15)")
+    ap.add_argument("--umap-min-dist", type=float, default=0.1,
+                    help="UMAP min_dist parameter (default: 0.1)")
     
-    # Checkpointing
-    ap.add_argument("--checkpoint-freq", type=int, default=10,
-                    help="Save checkpoint every N epochs (default: 10)")
-    
-    # Random seed
-    ap.add_argument("--seed", type=int, default=42,
-                    help="Random seed for reproducibility (default: 42)")
     
     return ap.parse_args()
 
@@ -216,6 +236,7 @@ EMA_DECAY = args.ema_decay
 PROJECTION_DIM = args.projection_dim
 HIDDEN_DIM = args.hidden_dim
 BN_MOMENTUM = args.bn_momentum
+MODEL_TYPE = args.model_type
 
 # Optimization hyperparameters
 GRAD_CLIP = args.grad_clip
@@ -271,11 +292,21 @@ else:
     RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
     if DATASET_NAME != "LOTSS":
         RUN_ID += f"_{DATASET_NAME}"
-    RUN_ID += f"_w{args.weighting}_p{P_PAIR_FROM_CLASS}"
+    RUN_ID += f"_{MODEL_TYPE}_w{args.weighting}_p{P_PAIR_FROM_CLASS}"
+    
+# Truncate labels based on label type
+LABEL_RANGES = {
+    'full': (0, 20),          # All labels
+    'initial': (0, 5),        # FRI, FRII, Hybrids, Spirals, Relaxed doubles
+    'morphology': (5, 15),    # C-curve through Restarted
+    'environment': (15, 19),  # Cluster, Merger, Diffuse emission, Unknown
+    'derived': (19, 24)       # Compact+hybrids through Straight+multi hotspots (note: may only have 19-23, adjust if needed)
+}
 
 OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 checkpoint_path = OUTPUT_DIR / 'byol_model_best.pt'
+label_dims = LABEL_RANGES[args.label_type][1] - LABEL_RANGES[args.label_type][0]
 
 print(f"\n{'='*70}")
 print(f"CONFIGURATION")
@@ -284,9 +315,10 @@ print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
 print(f"{'='*70}")
+print(f"Model type:     {MODEL_TYPE}")
 print(f"Dataset:        {DATASET_NAME}")
 print(f"Data dir:       {DATA_DIR}")
-print(f"Label mode:     {'initial-only (5 dims)' if args.use_initial_only else 'Full labels (20 dims)'}")
+print(f"Label type:     {args.label_type} ({label_dims} dims)")
 print(f"Batch size:     {BATCH_SIZE}")
 print(f"Learning rate:  {LEARNING_RATE}")
 print(f"Epochs:         {NUM_EPOCHS}")
@@ -328,10 +360,11 @@ if not LABELS_PATH.exists():
 images = np.load(IMAGES_PATH).astype(np.float32)/255
 labels = np.load(LABELS_PATH)
 
-# Truncate labels if initial-only mode
-if args.use_initial_only:
-    labels = labels[:, :5]  # Keep only [FRI, FRII, Hybrid, Spiral, Restart]
-    print(f"\n✓ Using initial-only labels (first 5 indices)")
+label_start, label_end = LABEL_RANGES[args.label_type]
+if args.label_type != 'full':
+    labels = labels[:, label_start:label_end]
+    n_labels = label_end - label_start
+    print(f"\n✓ Using {args.label_type} labels only (indices {label_start}-{label_end-1}, {n_labels} dimensions)")
 
 # Validate
 assert len(images) == len(labels), f"Mismatch: {len(images)} images, {len(labels)} labels"
@@ -452,7 +485,7 @@ class BYOLSupDataset(Dataset):
         return img, img_friend, mdist
 
 # =============================================================================
-# CREATE DATASETS WITH SNIPPET-STYLE AUGMENTATIONS
+# CREATE DATASETS
 # =============================================================================
 print("\nCreating datasets...")
 
@@ -463,18 +496,22 @@ test_labels_df = pd.DataFrame(test_labels)
 
 print(f"  Converted labels to DataFrames")
 
-# Default augmentation from snippet (adapted for greyscale)
-DEFAULT_AUG = torch.nn.Sequential(
+# Transforms
+base_transform = T.Compose([
+    # Empty - tensors already created in __getitem__
+])
+
+byol_strong_aug = T.Compose([
     T.RandomHorizontalFlip(),
     T.RandomVerticalFlip(),
     T.RandomRotation(180),
-)
+])
 
 train_dataset = BYOLSupDataset(
     tags_data=train_labels_df,
     img_data=train_images,
-    transform=DEFAULT_AUG,
-    friend_transform=DEFAULT_AUG,
+    transform=base_transform,
+    friend_transform=byol_strong_aug,
     weightfunc=WEIGHTING_FUNC,
     p_pair_from_class=P_PAIR_FROM_CLASS
 )
@@ -482,8 +519,8 @@ train_dataset = BYOLSupDataset(
 val_dataset = BYOLSupDataset(
     tags_data=val_labels_df,
     img_data=val_images,
-    transform=DEFAULT_AUG,
-    friend_transform=DEFAULT_AUG,
+    transform=base_transform,
+    friend_transform=byol_strong_aug,
     weightfunc=WEIGHTING_FUNC,  
     p_pair_from_class=P_PAIR_FROM_CLASS
 )
@@ -491,13 +528,13 @@ val_dataset = BYOLSupDataset(
 test_dataset = BYOLSupDataset(
     tags_data=test_labels_df,
     img_data=test_images,
-    transform=DEFAULT_AUG,
-    friend_transform=DEFAULT_AUG,
+    transform=base_transform,
+    friend_transform=byol_strong_aug,
     weightfunc=WEIGHTING_FUNC,
     p_pair_from_class=P_PAIR_FROM_CLASS
 )
 
-# DATA LOADERS
+# DATA LOADERS 
 train_loader = DataLoader(
     train_dataset, batch_size=BATCH_SIZE,
     shuffle=True, num_workers=4 if use_cuda else 0,
@@ -530,8 +567,10 @@ print(f"✓ Test batch: {x1.shape}, {x2.shape}")
 print(f"  Different: {not torch.allclose(x1, x2)}")
 
 # =============================================================================
-# BASE ENCODER (ResNet-style for 89x89 greyscale) - UPDATED TO 512-DIM
+# MODEL ARCHITECTURE
 # =============================================================================
+
+# Shared encoder architecture
 class BYOLEncoder(nn.Module):
     """
     ResNet-style encoder (f_θ in BYOL paper) for 89x89 greyscale images.
@@ -551,8 +590,6 @@ class BYOLEncoder(nn.Module):
         
         # Global pooling: 6x6 -> 1x1
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # No final FC layer - output 512-dim representation directly
         
     def _make_layer(self, in_channels, out_channels, stride=1, bn_momentum=0.1):
         """Create a residual block"""
@@ -580,9 +617,139 @@ class BYOLEncoder(nn.Module):
         
         return x
 
-# =============================================================================
-# NET WRAPPER (from snippet - adapted for direct encoder)
-# =============================================================================
+
+# Efficient model components
+class ProjectionHead(nn.Module):
+    """
+    MLP projection head (g_θ in BYOL paper).
+    Projects representation y to projection z.
+    """
+    def __init__(self, in_dim=512, hidden_dim=4096, out_dim=256, bn_momentum=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim, momentum=bn_momentum),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+
+class PredictionHead(nn.Module):
+    """
+    MLP prediction head (q_θ in BYOL paper).
+    Predicts target projection from online projection.
+    Only exists in online network (asymmetry prevents collapse).
+    """
+    def __init__(self, in_dim=256, hidden_dim=4096, out_dim=256, bn_momentum=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim, momentum=bn_momentum),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+
+class BYOLEfficient(nn.Module):
+    """
+    Efficient BYOL model (Document 2 style).
+    
+    Architecture:
+    - Encoder f_θ: input → representation y (512-dim)
+    - Projector g_θ: representation y → projection z (256-dim)
+    - Predictor q_θ: projection z → prediction (256-dim) [online only]
+    
+    Loss compares online prediction with target projection.
+    """
+    def __init__(self, encoder_dim=512, projection_dim=256, hidden_dim=4096, bn_momentum=0.1):
+        super().__init__()
+        
+        # Online network: encoder → projector → predictor
+        self.online_encoder = BYOLEncoder(bn_momentum=bn_momentum)
+        self.online_projector = ProjectionHead(
+            in_dim=encoder_dim, 
+            hidden_dim=hidden_dim, 
+            out_dim=projection_dim,
+            bn_momentum=bn_momentum
+        )
+        self.online_predictor = PredictionHead(
+            in_dim=projection_dim, 
+            hidden_dim=hidden_dim, 
+            out_dim=projection_dim,
+            bn_momentum=bn_momentum
+        )
+        
+        # Target network: encoder → projector (no predictor!)
+        self.target_encoder = copy.deepcopy(self.online_encoder)
+        self.target_projector = copy.deepcopy(self.online_projector)
+        
+        # Freeze target network parameters (updated via EMA only)
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+        for param in self.target_projector.parameters():
+            param.requires_grad = False
+    
+    def forward(self, x1, x2):
+        """
+        Forward pass for two augmented views.
+        
+        Returns:
+            online_pred_1: prediction from view 1 (256-dim)
+            online_pred_2: prediction from view 2 (256-dim)
+            target_proj_1: projection from view 1 (256-dim, detached)
+            target_proj_2: projection from view 2 (256-dim, detached)
+        """
+        # Online network forward pass
+        online_repr_1 = self.online_encoder(x1)           # (batch, 512)
+        online_repr_2 = self.online_encoder(x2)           # (batch, 512)
+        
+        online_proj_1 = self.online_projector(online_repr_1)  # (batch, 256)
+        online_proj_2 = self.online_projector(online_repr_2)  # (batch, 256)
+        
+        online_pred_1 = self.online_predictor(online_proj_1)  # (batch, 256)
+        online_pred_2 = self.online_predictor(online_proj_2)  # (batch, 256)
+        
+        # Target network forward pass (no gradients)
+        with torch.no_grad():
+            target_repr_1 = self.target_encoder(x1)       # (batch, 512)
+            target_repr_2 = self.target_encoder(x2)       # (batch, 512)
+            
+            target_proj_1 = self.target_projector(target_repr_1)  # (batch, 256)
+            target_proj_2 = self.target_projector(target_repr_2)  # (batch, 256)
+        
+        return online_pred_1, online_pred_2, target_proj_1, target_proj_2
+    
+    @torch.no_grad()
+    def update_target_network(self, momentum=0.996):
+        """
+        Exponential moving average (EMA) update of target network.
+        
+        Target parameters: θ_target = m * θ_target + (1 - m) * θ_online
+        """
+        # Update target encoder
+        for online_params, target_params in zip(
+            self.online_encoder.parameters(), self.target_encoder.parameters()
+        ):
+            target_params.data = (
+                momentum * target_params.data + (1 - momentum) * online_params.data
+            )
+        
+        # Update target projector
+        for online_params, target_params in zip(
+            self.online_projector.parameters(), self.target_projector.parameters()
+        ):
+            target_params.data = (
+                momentum * target_params.data + (1 - momentum) * online_params.data
+            )
+
+
+# Original (snippet-style) model components
 class NetWrapper(nn.Module):
     """
     Wrapper for base network following snippet pattern.
@@ -615,10 +782,6 @@ class NetWrapper(nn.Module):
             x: Input tensor
             return_projection: If True, return (projection, representation)
                              If False, return representation only
-        
-        Returns:
-            If return_projection=True: (projection, representation) tuple
-            If return_projection=False: representation tensor
         """
         representation = self.get_representation(x)
         
@@ -630,13 +793,11 @@ class NetWrapper(nn.Module):
         projection = projector(representation)
         return projection, representation
 
-# =============================================================================
-# BYOL MODEL (following snippet architecture exactly)
-# =============================================================================
-class BYOL(nn.Module):
+
+class BYOLOriginal(nn.Module):
     """
-    Bootstrap Your Own Latent (BYOL) following original implementation.
-    Uses EMA for target network update.
+    Original BYOL model (Document 3 style, snippet-based).
+    Uses NetWrapper with singleton pattern and EMA class.
     """
     def __init__(
         self,
@@ -697,13 +858,9 @@ class BYOL(nn.Module):
         Forward pass for BYOL.
         
         Args:
-            x: Input batch (can be single view or will be augmented internally)
+            x: Input batch (concatenated pair [view1; view2] for training)
             return_embedding: If True, return embeddings instead of loss
             return_projection: If True (with return_embedding), return projections too
-        
-        Returns:
-            If return_embedding=True: (projection, representation) or representation
-            If return_embedding=False: BYOL loss (scalar)
         """
         # If requesting embeddings, just return from online encoder
         if return_embedding:
@@ -727,37 +884,40 @@ class BYOL(nn.Module):
             
             target_proj_one, target_proj_two = target_projections.chunk(2, dim=0)
         
-        # Compute symmetric loss: predict1 -> target2, predict2 -> target1
+        # Compute symmetric loss
         loss_one = loss_fn(online_pred_one, target_proj_two.detach())
         loss_two = loss_fn(online_pred_two, target_proj_one.detach())
         
         loss = loss_one + loss_two
         return loss.mean()
 
+
+def byol_loss(online_pred_1, online_pred_2, target_proj_1, target_proj_2):
+    """
+    BYOL loss for efficient model: normalized Mean Squared Error.
+    """
+    # L2 normalize all vectors
+    online_pred_1 = F.normalize(online_pred_1, dim=-1, p=2)
+    online_pred_2 = F.normalize(online_pred_2, dim=-1, p=2)
+    target_proj_1 = F.normalize(target_proj_1, dim=-1, p=2)
+    target_proj_2 = F.normalize(target_proj_2, dim=-1, p=2)
+    
+    # Compute symmetric MSE loss
+    loss_1 = (2 - 2 * (online_pred_1 * target_proj_2).sum(dim=-1)).mean()
+    loss_2 = (2 - 2 * (online_pred_2 * target_proj_1).sum(dim=-1)).mean()
+    
+    return loss_1 + loss_2
+
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 
 def get_ema_decay(epoch, num_epochs, schedule='constant', 
-                  base_decay=0.99, start_decay=0.99, end_decay=0.9999):
-    """
-    Compute EMA decay rate for current epoch based on schedule.
-    
-    Args:
-        epoch: Current epoch (0-indexed)
-        num_epochs: Total number of epochs
-        schedule: 'constant' or 'cosine'
-        base_decay: Decay value for constant schedule
-        start_decay: Starting decay for cosine schedule
-        end_decay: Ending decay for cosine schedule
-    
-    Returns:
-        Current EMA decay value
-    """
+                  base_decay=0.996, start_decay=0.996, end_decay=0.9999):
+    """Compute EMA decay rate for current epoch based on schedule."""
     if schedule == 'constant':
         return base_decay
     elif schedule == 'cosine':
-        # Cosine annealing from start_decay to end_decay
         progress = epoch / max(num_epochs - 1, 1)
         return end_decay - (end_decay - start_decay) * (np.cos(np.pi * progress) + 1) / 2
     else:
@@ -765,38 +925,39 @@ def get_ema_decay(epoch, num_epochs, schedule='constant',
 
 
 def get_warmup_lr(epoch, base_lr, warmup_epochs):
-    """
-    Compute learning rate during warmup phase.
-    
-    Linear warmup from 0 to base_lr over warmup_epochs.
-    
-    Args:
-        epoch: Current epoch (0-indexed)
-        base_lr: Target learning rate after warmup
-        warmup_epochs: Number of warmup epochs
-    
-    Returns:
-        Current learning rate
-    """
+    """Compute learning rate during warmup phase."""
     if epoch >= warmup_epochs or warmup_epochs == 0:
         return base_lr
     else:
         return base_lr * (epoch + 1) / warmup_epochs
 
+
 # =============================================================================
 # MODEL INITIALIZATION
 # =============================================================================
 print("\nInitializing model...")
-encoder = BYOLEncoder(bn_momentum=BN_MOMENTUM)
-model = BYOL(
-    encoder, 
-    image_size=89,
-    projection_size=PROJECTION_DIM, 
-    projection_hidden_size=HIDDEN_DIM,
-    moving_average_decay=EMA_DECAY,
-    use_momentum=True,
-    bn_momentum=BN_MOMENTUM
-)
+
+if MODEL_TYPE == "efficient":
+    # Efficient model (Document 2)
+    model = BYOLEfficient(
+        encoder_dim=512,
+        projection_dim=PROJECTION_DIM,
+        hidden_dim=HIDDEN_DIM,
+        bn_momentum=BN_MOMENTUM
+    )
+else:
+    # Original model (Document 3)
+    encoder = BYOLEncoder(bn_momentum=BN_MOMENTUM)
+    model = BYOLOriginal(
+        encoder, 
+        image_size=89,
+        projection_size=PROJECTION_DIM, 
+        projection_hidden_size=HIDDEN_DIM,
+        moving_average_decay=EMA_DECAY,
+        use_momentum=True,
+        bn_momentum=BN_MOMENTUM
+    )
+
 model = model.to(device)
 
 # Count parameters
@@ -804,7 +965,7 @@ total_params = sum(p.numel() for p in model.parameters())
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 print(f"{'='*70}")
-print(f"MODEL ARCHITECTURE")
+print(f"MODEL ARCHITECTURE ({MODEL_TYPE.upper()})")
 print(f"{'='*70}")
 print(f"Total parameters:     {total_params:,}")
 print(f"Trainable parameters: {trainable_params:,}")
@@ -842,6 +1003,7 @@ history = {
 
 best_val_loss = float('inf')
 best_model_state = None
+best_epoch = 0
 
 print(f"✓ Optimizer: Adam (lr={LEARNING_RATE})")
 print(f"✓ Scheduler: CosineAnnealingLR (T_max={NUM_EPOCHS})")
@@ -849,7 +1011,7 @@ if WARMUP_EPOCHS > 0:
     print(f"✓ Warmup: {WARMUP_EPOCHS} epochs")
 if GRAD_CLIP:
     print(f"✓ Gradient clipping: max_norm={GRAD_CLIP}")
-print(f"✓ Loss: BYOL symmetric MSE (from snippet)")
+print(f"✓ Loss: BYOL symmetric MSE")
 
 # =============================================================================
 # TRAINING LOOP
@@ -878,8 +1040,9 @@ for epoch in range(NUM_EPOCHS):
         end_decay=EMA_DECAY_END
     )
     
-    # Update EMA decay in the updater
-    model.target_ema_updater.beta = current_ema_decay
+    # Update EMA decay for original model
+    if MODEL_TYPE == "original":
+        model.target_ema_updater.beta = current_ema_decay
     
     # -------------------------------------------------------------------------
     # TRAIN
@@ -891,11 +1054,13 @@ for epoch in range(NUM_EPOCHS):
     for x1, x2, _ in pbar:
         x1, x2 = x1.to(device), x2.to(device)
         
-        # Concatenate views as expected by snippet's forward method
-        images = torch.cat((x1, x2), dim=0)
-        
-        # Forward pass (returns loss directly)
-        loss = model(images)
+        # Forward pass (different for each model type)
+        if MODEL_TYPE == "efficient":
+            pred1, pred2, proj1, proj2 = model(x1, x2)
+            loss = byol_loss(pred1, pred2, proj1, proj2)
+        else:  # original
+            images = torch.cat((x1, x2), dim=0)
+            loss = model(images)
         
         # Backward pass
         optimizer.zero_grad()
@@ -907,8 +1072,11 @@ for epoch in range(NUM_EPOCHS):
         
         optimizer.step()
         
-        # Update target network using EMA
-        model.update_moving_average()
+        # Update target network
+        if MODEL_TYPE == "efficient":
+            model.update_target_network(momentum=current_ema_decay)
+        else:  # original
+            model.update_moving_average()
         
         # Track loss
         train_loss += loss.item()
@@ -925,8 +1093,13 @@ for epoch in range(NUM_EPOCHS):
     with torch.no_grad():
         for x1, x2, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]  ", leave=False):
             x1, x2 = x1.to(device), x2.to(device)
-            images = torch.cat((x1, x2), dim=0)
-            val_loss += model(images).item()
+            
+            if MODEL_TYPE == "efficient":
+                pred1, pred2, proj1, proj2 = model(x1, x2)
+                val_loss += byol_loss(pred1, pred2, proj1, proj2).item()
+            else:  # original
+                images = torch.cat((x1, x2), dim=0)
+                val_loss += model(images).item()
     
     avg_val_loss = val_loss / len(val_loader)
     
@@ -945,42 +1118,11 @@ for epoch in range(NUM_EPOCHS):
     print(f"  LR:         {current_lr:.6f}")
     print(f"  EMA decay:  {current_ema_decay:.4f}")
     
-    # Save checkpoint periodically
-    if (epoch + 1) % args.checkpoint_freq == 0:
-        checkpoint_periodic = OUTPUT_DIR / f'checkpoint_epoch_{epoch+1}.pt'
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'epoch': epoch + 1,
-            'best_val_loss': best_val_loss,
-            'avg_val_loss': avg_val_loss,
-            'history': history,
-            'config': {
-                'batch_size': BATCH_SIZE,
-                'learning_rate': LEARNING_RATE,
-                'num_epochs': NUM_EPOCHS,
-                'warmup_epochs': WARMUP_EPOCHS,
-                'grad_clip': GRAD_CLIP,
-                'bn_momentum': BN_MOMENTUM,
-                'ema_decay': EMA_DECAY,
-                'ema_decay_schedule': EMA_DECAY_SCHEDULE,
-                'ema_decay_start': EMA_DECAY_START,
-                'ema_decay_end': EMA_DECAY_END,
-                'projection_dim': PROJECTION_DIM,
-                'hidden_dim': HIDDEN_DIM,
-                'encoder_dim': 512,
-                'weighting': args.weighting,
-                'p_pair_from_class': P_PAIR_FROM_CLASS,
-                'dataset': DATASET_NAME,
-                'use_initial_only': args.use_initial_only,
-            }
-        }, checkpoint_periodic)
-        print(f"  Checkpoint saved: {checkpoint_periodic}")
-    
     # Save best model
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         best_model_state = copy.deepcopy(model.state_dict())
+        best_epoch = epoch + 1
         print(f"  ✓ New best model (val_loss: {best_val_loss:.4f})")
     
     print()
@@ -1009,8 +1151,13 @@ test_loss = 0.0
 with torch.no_grad():
     for x1, x2, _ in tqdm(test_loader, desc="Test"):
         x1, x2 = x1.to(device), x2.to(device)
-        images = torch.cat((x1, x2), dim=0)
-        test_loss += model(images).item()
+        
+        if MODEL_TYPE == "efficient":
+            pred1, pred2, proj1, proj2 = model(x1, x2)
+            test_loss += byol_loss(pred1, pred2, proj1, proj2).item()
+        else:  # original
+            images = torch.cat((x1, x2), dim=0)
+            test_loss += model(images).item()
 
 avg_test_loss = test_loss / len(test_loader)
 
@@ -1029,7 +1176,7 @@ history['test_loss'] = avg_test_loss
 # SAVE MODEL AND HISTORY
 # =============================================================================
 
-# Save final model checkpoint
+# Save model checkpoint
 torch.save({
     'model_state_dict': best_model_state,
     'optimizer_state_dict': optimizer.state_dict(),
@@ -1038,6 +1185,7 @@ torch.save({
     'test_loss': avg_test_loss,
     'history': history,
     'config': {
+        'model_type': MODEL_TYPE,
         'batch_size': BATCH_SIZE,
         'learning_rate': LEARNING_RATE,
         'num_epochs': NUM_EPOCHS,
@@ -1054,7 +1202,7 @@ torch.save({
         'weighting': args.weighting,
         'p_pair_from_class': P_PAIR_FROM_CLASS,
         'dataset': DATASET_NAME,
-        'use_initial_only': args.use_initial_only,
+        'label_type': args.label_type,
     }
 }, checkpoint_path)
 
@@ -1064,21 +1212,118 @@ print(f"✓ Model checkpoint saved to {checkpoint_path}")
 np.save(OUTPUT_DIR / 'training_history.npy', history)
 print(f"✓ Training history saved to {OUTPUT_DIR / 'training_history.npy'}")
 
+# Plot training history (default behavior unless disabled)
+if not args.no_plot_history:
+    print("\nGenerating training curve plots...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f'Training History - {MODEL_TYPE.upper()} Model', fontsize=16)
+    
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    # Plot 1: Training and Validation Loss
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+    axes[0, 0].axhline(y=best_val_loss, color='g', linestyle='--', label=f'Best Val ({best_val_loss:.4f})', alpha=0.7)
+    axes[0, 0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})', alpha=0.7)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Plot 2: Loss Difference (Overfitting indicator)
+    loss_diff = [val - train for train, val in zip(history['train_loss'], history['val_loss'])]
+    axes[0, 1].plot(epochs, loss_diff, 'purple', linewidth=2)
+    axes[0, 1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
+    axes[0, 1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Val Loss - Train Loss')
+    axes[0, 1].set_title('Overfitting Indicator (Val - Train)')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Plot 3: Learning Rate
+    axes[1, 0].plot(epochs, history['lr'], 'orange', linewidth=2)
+    axes[1, 0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_title('Learning Rate Schedule')
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].set_yscale('log')
+    
+    # Plot 4: EMA Decay
+    axes[1, 1].plot(epochs, history['ema_decay'], 'green', linewidth=2)
+    axes[1, 1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('EMA Decay')
+    axes[1, 1].set_title('EMA Decay Schedule')
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    plot_path = OUTPUT_DIR / 'training_curves.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"✓ Training curves saved to {plot_path}")
+    
+    # Also save a zoomed version (last 20% of training)
+    if len(epochs) > 10:
+        start_idx = int(len(epochs) * 0.8)
+        
+        fig2, axes2 = plt.subplots(1, 2, figsize=(12, 4))
+        fig2.suptitle(f'Training History (Final 20%) - {MODEL_TYPE.upper()} Model', fontsize=14)
+        
+        epochs_zoom = list(epochs)[start_idx:]
+        train_zoom = history['train_loss'][start_idx:]
+        val_zoom = history['val_loss'][start_idx:]
+        
+        # Zoomed loss plot
+        axes2[0].plot(epochs_zoom, train_zoom, 'b-', label='Train Loss', linewidth=2)
+        axes2[0].plot(epochs_zoom, val_zoom, 'r-', label='Val Loss', linewidth=2)
+        axes2[0].axhline(y=best_val_loss, color='g', linestyle='--', label=f'Best Val ({best_val_loss:.4f})', alpha=0.7)
+        if best_epoch >= start_idx:  # Only show vertical line if best epoch is in zoomed range
+            axes2[0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})', alpha=0.7)
+        axes2[0].set_xlabel('Epoch')
+        axes2[0].set_ylabel('Loss')
+        axes2[0].set_title('Loss (Zoomed)')
+        axes2[0].legend()
+        axes2[0].grid(True, alpha=0.3)
+        
+        # Zoomed loss difference
+        loss_diff_zoom = loss_diff[start_idx:]
+        axes2[1].plot(epochs_zoom, loss_diff_zoom, 'purple', linewidth=2)
+        axes2[1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        if best_epoch >= start_idx:  # Only show vertical line if best epoch is in zoomed range
+            axes2[1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+        axes2[1].set_xlabel('Epoch')
+        axes2[1].set_ylabel('Val Loss - Train Loss')
+        axes2[1].set_title('Overfitting Indicator (Zoomed)')
+        axes2[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        zoom_plot_path = OUTPUT_DIR / 'training_curves_zoomed.png'
+        plt.savefig(zoom_plot_path, dpi=150, bbox_inches='tight')
+        print(f"✓ Zoomed training curves saved to {zoom_plot_path}")
+    
+    plt.close('all')
+
 # =============================================================================
 # EXTRACT EMBEDDINGS
 # =============================================================================
-def extract_embeddings_from_loader(model, dataloader, max_batches=None):
+def extract_embeddings_from_loader(model, dataloader, model_type, max_batches=None):
     """
     Extract representations and projections from a DataLoader.
     
     Args:
         model: Trained BYOL model
-        dataloader: DataLoader yielding (x1, x2, mdist) tuples
+        dataloader: DataLoader that yields (x1, x2, mdist) tuples
+        model_type: "efficient" or "original"
         max_batches: Limit number of batches (None = all)
     
     Returns:
-        representations: (N, 512) representations from encoder (y in BYOL vocab)
-        projections: (N, 256) projections from projector head (z in BYOL vocab)
+        representations: (N, 512) representations from encoder
+        projections: (N, 256) projections from projector head
     """
     model.eval()
     
@@ -1090,14 +1335,18 @@ def extract_embeddings_from_loader(model, dataloader, max_batches=None):
             if max_batches and batch_idx >= max_batches:
                 break
             
-            # Use x1 (either view works for feature extraction)
             x1 = x1.to(device)
             
-            # Extract features using return_embedding=True
-            projections, representations = model(x1, return_embedding=True, return_projection=True)
+            if model_type == "efficient":
+                # Extract from efficient model
+                representation = model.online_encoder(x1)
+                projection = model.online_projector(representation)
+            else:  # original
+                # Extract from original model using return_embedding
+                projection, representation = model(x1, return_embedding=True, return_projection=True)
             
-            all_representations.append(representations.cpu().numpy())
-            all_projections.append(projections.cpu().numpy())
+            all_representations.append(representation.cpu().numpy())
+            all_projections.append(projection.cpu().numpy())
     
     representations = np.vstack(all_representations)
     projections = np.vstack(all_projections)
@@ -1109,7 +1358,7 @@ print("\nExtracting embeddings from DataLoaders...")
 # Extract from train loader
 print("\n  Train set:")
 train_representations, train_projections = extract_embeddings_from_loader(
-    model, train_loader, max_batches=None
+    model, train_loader, MODEL_TYPE, max_batches=None
 )
 print(f"    Representations: {train_representations.shape}")
 print(f"    Projections: {train_projections.shape}")
@@ -1117,7 +1366,7 @@ print(f"    Projections: {train_projections.shape}")
 # Extract from val loader
 print("\n  Val set:")
 val_representations, val_projections = extract_embeddings_from_loader(
-    model, val_loader, max_batches=None
+    model, val_loader, MODEL_TYPE, max_batches=None
 )
 print(f"    Representations: {val_representations.shape}")
 print(f"    Projections: {val_projections.shape}")
@@ -1125,12 +1374,12 @@ print(f"    Projections: {val_projections.shape}")
 # Extract from test loader
 print("\n  Test set:")
 test_representations, test_projections = extract_embeddings_from_loader(
-    model, test_loader, max_batches=None
+    model, test_loader, MODEL_TYPE, max_batches=None
 )
 print(f"    Representations: {test_representations.shape}")
 print(f"    Projections: {test_projections.shape}")
 
-# Save embeddings with corrected naming (representations, not embeddings)
+# Save embeddings
 embeddings_dir = OUTPUT_DIR / 'embeddings'
 embeddings_dir.mkdir(exist_ok=True)
 
@@ -1147,6 +1396,118 @@ np.save(embeddings_dir / 'val_labels.npy', val_labels[:len(val_representations)]
 np.save(embeddings_dir / 'test_labels.npy', test_labels[:len(test_representations)])
 
 print(f"\n✓ Embeddings saved to {embeddings_dir}/")
+
+# Generate UMAP plots (default behavior unless disabled)
+if not args.no_plot_umap:
+    print("\nGenerating UMAP visualizations...")
+    
+    # Determine label type for plot titles
+    label_dims = LABEL_RANGES[args.label_type][1] - LABEL_RANGES[args.label_type][0]
+    label_type_display = f"{args.label_type.capitalize()} ({label_dims}-dim)"
+    
+    # Function to plot UMAP
+    def plot_umap_embeddings(embeddings, labels, title_suffix, save_name):
+        """Generate UMAP plot for embeddings"""
+        print(f"  Computing UMAP for {title_suffix}...")
+        
+        # Fit UMAP
+        reducer = umap.UMAP(
+            n_neighbors=args.umap_n_neighbors,
+            min_dist=args.umap_min_dist,
+            metric='euclidean',
+            random_state=SEED
+        )
+        embedding_2d = reducer.fit_transform(embeddings)
+        
+        # Create figure with 2 subplots (by first label, and by second label)
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        fig.suptitle(f'UMAP - {title_suffix} - {MODEL_TYPE.upper()} Model ({label_type_display} labels)', 
+             fontsize=14)
+        
+        # Plot 1: Colored by first label dimension
+        scatter1 = axes[0].scatter(
+            embedding_2d[:, 0], 
+            embedding_2d[:, 1],
+            c=labels[:, 0],
+            cmap='viridis',
+            s=10,
+            alpha=0.6
+        )
+        axes[0].set_xlabel('UMAP 1')
+        axes[0].set_ylabel('UMAP 2')
+        axes[0].set_title(f'Colored by Label[0]')
+        plt.colorbar(scatter1, ax=axes[0], label='Label[0] value')
+        axes[0].grid(True, alpha=0.3)
+        
+        # Plot 2: Colored by second label dimension (if exists)
+        if labels.shape[1] > 1:
+            scatter2 = axes[1].scatter(
+                embedding_2d[:, 0], 
+                embedding_2d[:, 1],
+                c=labels[:, 1],
+                cmap='plasma',
+                s=10,
+                alpha=0.6
+            )
+            axes[1].set_xlabel('UMAP 1')
+            axes[1].set_ylabel('UMAP 2')
+            axes[1].set_title(f'Colored by Label[1]')
+            plt.colorbar(scatter2, ax=axes[1], label='Label[1] value')
+        else:
+            # If only 1 label dim, repeat first plot
+            scatter2 = axes[1].scatter(
+                embedding_2d[:, 0], 
+                embedding_2d[:, 1],
+                c=labels[:, 0],
+                cmap='viridis',
+                s=10,
+                alpha=0.6
+            )
+            axes[1].set_xlabel('UMAP 1')
+            axes[1].set_ylabel('UMAP 2')
+            axes[1].set_title(f'Colored by Label[0] (duplicate)')
+            plt.colorbar(scatter2, ax=axes[1], label='Label[0] value')
+        axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save plot
+        umap_path = embeddings_dir / save_name
+        plt.savefig(umap_path, dpi=150, bbox_inches='tight')
+        print(f"    ✓ Saved to {umap_path}")
+        plt.close()
+    
+    # Plot UMAPs for representations
+    plot_umap_embeddings(
+        train_representations,
+        train_labels[:len(train_representations)],
+        "Train Representations (512-dim)",
+        "umap_train_representations.png"
+    )
+    
+    plot_umap_embeddings(
+        test_representations,
+        test_labels[:len(test_representations)],
+        "Test Representations (512-dim)",
+        "umap_test_representations.png"
+    )
+    
+    # Plot UMAPs for projections
+    plot_umap_embeddings(
+        train_projections,
+        train_labels[:len(train_projections)],
+        "Train Projections (256-dim)",
+        "umap_train_projections.png"
+    )
+    
+    plot_umap_embeddings(
+        test_projections,
+        test_labels[:len(test_projections)],
+        "Test Projections (256-dim)",
+        "umap_test_projections.png"
+    )
+    
+    print(f"\n✓ UMAP plots saved to {embeddings_dir}/")
 
 print(f"\n{'='*70}")
 print(f"SCRIPT COMPLETE")
