@@ -1401,16 +1401,52 @@ print(f"\n✓ Embeddings saved to {embeddings_dir}/")
 if not args.no_plot_umap:
     print("\nGenerating UMAP visualizations...")
     
-    # Determine label type for plot titles
-    label_dims = LABEL_RANGES[args.label_type][1] - LABEL_RANGES[args.label_type][0]
-    label_type_display = f"{args.label_type.capitalize()} ({label_dims}-dim)"
+    # Define class names for each label type
+    CLASS_NAMES = {
+        'initial': ['FRI', 'FRII', 'Hybrids', 'Spirals', 'Relaxed doubles'],
+        'morphology': ['C-curvature', 'S-curvature', 'Misalignment', 'Wings', 'X-shaped', 
+                      'Straight jets', 'Multiple hotspots', 'Continuous jets', 'Banding', 
+                      'One-sided', 'Restarted'],
+        'environment': ['Cluster', 'Merger', 'Diffuse emission', 'Unknown'],
+        'derived': ['Compact+hybrids', 'Hybrid FRI/FRII', 'Curved FRIs', 
+                   'Curved FRIIs', 'Straight+multi hotspots']
+    }
     
-    # Function to plot UMAP
-    def plot_umap_embeddings(embeddings, labels, title_suffix, save_name):
-        """Generate UMAP plot for embeddings"""
+    # Function to identify pure class samples
+    def get_pure_class_colors(labels, label_type):
+        """
+        Assign colors to pure class samples, grey for non-pure.
+        
+        Args:
+            labels: (N, D) array of labels for current classification type
+            label_type: 'initial', 'morphology', 'environment', or 'derived'
+        
+        Returns:
+            colors: (N,) array of color indices (-1 for grey, 0-K for pure classes)
+            class_names: List of class names for legend
+        """
+        n_samples, n_classes = labels.shape
+        colors = np.full(n_samples, -1, dtype=int)  # -1 = grey (non-pure)
+        
+        # Check each sample: pure if exactly one 1, rest 0s
+        for i in range(n_samples):
+            label_vec = labels[i]
+            n_ones = np.sum(label_vec == 1)
+            
+            # Pure class: exactly one 1
+            if n_ones == 1:
+                class_idx = np.where(label_vec == 1)[0][0]
+                colors[i] = class_idx
+        
+        class_names = CLASS_NAMES.get(label_type, [f"Class {i}" for i in range(n_classes)])
+        return colors, class_names
+    
+    # Function to plot UMAP with pure class colors
+    def plot_umap_pure_classes(embeddings, labels, title_suffix, save_prefix, split_name):
+        """Generate UMAP plots for each classification type with pure class coloring"""
         print(f"  Computing UMAP for {title_suffix}...")
         
-        # Fit UMAP
+        # Fit UMAP once for all classification types
         reducer = umap.UMAP(
             n_neighbors=args.umap_n_neighbors,
             min_dist=args.umap_min_dist,
@@ -1419,95 +1455,127 @@ if not args.no_plot_umap:
         )
         embedding_2d = reducer.fit_transform(embeddings)
         
-        # Create figure with 2 subplots (by first label, and by second label)
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-        fig.suptitle(f'UMAP - {title_suffix} - {MODEL_TYPE.upper()} Model ({label_type_display} labels)', 
-             fontsize=14)
-        
-        # Plot 1: Colored by first label dimension
-        scatter1 = axes[0].scatter(
-            embedding_2d[:, 0], 
-            embedding_2d[:, 1],
-            c=labels[:, 0],
-            cmap='viridis',
-            s=10,
-            alpha=0.6
-        )
-        axes[0].set_xlabel('UMAP 1')
-        axes[0].set_ylabel('UMAP 2')
-        axes[0].set_title(f'Colored by Label[0]')
-        plt.colorbar(scatter1, ax=axes[0], label='Label[0] value')
-        axes[0].grid(True, alpha=0.3)
-        
-        # Plot 2: Colored by second label dimension (if exists)
-        if labels.shape[1] > 1:
-            scatter2 = axes[1].scatter(
-                embedding_2d[:, 0], 
-                embedding_2d[:, 1],
-                c=labels[:, 1],
-                cmap='plasma',
-                s=10,
-                alpha=0.6
-            )
-            axes[1].set_xlabel('UMAP 1')
-            axes[1].set_ylabel('UMAP 2')
-            axes[1].set_title(f'Colored by Label[1]')
-            plt.colorbar(scatter2, ax=axes[1], label='Label[1] value')
-        else:
-            # If only 1 label dim, repeat first plot
-            scatter2 = axes[1].scatter(
-                embedding_2d[:, 0], 
-                embedding_2d[:, 1],
-                c=labels[:, 0],
-                cmap='viridis',
-                s=10,
-                alpha=0.6
-            )
-            axes[1].set_xlabel('UMAP 1')
-            axes[1].set_ylabel('UMAP 2')
-            axes[1].set_title(f'Colored by Label[0] (duplicate)')
-            plt.colorbar(scatter2, ax=axes[1], label='Label[0] value')
-        axes[1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save plot
-        umap_path = embeddings_dir / save_name
-        plt.savefig(umap_path, dpi=150, bbox_inches='tight')
-        print(f"    ✓ Saved to {umap_path}")
-        plt.close()
+        # Generate one plot per classification type
+        for class_type in ['initial', 'morphology', 'environment', 'derived']:
+            # Get label range for this classification type
+            label_start, label_end = LABEL_RANGES[class_type]
+            
+            # Extract labels for this classification type from FULL labels
+            # Need to reload full labels for proper indexing
+            if args.label_type == 'full':
+                # Already have full labels
+                type_labels = labels[:, label_start:label_end]
+            else:
+                # Need to reconstruct from saved full labels
+                # Load the appropriate full labels based on split
+                if split_name == 'train':
+                    full_labels = train_labels_full[:len(embeddings)]
+                elif split_name == 'test':
+                    full_labels = test_labels_full[:len(embeddings)]
+                else:
+                    continue  # Skip val set for UMAP
+                
+                type_labels = full_labels[:, label_start:label_end]
+            
+            # Get pure class colors
+            colors, class_names = get_pure_class_colors(type_labels, class_type)
+            
+            # Count pure vs non-pure samples
+            n_pure = np.sum(colors >= 0)
+            n_nonpure = np.sum(colors == -1)
+            
+            # Create figure
+            fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+            fig.suptitle(f'UMAP - {title_suffix} - {class_type.capitalize()} Classification', 
+                        fontsize=14)
+            
+            # Plot non-pure samples in grey first (background)
+            mask_nonpure = colors == -1
+            if np.any(mask_nonpure):
+                ax.scatter(
+                    embedding_2d[mask_nonpure, 0],
+                    embedding_2d[mask_nonpure, 1],
+                    c='lightgrey',
+                    s=10,
+                    alpha=0.3,
+                    label=f'Non-pure ({n_nonpure})'
+                )
+            
+            # Plot pure classes with distinct colors
+            n_classes = len(class_names)
+            cmap = plt.cm.get_cmap('tab10' if n_classes <= 10 else 'tab20')
+            
+            for class_idx in range(n_classes):
+                mask_class = colors == class_idx
+                n_class = np.sum(mask_class)
+                
+                if n_class > 0:
+                    ax.scatter(
+                        embedding_2d[mask_class, 0],
+                        embedding_2d[mask_class, 1],
+                        c=[cmap(class_idx)],
+                        s=15,
+                        alpha=0.7,
+                        label=f'{class_names[class_idx]} ({n_class})'
+                    )
+            
+            ax.set_xlabel('UMAP 1')
+            ax.set_ylabel('UMAP 2')
+            ax.set_title(f'{n_pure} pure samples, {n_nonpure} non-pure')
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+            ax.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save plot to OUTPUT_DIR (not embeddings_dir)
+            umap_path = OUTPUT_DIR / f'{save_prefix}_{class_type}.png'
+            plt.savefig(umap_path, dpi=150, bbox_inches='tight')
+            print(f"    ✓ Saved {class_type} to {umap_path}")
+            plt.close()
     
-    # Plot UMAPs for representations
-    plot_umap_embeddings(
+    # Store full labels before any filtering (needed for all classification types)
+    # Reload full labels
+    labels_full = np.load(LABELS_PATH)
+    train_labels_full = labels_full[train_idx]
+    test_labels_full = labels_full[test_idx]
+    
+    # Plot UMAPs for train representations
+    plot_umap_pure_classes(
         train_representations,
         train_labels[:len(train_representations)],
         "Train Representations (512-dim)",
-        "umap_train_representations.png"
+        "umap_train_representations",
+        "train"
     )
     
-    plot_umap_embeddings(
+    # Plot UMAPs for test representations
+    plot_umap_pure_classes(
         test_representations,
         test_labels[:len(test_representations)],
         "Test Representations (512-dim)",
-        "umap_test_representations.png"
+        "umap_test_representations",
+        "test"
     )
     
-    # Plot UMAPs for projections
-    plot_umap_embeddings(
+    # Plot UMAPs for train projections
+    plot_umap_pure_classes(
         train_projections,
         train_labels[:len(train_projections)],
         "Train Projections (256-dim)",
-        "umap_train_projections.png"
+        "umap_train_projections",
+        "train"
     )
     
-    plot_umap_embeddings(
+    # Plot UMAPs for test projections
+    plot_umap_pure_classes(
         test_projections,
         test_labels[:len(test_projections)],
         "Test Projections (256-dim)",
-        "umap_test_projections.png"
+        "umap_test_projections",
+        "test"
     )
     
-    print(f"\n✓ UMAP plots saved to {embeddings_dir}/")
+    print(f"\n✓ UMAP plots saved to {OUTPUT_DIR}/")
 
 print(f"\n{'='*70}")
 print(f"SCRIPT COMPLETE")
