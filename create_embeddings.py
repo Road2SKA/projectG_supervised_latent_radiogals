@@ -25,6 +25,12 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import umap
 
+# Check device availability
+if torch.cuda.is_available(): 
+    print("using gpu")
+else: 
+    print("using cpu")
+
 # =============================================================================
 # HELPER FUNCTIONS (for original model)
 # =============================================================================
