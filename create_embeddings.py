@@ -33,26 +33,6 @@ if torch.cuda.is_available():
 else: 
     print("using cpu")
 
-'''
-# =============================================================================
-# AUGMENTATION UTILS
-# =============================================================================
-
-class RandomApply(nn.Module):
-    """Apply augmentation with probability p"""
-    def __init__(self, fn, p):
-        super().__init__()
-        self.fn = fn
-        self.p = p
-    
-    def forward(self, x):
-        if random.random() > self.p:
-            return x
-        return self.fn(x)
-'''
-
-
-
 # =============================================================================
 # ARGUMENT PARSING
 # =============================================================================
@@ -429,9 +409,6 @@ print(f"  Different: {not torch.allclose(x1, x2)}")
 # =============================================================================
 # MODEL ARCHITECTURE
 # =============================================================================
-
-
-
 
 def byol_loss(online_pred_1, online_pred_2, target_proj_1, target_proj_2):
     """
@@ -863,12 +840,10 @@ def extract_embeddings_from_loader(model, dataloader, model_type, max_batches=No
         max_batches: Limit number of batches (None = all)
     
     Returns:
-        representations: (N, 512) representations from encoder
         projections: (N, 256) projections from projector head
     """
     model.eval()
     
-    all_representations = []
     all_projections = []
     
     with torch.no_grad():
@@ -884,57 +859,49 @@ def extract_embeddings_from_loader(model, dataloader, model_type, max_batches=No
                 projection = model.online_projector(representation)
             else:  # original
                 # Extract from original model using return_embedding
-                projection, representation = model(x1, return_embedding=True, return_projection=True)
+                projection, _ = model(x1, return_embedding=True, return_projection=True)
             
-            all_representations.append(representation.cpu().numpy())
             all_projections.append(projection.cpu().numpy())
-    
-    representations = np.vstack(all_representations)
+
     projections = np.vstack(all_projections)
     
-    return representations, projections
+    return projections
 
 print("\nExtracting embeddings from DataLoaders...")
 
 # Extract from train loader
 print("\n  Train set:")
-train_representations, train_projections = extract_embeddings_from_loader(
+train_projections = extract_embeddings_from_loader(
     model, train_loader, MODEL_TYPE, max_batches=None
 )
-print(f"    Representations: {train_representations.shape}")
 print(f"    Projections: {train_projections.shape}")
 
 # Extract from val loader
 print("\n  Val set:")
-val_representations, val_projections = extract_embeddings_from_loader(
+val_projections = extract_embeddings_from_loader(
     model, val_loader, MODEL_TYPE, max_batches=None
 )
-print(f"    Representations: {val_representations.shape}")
 print(f"    Projections: {val_projections.shape}")
 
 # Extract from test loader
 print("\n  Test set:")
-test_representations, test_projections = extract_embeddings_from_loader(
+test_projections = extract_embeddings_from_loader(
     model, test_loader, MODEL_TYPE, max_batches=None
 )
-print(f"    Representations: {test_representations.shape}")
 print(f"    Projections: {test_projections.shape}")
 
 # Save embeddings
 embeddings_dir = OUTPUT_DIR / 'embeddings'
 embeddings_dir.mkdir(exist_ok=True)
 
-np.save(embeddings_dir / 'train_representations.npy', train_representations)
 np.save(embeddings_dir / 'train_projections.npy', train_projections)
-np.save(embeddings_dir / 'val_representations.npy', val_representations)
 np.save(embeddings_dir / 'val_projections.npy', val_projections)
-np.save(embeddings_dir / 'test_representations.npy', test_representations)
 np.save(embeddings_dir / 'test_projections.npy', test_projections)
 
 # Save corresponding labels
-np.save(embeddings_dir / 'train_labels.npy', train_labels[:len(train_representations)])
-np.save(embeddings_dir / 'val_labels.npy', val_labels[:len(val_representations)])
-np.save(embeddings_dir / 'test_labels.npy', test_labels[:len(test_representations)])
+np.save(embeddings_dir / 'train_labels.npy', train_labels[:len(train_projections)])
+np.save(embeddings_dir / 'val_labels.npy', val_labels[:len(val_projections)])
+np.save(embeddings_dir / 'test_labels.npy', test_labels[:len(test_projections)])
 
 print(f"\n✓ Embeddings saved to {embeddings_dir}/")
 
@@ -1079,24 +1046,6 @@ if not args.no_plot_umap:
     labels_full = np.load(LABELS_PATH)
     train_labels_full = labels_full[train_idx]
     test_labels_full = labels_full[test_idx]
-    
-    # Plot UMAPs for train representations
-    plot_umap_pure_classes(
-        train_representations,
-        train_labels[:len(train_representations)],
-        "Train Representations (512-dim)",
-        "umap_train_representations",
-        "train"
-    )
-    
-    # Plot UMAPs for test representations
-    plot_umap_pure_classes(
-        test_representations,
-        test_labels[:len(test_representations)],
-        "Test Representations (512-dim)",
-        "umap_test_representations",
-        "test"
-    )
     
     # Plot UMAPs for train projections
     plot_umap_pure_classes(
