@@ -16,7 +16,11 @@ def weights_ponderate(pi):
 class BYOLSupDataset(Dataset):
     """
     Dataset for BYOL with supervised pairing based on label similarity.
-    Returns augmented pairs (x1, x2) and their label distance.
+    Returns :
+    - img: original image
+    - img_transformed: transformed image (positive pair)
+    - img_friend: image from similar (or close) class
+    - mdist: Manhattan distance between the labels img and img_friend
     """
     def __init__(self, 
                  tags_data, 
@@ -42,20 +46,14 @@ class BYOLSupDataset(Dataset):
         img = self.img_data[idx]
         label_vec = self.all_labels.iloc[idx, :].values.reshape(1, -1)
         
-        u = np.random.rand()
-        if u < self.p_pair_from_class:
-            # Sample a friend image from similar class, using the precomputed distance matrix
-            all_tags_nofid = self.all_labels.drop(index=idx)
-            pi = self.label_distances[idx, all_tags_nofid.index].reshape(1, -1)
-            weights = self.weightfunc(pi)
-            sample = np.random.choice(all_tags_nofid.shape[0], p=weights)
-            idx_friend = all_tags_nofid.index[sample]
-            mdist = pi[0, sample]
-            img_friend = self.img_data[idx_friend]
-        else:
-            # Use same image (will be augmented differently)
-            img_friend = img.copy()
-            mdist = 0.0
+        # Sample a friend image from similar class, using the precomputed distance matrix
+        all_tags_nofid = self.all_labels.drop(index=idx)
+        pi = self.label_distances[idx, all_tags_nofid.index].reshape(1, -1)
+        weights = self.weightfunc(pi)
+        sample = np.random.choice(all_tags_nofid.shape[0], p=weights)
+        idx_friend = all_tags_nofid.index[sample]
+        mdist = pi[0, sample]
+        img_friend = self.img_data[idx_friend]
         
         # Convert numpy arrays to tensors BEFORE transforms
         img = torch.from_numpy(img).unsqueeze(0).float()  # Shape: (1, H, W)
@@ -63,11 +61,11 @@ class BYOLSupDataset(Dataset):
         
         # Apply transforms to tensors
         if self.transform:
-            img = self.transform(img)
+            img_transformed = self.transform(img)
         if self.friend_transform:
             img_friend = self.friend_transform(img_friend)
         
-        return img, img_friend, mdist
+        return img, img_transformed, img_friend, mdist
 
 
 
