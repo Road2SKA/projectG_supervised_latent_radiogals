@@ -31,6 +31,8 @@ class BYOLSupDataset(Dataset):
         self.friend_transform = friend_transform
         self.weightfunc = weightfunc
         self.p_pair_from_class = p_pair_from_class
+        # build the distance matrix once for efficiency
+        self.label_distances = cdist(self.all_labels.values, self.all_labels.values, metric="cityblock")
     
     def __len__(self):
         return self.all_labels.shape[0]
@@ -42,9 +44,9 @@ class BYOLSupDataset(Dataset):
         
         u = np.random.rand()
         if u < self.p_pair_from_class:
-            # Sample a friend image from similar class
+            # Sample a friend image from similar class, using the precomputed distance matrix
             all_tags_nofid = self.all_labels.drop(index=idx)
-            pi = cdist(label_vec, all_tags_nofid.values, metric="cityblock")
+            pi = self.label_distances[idx, all_tags_nofid.index].reshape(1, -1)
             weights = self.weightfunc(pi)
             sample = np.random.choice(all_tags_nofid.shape[0], p=weights)
             idx_friend = all_tags_nofid.index[sample]
