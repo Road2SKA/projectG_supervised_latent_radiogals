@@ -64,8 +64,12 @@ def parse_args():
     ap.add_argument("--weighting", type=str, default="closest",
                     choices=["closest", "ponderate"],
                     help="Weight function for sampling pairs: 'closest' or 'ponderate' (default: closest)")
+    ap.add_argument("--loss-mode", type=str, default="either", choices=["either", "both"],
+                    help="Whether to use 'either' (randomly choose friend or transformed) or 'both' (compute loss for both pairs) in BYOL loss")
     ap.add_argument("--prob", type=float, default=0.5,
-                    help="Probability of pairing from same class (default: 0.5)")
+                    help="Probability of pairing from same class (default: 0.5). Only applicable if loss_mode is 'either'.")
+    ap.add_argument("--supervision-strength", type=float, default=1.0, 
+                    help="Weighting factor for supervised pairing loss (default: 1.0). Only applicable if loss_mode is 'both'.")
     
     # Data subsampling
     ap.add_argument("--subsample", type=int, default=None,
@@ -337,10 +341,6 @@ test_labels_df = pd.DataFrame(test_labels)
 print(f"  Converted labels to DataFrames")
 
 # Transforms
-base_transform = T.Compose([
-    # Empty - tensors already created in __getitem__
-])
-
 byol_strong_aug = T.Compose([
     T.RandomHorizontalFlip(),
     T.RandomVerticalFlip(),
@@ -350,7 +350,7 @@ byol_strong_aug = T.Compose([
 train_dataset = BYOLSupDataset(
     tags_data=train_labels_df,
     img_data=train_images,
-    transform=base_transform,
+    transform=byol_strong_aug,
     friend_transform=byol_strong_aug,
     weightfunc=WEIGHTING_FUNC,
     p_pair_from_class=P_PAIR_FROM_CLASS
@@ -359,7 +359,7 @@ train_dataset = BYOLSupDataset(
 val_dataset = BYOLSupDataset(
     tags_data=val_labels_df,
     img_data=val_images,
-    transform=base_transform,
+    transform=byol_strong_aug,
     friend_transform=byol_strong_aug,
     weightfunc=WEIGHTING_FUNC,  
     p_pair_from_class=P_PAIR_FROM_CLASS
@@ -368,7 +368,7 @@ val_dataset = BYOLSupDataset(
 test_dataset = BYOLSupDataset(
     tags_data=test_labels_df,
     img_data=test_images,
-    transform=base_transform,
+    transform=byol_strong_aug,
     friend_transform=byol_strong_aug,
     weightfunc=WEIGHTING_FUNC,
     p_pair_from_class=P_PAIR_FROM_CLASS
@@ -402,13 +402,17 @@ print(f"Test:  {len(test_loader)} batches × {BATCH_SIZE}")
 print(f"{'='*70}\n")
 
 # Test sampling
-x1, x2, _ = next(iter(train_loader))
-print(f"✓ Test batch: {x1.shape}, {x2.shape}")
-print(f"  Different: {not torch.allclose(x1, x2)}")
+x1, x1_trans, x2_friend, _ = next(iter(train_loader))
+print(f"✓ Test batch: {x1.shape}, {x1_trans.shape}, {x2_friend.shape}")
+print(f"  Different: {not torch.allclose(x1, x1_trans)}")
 
 # =============================================================================
 # MODEL ARCHITECTURE
 # =============================================================================
+
+LOSS_MODE = args.loss_mode
+SUPERVISION_STRENGTH = args.supervision_strength
+PROB_PAIR_FROM_CLASS = args.prob
 
 def byol_loss(online_pred_1, online_pred_2, target_proj_1, target_proj_2):
     """
@@ -569,16 +573,33 @@ for epoch in range(NUM_EPOCHS):
     train_loss = 0.0
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
-    for x1, x2, _ in pbar:
-        x1, x2 = x1.to(device), x2.to(device)
-        
-        # Forward pass (different for each model type)
-        if MODEL_TYPE == "efficient":
-            pred1, pred2, proj1, proj2 = model(x1, x2)
-            loss = byol_loss(pred1, pred2, proj1, proj2)
-        else:  # original
-            images = torch.cat((x1, x2), dim=0)
-            loss = model(images)
+    for x1, x1_trans, x2_friend, _ in pbar:
+        x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
+        if LOSS_MODE == "either":
+            # Randomly choose to pair with friend or transformed version. 
+            u = torch.rand(x1.size(0), device=device).unsqueeze(1).unsqueeze(2).unsqueeze(3)*torch.ones(x1.size(), device=device)  # Shape: (B, 1, 1, 1)
+            x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
+            # Forward pass (different for each model type)
+            if MODEL_TYPE == "efficient":
+                pred1, pred2, proj1, proj2 = model(x1, x2)
+                loss = byol_loss(pred1, pred2, proj1, proj2)
+            else:  # original
+                images = torch.cat((x1, x2), dim=0)
+                loss = model(images)
+        else:  # "both"
+            if MODEL_TYPE == "efficient":
+                # Compute loss for both pairs and combine
+                pred1_f, pred2_f, proj1_f, proj2_f = model(x1, x2_friend)
+                loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
+                pred1_t, pred2_t, proj1_t, proj2_t = model(x1, x1_trans)
+                loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
+            else:  # original
+                images_friend = torch.cat((x1, x2_friend), dim=0)
+                loss_friend = model(images_friend)
+                images_trans = torch.cat((x1, x1_trans), dim=0)
+                loss_trans = model(images_trans)
+            loss = loss_trans + SUPERVISION_STRENGTH * loss_friend
+       
         
         # Backward pass
         optimizer.zero_grad()
@@ -609,15 +630,30 @@ for epoch in range(NUM_EPOCHS):
     val_loss = 0.0
     
     with torch.no_grad():
-        for x1, x2, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]  ", leave=False):
-            x1, x2 = x1.to(device), x2.to(device)
+        for x1, x1_trans, x2_friend, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]  ", leave=False):
+            x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
             
-            if MODEL_TYPE == "efficient":
-                pred1, pred2, proj1, proj2 = model(x1, x2)
-                val_loss += byol_loss(pred1, pred2, proj1, proj2).item()
-            else:  # original
-                images = torch.cat((x1, x2), dim=0)
-                val_loss += model(images).item()
+            if LOSS_MODE == "either":
+                u = torch.rand(x1.size(0), device=device).unsqueeze(1).unsqueeze(2).unsqueeze(3)*torch.ones(x1.size(), device=device)
+                x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
+                if MODEL_TYPE == "efficient":
+                    pred1, pred2, proj1, proj2 = model(x1, x2)
+                    val_loss += byol_loss(pred1, pred2, proj1, proj2).item()
+                else:  # original
+                    images = torch.cat((x1, x2), dim=0)
+                    val_loss += model(images).item()
+            else:  # "both"
+                if MODEL_TYPE == "efficient":
+                    pred1_f, pred2_f, proj1_f, proj2_f = model(x1, x2_friend)
+                    loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
+                    pred1_t, pred2_t, proj1_t, proj2_t = model(x1, x1_trans)
+                    loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
+                else:  # original
+                    images_friend = torch.cat((x1, x2_friend), dim=0)
+                    loss_friend = model(images_friend)
+                    images_trans = torch.cat((x1, x1_trans), dim=0)
+                    loss_trans = model(images_trans)
+                val_loss += (loss_trans + SUPERVISION_STRENGTH * loss_friend).item()
     
     avg_val_loss = val_loss / len(val_loader)
     
@@ -667,15 +703,29 @@ model.eval()
 test_loss = 0.0
 
 with torch.no_grad():
-    for x1, x2, _ in tqdm(test_loader, desc="Test"):
-        x1, x2 = x1.to(device), x2.to(device)
-        
-        if MODEL_TYPE == "efficient":
-            pred1, pred2, proj1, proj2 = model(x1, x2)
-            test_loss += byol_loss(pred1, pred2, proj1, proj2).item()
-        else:  # original
-            images = torch.cat((x1, x2), dim=0)
-            test_loss += model(images).item()
+    for x1, x1_trans, x2_friend, _ in tqdm(test_loader, desc="Test"):
+        x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
+        if LOSS_MODE == "either":
+                u = torch.rand(x1.size(0), device=device).unsqueeze(1).unsqueeze(2).unsqueeze(3)*torch.ones(x1.size(), device=device)
+                x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
+                if MODEL_TYPE == "efficient":
+                    pred1, pred2, proj1, proj2 = model(x1, x2)
+                    test_loss += byol_loss(pred1, pred2, proj1, proj2).item()
+                else:  # original
+                    images = torch.cat((x1, x2), dim=0)
+                    test_loss += model(images).item()
+        else:  # "both"
+            if MODEL_TYPE == "efficient":
+                pred1_f, pred2_f, proj1_f, proj2_f = model(x1, x2_friend)
+                loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
+                pred1_t, pred2_t, proj1_t, proj2_t = model(x1, x1_trans)
+                loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
+            else:  # original
+                images_friend = torch.cat((x1, x2_friend), dim=0)
+                loss_friend = model(images_friend)
+                images_trans = torch.cat((x1, x1_trans), dim=0)
+                loss_trans = model(images_trans)
+            test_loss += (loss_trans + SUPERVISION_STRENGTH * loss_friend).item()
 
 avg_test_loss = test_loss / len(test_loader)
 
@@ -847,7 +897,7 @@ def extract_embeddings_from_loader(model, dataloader, model_type, max_batches=No
     all_projections = []
     
     with torch.no_grad():
-        for batch_idx, (x1, x2, _) in enumerate(tqdm(dataloader, desc="Extracting")):
+        for batch_idx, (x1, x1_trans, x2_friend, _) in enumerate(tqdm(dataloader, desc="Extracting")):
             if max_batches and batch_idx >= max_batches:
                 break
             
