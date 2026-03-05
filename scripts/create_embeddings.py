@@ -25,9 +25,10 @@ import matplotlib.pyplot as plt
 import umap
 
 from suplat.data.data_samplers import BYOLSupDataset, weights_closest, weights_ponderate
+from suplat.data.augmentations import get_augmentation
 from suplat.models.byol_models import BYOLEfficient, BYOLOriginal, BYOLEncoder
-from suplat.trainer.trainer import byol_loss, get_ema_decay, get_warmup_lr, extract_embeddings_from_loader
-from suplat.utils.plotting import plot_umap_pure_classes, plot_training_curves
+from suplat.trainer.trainer import byol_loss, get_ema_decay, get_warmup_lr, get_supervision_weight, extract_embeddings_from_loader
+from suplat.utils.plotting import plot_umap_pure_classes, plot_umap_overlay, plot_umap_outliers, plot_training_curves
 
 # Check device availability
 if torch.cuda.is_available(): 
@@ -70,12 +71,31 @@ def parse_args():
                     help="Whether to use 'either' (randomly choose friend or transformed) or 'both' (compute loss for both pairs) in BYOL loss")
     ap.add_argument("--prob", type=float, default=0.5,
                     help="Probability of pairing from same class (default: 0.5). Only applicable if loss_mode is 'either'.")
-    ap.add_argument("--supervision-strength", type=float, default=1.0, 
-                    help="Weighting factor for supervised pairing loss (default: 1.0). Only applicable if loss_mode is 'both'.")
+    ap.add_argument("--prob-schedule", type=str, default="constant",
+                    choices=["constant", "linear", "cosine"],
+                    help="Curriculum schedule for pairing probability (default: constant)")
+    ap.add_argument("--prob-start", type=float, default=0.0,
+                    help="Starting probability for scheduled curriculum (default: 0.0)")
+    ap.add_argument("--prob-end", type=float, default=0.5,
+                    help="Ending probability for scheduled curriculum (default: 0.5)")
+    ap.add_argument("--supervision-weight", type=float, default=1.0,
+                    help="Weight for supervised pairing loss (default: 1.0). Only applicable if loss_mode is 'both'.")
+    ap.add_argument("--supervision-weight-schedule", type=str, default="constant",
+                    choices=["constant", "linear", "cosine"],
+                    help="Curriculum schedule for supervision weight (default: constant)")
+    ap.add_argument("--supervision-weight-start", type=float, default=0.0,
+                    help="Starting supervision weight for scheduled curriculum (default: 0.0)")
+    ap.add_argument("--supervision-weight-end", type=float, default=1.0,
+                    help="Ending supervision weight for scheduled curriculum (default: 1.0)")
     
     # Data subsampling
     ap.add_argument("--subsample", type=int, default=None,
                     help="Subsample dataset to N samples (for quick testing)")
+
+    # Augmentation
+    ap.add_argument("--augmentation", type=str, default="standard",
+                    choices=["standard", "extended"],
+                    help="Augmentation pipeline: 'standard' (flip+rotate) or 'extended' (+ gaussian noise + intensity scaling)")
     
     # Model selection
     ap.add_argument("--model-type", type=str, default="efficient",
@@ -163,7 +183,6 @@ EMA_DECAY_START = args.ema_decay_start
 EMA_DECAY_END = args.ema_decay_end
 
 # Dataset configuration
-DATA_DIR = args.data_dir
 DATASET_NAME = args.dataset
 P_PAIR_FROM_CLASS = args.prob
 
@@ -201,10 +220,11 @@ OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
 # Create run directory
 from datetime import datetime
+_timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
-    RUN_ID = args.run_name
+    RUN_ID = f"{args.run_name}_{_timestamp}"
 else:
-    RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
+    RUN_ID = _timestamp
     if DATASET_NAME != "LOTSS":
         RUN_ID += f"_{DATASET_NAME}"
     RUN_ID += f"_{MODEL_TYPE}_w{args.weighting}_p{P_PAIR_FROM_CLASS}"
@@ -220,7 +240,36 @@ LABEL_RANGES = {
 
 OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Create subfolders
+FIGURES_DIR    = OUTPUT_DIR / 'figures'
+EMBEDDINGS_DIR = OUTPUT_DIR / 'embeddings'
+LOGS_DIR       = OUTPUT_DIR / 'logs'
+DATA_DIR       = OUTPUT_DIR / 'data'
+for _d in [FIGURES_DIR, EMBEDDINGS_DIR, LOGS_DIR, DATA_DIR]:
+    _d.mkdir(exist_ok=True)
+
 checkpoint_path = OUTPUT_DIR / 'byol_model_best.pt'
+
+# Tee stdout to logs/run.log (SLURM also keeps its own copy)
+import sys as _sys
+class _Tee:
+    def __init__(self, *files):
+        self.files = files
+    def write(self, obj):
+        for f in self.files: f.write(obj); f.flush()
+    def flush(self):
+        for f in self.files: f.flush()
+_log_file = open(LOGS_DIR / 'run.log', 'w')
+_sys.stdout = _Tee(_sys.__stdout__, _log_file)
+
+# Write configuration log
+with open(LOGS_DIR / 'configuration_log.txt', 'w') as _cfg:
+    _cfg.write(f"Run: {RUN_ID}\n")
+    _cfg.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    _cfg.write("=" * 50 + "\n")
+    for key, val in sorted(vars(args).items()):
+        _cfg.write(f"{key}: {val}\n")
 label_dims = LABEL_RANGES[args.label_type][1] - LABEL_RANGES[args.label_type][0]
 
 print(f"\n{'='*70}")
@@ -232,7 +281,7 @@ print(f"CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A
 print(f"{'='*70}")
 print(f"Model type:     {MODEL_TYPE}")
 print(f"Dataset:        {DATASET_NAME}")
-print(f"Data dir:       {DATA_DIR}")
+print(f"Data dir:       {args.data_dir}")
 print(f"Label type:     {args.label_type} ({label_dims} dims)")
 print(f"Batch size:     {BATCH_SIZE}")
 print(f"Learning rate:  {LEARNING_RATE}")
@@ -258,8 +307,8 @@ print(f"{'='*70}\n")
 # =============================================================================
 
 # Data paths
-IMAGES_PATH = DATA_DIR / 'data/images.npy'
-LABELS_PATH = DATA_DIR / 'data/labels.npy'
+IMAGES_PATH = args.data_dir / 'data/images.npy'
+LABELS_PATH = args.data_dir / 'data/labels.npy'
 
 print(f"Attempting to load {DATASET_NAME} data...")
 print(f"  Images: {IMAGES_PATH}")
@@ -343,11 +392,8 @@ test_labels_df = pd.DataFrame(test_labels)
 print(f"  Converted labels to DataFrames")
 
 # Transforms
-byol_strong_aug = T.Compose([
-    T.RandomHorizontalFlip(),
-    T.RandomVerticalFlip(),
-    T.RandomRotation(180),
-])
+byol_strong_aug = get_augmentation(args.augmentation)
+print(f"  Augmentation: {args.augmentation}")
 
 train_dataset = BYOLSupDataset(
     tags_data=train_labels_df,
@@ -383,6 +429,13 @@ train_loader = DataLoader(
     pin_memory=use_cuda, drop_last=True
 )
 
+# No-shuffle loader for ordered embedding extraction (UMAP + outlier plots)
+train_extract_loader = DataLoader(
+    train_dataset, batch_size=BATCH_SIZE,
+    shuffle=False, num_workers=4 if use_cuda else 0,
+    pin_memory=use_cuda, drop_last=False
+)
+
 val_loader = DataLoader(
     val_dataset, batch_size=BATCH_SIZE,
     shuffle=False, num_workers=4 if use_cuda else 0,
@@ -413,8 +466,14 @@ print(f"  Different: {not torch.allclose(x1, x1_trans)}")
 # =============================================================================
 
 LOSS_MODE = args.loss_mode
-SUPERVISION_STRENGTH = args.supervision_strength
+SUPERVISION_WEIGHT = args.supervision_weight
+SUPERVISION_WEIGHT_SCHEDULE = args.supervision_weight_schedule
+SUPERVISION_WEIGHT_START = args.supervision_weight_start
+SUPERVISION_WEIGHT_END = args.supervision_weight_end
 PROB_PAIR_FROM_CLASS = args.prob
+PROB_SCHEDULE = args.prob_schedule
+PROB_START = args.prob_start
+PROB_END = args.prob_end
 
 # =============================================================================
 # MODEL INITIALIZATION
@@ -524,6 +583,25 @@ for epoch in range(NUM_EPOCHS):
         end_decay=EMA_DECAY_END
     )
     
+    # -------------------------------------------------------------------------
+    # SUPERVISION WEIGHT SCHEDULING
+    # -------------------------------------------------------------------------
+    current_supervision_weight = get_supervision_weight(
+        epoch, NUM_EPOCHS,
+        schedule=SUPERVISION_WEIGHT_SCHEDULE,
+        base_weight=SUPERVISION_WEIGHT,
+        start_weight=SUPERVISION_WEIGHT_START,
+        end_weight=SUPERVISION_WEIGHT_END,
+    )
+
+    current_prob = get_supervision_weight(
+        epoch, NUM_EPOCHS,
+        schedule=PROB_SCHEDULE,
+        base_weight=PROB_PAIR_FROM_CLASS,
+        start_weight=PROB_START,
+        end_weight=PROB_END,
+    )
+
     # Update EMA decay for original model
     if MODEL_TYPE == "original":
         model.target_ema_updater.beta = current_ema_decay
@@ -539,7 +617,7 @@ for epoch in range(NUM_EPOCHS):
         x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
         if LOSS_MODE == "either":
             u = torch.rand(x1.size(0), device=device).unsqueeze(1).unsqueeze(2).unsqueeze(3)*torch.ones(x1.size(), device=device)
-            x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
+            x2 = torch.where(u < current_prob, x2_friend, x1_trans)
             if MODEL_TYPE == "efficient":
                 pred1, pred2, proj1, proj2 = model(x1, x2)
                 loss = byol_loss(pred1, pred2, proj1, proj2)
@@ -557,7 +635,7 @@ for epoch in range(NUM_EPOCHS):
                 loss_friend = model(images_friend)
                 images_trans = torch.cat((x1, x1_trans), dim=0)
                 loss_trans = model(images_trans)
-            loss = loss_trans + SUPERVISION_STRENGTH * loss_friend
+            loss = loss_trans + current_supervision_weight * loss_friend
 
         optimizer.zero_grad()
         loss.backward()
@@ -586,7 +664,7 @@ for epoch in range(NUM_EPOCHS):
             x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
             if LOSS_MODE == "either":
                 u = torch.rand(x1.size(0), device=device).unsqueeze(1).unsqueeze(2).unsqueeze(3)*torch.ones(x1.size(), device=device)
-                x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
+                x2 = torch.where(u < current_prob, x2_friend, x1_trans)
                 if MODEL_TYPE == "efficient":
                     pred1, pred2, proj1, proj2 = model(x1, x2)
                     val_loss += byol_loss(pred1, pred2, proj1, proj2).item()
@@ -604,7 +682,7 @@ for epoch in range(NUM_EPOCHS):
                     loss_friend = model(images_friend)
                     images_trans = torch.cat((x1, x1_trans), dim=0)
                     loss_trans = model(images_trans)
-                val_loss += (loss_trans + SUPERVISION_STRENGTH * loss_friend).item()
+                val_loss += (loss_trans + current_supervision_weight * loss_friend).item()
 
     avg_val_loss = val_loss / len(val_loader)
 
@@ -624,7 +702,8 @@ for epoch in range(NUM_EPOCHS):
         best_epoch = epoch + 1
 
     best_marker = ' ★' if is_best else ''
-    print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | train: {avg_train_loss:.4f} | val: {avg_val_loss:.4f} | lr: {current_lr:.2e} | ema: {current_ema_decay:.4f}{best_marker}")
+    sup_str = f" | sup: {current_supervision_weight:.3f}" if LOSS_MODE == "both" else f" | prob: {current_prob:.3f}"
+    print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | train: {avg_train_loss:.4f} | val: {avg_val_loss:.4f} | lr: {current_lr:.2e} | ema: {current_ema_decay:.4f}{sup_str}{best_marker}")
     
     # Step scheduler (after warmup phase)
     if epoch >= WARMUP_EPOCHS:
@@ -670,7 +749,7 @@ with torch.no_grad():
                 loss_friend = model(images_friend)
                 images_trans = torch.cat((x1, x1_trans), dim=0)
                 loss_trans = model(images_trans)
-            test_loss += (loss_trans + SUPERVISION_STRENGTH * loss_friend).item()
+            test_loss += (loss_trans + current_supervision_weight * loss_friend).item()
 
 avg_test_loss = test_loss / len(test_loader)
 
@@ -714,6 +793,9 @@ torch.save({
         'encoder_dim': 512,
         'weighting': args.weighting,
         'p_pair_from_class': P_PAIR_FROM_CLASS,
+            'prob_schedule': PROB_SCHEDULE,
+            'supervision_weight': SUPERVISION_WEIGHT,
+            'supervision_weight_schedule': SUPERVISION_WEIGHT_SCHEDULE,
         'dataset': DATASET_NAME,
         'label_type': args.label_type,
     }
@@ -722,13 +804,13 @@ torch.save({
 print(f"✓ Model checkpoint saved to {checkpoint_path}")
 
 # Save training history
-np.save(OUTPUT_DIR / 'training_history.npy', history)
-print(f"✓ Training history saved to {OUTPUT_DIR / 'training_history.npy'}")
+np.save(DATA_DIR / 'training_history.npy', history)
+print(f"✓ Training history saved to {DATA_DIR / 'training_history.npy'}")
 
 # Plot training history (default behavior unless disabled)
 if not args.no_plot_history:
     print("\nGenerating training curve plots...")
-    plot_training_curves(history, best_val_loss, best_epoch, MODEL_TYPE, OUTPUT_DIR)
+    plot_training_curves(history, best_val_loss, best_epoch, MODEL_TYPE, FIGURES_DIR)
 
 # =============================================================================
 # EXTRACT EMBEDDINGS
@@ -736,10 +818,10 @@ if not args.no_plot_history:
 
 print("\nExtracting embeddings from DataLoaders...")
 
-# Extract from train loader
+# Extract from train loader (no-shuffle for ordered alignment with images)
 print("\n  Train set:")
 train_projections = extract_embeddings_from_loader(
-    model, train_loader, MODEL_TYPE, device, max_batches=None
+    model, train_extract_loader, MODEL_TYPE, device, max_batches=None
 )
 print(f"    Projections: {train_projections.shape}")
 
@@ -758,19 +840,16 @@ test_projections = extract_embeddings_from_loader(
 print(f"    Projections: {test_projections.shape}")
 
 # Save embeddings
-embeddings_dir = OUTPUT_DIR / 'embeddings'
-embeddings_dir.mkdir(exist_ok=True)
-
-np.save(embeddings_dir / 'train_projections.npy', train_projections)
-np.save(embeddings_dir / 'val_projections.npy', val_projections)
-np.save(embeddings_dir / 'test_projections.npy', test_projections)
+np.save(EMBEDDINGS_DIR / 'train_projections.npy', train_projections)
+np.save(EMBEDDINGS_DIR / 'val_projections.npy', val_projections)
+np.save(EMBEDDINGS_DIR / 'test_projections.npy', test_projections)
 
 # Save corresponding labels
-np.save(embeddings_dir / 'train_labels.npy', train_labels[:len(train_projections)])
-np.save(embeddings_dir / 'val_labels.npy', val_labels[:len(val_projections)])
-np.save(embeddings_dir / 'test_labels.npy', test_labels[:len(test_projections)])
+np.save(EMBEDDINGS_DIR / 'train_labels.npy', train_labels[:len(train_projections)])
+np.save(EMBEDDINGS_DIR / 'val_labels.npy', val_labels[:len(val_projections)])
+np.save(EMBEDDINGS_DIR / 'test_labels.npy', test_labels[:len(test_projections)])
 
-print(f"\n✓ Embeddings saved to {embeddings_dir}/")
+print(f"\n✓ Embeddings saved to {EMBEDDINGS_DIR}/")
 
 # Generate UMAP plots (default behavior unless disabled)
 if not args.no_plot_umap:
@@ -793,8 +872,8 @@ if not args.no_plot_umap:
     train_labels_full = labels_full[train_idx]
     test_labels_full = labels_full[test_idx]
     
-    # Plot UMAPs for train projections
-    plot_umap_pure_classes(
+    # Train UMAP: fit and save
+    train_reducer, train_2d = plot_umap_pure_classes(
         train_projections,
         train_labels[:len(train_projections)],
         "Train Projections (256-dim)",
@@ -804,13 +883,14 @@ if not args.no_plot_umap:
         SEED=SEED,
         LABEL_RANGES=LABEL_RANGES,
         CLASS_NAMES=CLASS_NAMES,
-        OUTPUT_DIR=OUTPUT_DIR,
+        OUTPUT_DIR=FIGURES_DIR,
         train_labels_full=train_labels_full,
         test_labels_full=test_labels_full,
     )
-    
-    # Plot UMAPs for test projections
-    plot_umap_pure_classes(
+    np.save(EMBEDDINGS_DIR / 'umap_train_coords.npy', train_2d)
+
+    # Test UMAP: independent fit with centroid annotations
+    _, _test_2d = plot_umap_pure_classes(
         test_projections,
         test_labels[:len(test_projections)],
         "Test Projections (256-dim)",
@@ -820,12 +900,38 @@ if not args.no_plot_umap:
         SEED=SEED,
         LABEL_RANGES=LABEL_RANGES,
         CLASS_NAMES=CLASS_NAMES,
-        OUTPUT_DIR=OUTPUT_DIR,
+        OUTPUT_DIR=FIGURES_DIR,
         train_labels_full=train_labels_full,
         test_labels_full=test_labels_full,
+        annotate_centroids=True,
+    )
+    np.save(EMBEDDINGS_DIR / 'umap_test_coords.npy', _test_2d)
+
+    # Test UMAP: transformed into train space (fair comparison)
+    plot_umap_pure_classes(
+        test_projections,
+        test_labels[:len(test_projections)],
+        "Test Projections in Train UMAP Space (256-dim)",
+        "umap_test_projections_transformed",
+        "test",
+        args=args,
+        SEED=SEED,
+        LABEL_RANGES=LABEL_RANGES,
+        CLASS_NAMES=CLASS_NAMES,
+        OUTPUT_DIR=FIGURES_DIR,
+        train_labels_full=train_labels_full,
+        test_labels_full=test_labels_full,
+        reducer=train_reducer,
     )
     
-    print(f"\n✓ UMAP plots saved to {OUTPUT_DIR}/")
+    # Outlier plot: 4 most extreme points in train UMAP space
+    plot_umap_outliers(
+        train_2d,
+        train_images[:len(train_2d)],
+        OUTPUT_DIR=FIGURES_DIR,
+    )
+
+    print(f"\n✓ UMAP plots saved to {FIGURES_DIR}/")
 
 print(f"\n{'='*70}")
 print(f"SCRIPT COMPLETE")

@@ -36,6 +36,27 @@ def get_warmup_lr(
     else:
         return base_lr * (epoch + 1) / warmup_epochs
 
+
+def get_supervision_weight(
+    epoch: int,
+    num_epochs: int,
+    schedule: str = 'constant',
+    base_weight: float = 1.0,
+    start_weight: float = 0.0,
+    end_weight: float = 1.0,
+) -> float:
+    """Compute supervision weight for current epoch based on curriculum schedule."""
+    if schedule == 'constant':
+        return base_weight
+    elif schedule == 'linear':
+        progress = epoch / max(num_epochs - 1, 1)
+        return start_weight + (end_weight - start_weight) * progress
+    elif schedule == 'cosine':
+        progress = epoch / max(num_epochs - 1, 1)
+        return start_weight + (end_weight - start_weight) * (1 - np.cos(np.pi * progress)) / 2
+    else:
+        raise ValueError(f"Unknown schedule: {schedule}")
+
 def byol_loss(
     online_pred_1: torch.Tensor,
     online_pred_2: torch.Tensor,
