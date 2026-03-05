@@ -1,9 +1,13 @@
 **/*.ipynb_checkpoints/
 .ipynb_checkpoints
 __pycache__
+**/__pycache__/
+core_*
 outputs
 logs
 *.sbatch
 .venv
 Dockerfile
 *.sqsh
+src/*.egg-info/
+*.npy
