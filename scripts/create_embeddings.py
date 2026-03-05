@@ -26,8 +26,8 @@ import umap
 
 from suplat.data.data_samplers import BYOLSupDataset, weights_closest, weights_ponderate
 from suplat.models.byol_models import BYOLEfficient, BYOLOriginal, BYOLEncoder
-from suplat.trainer.trainer import byol_loss, get_ema_decay, get_warmup_lr
-from suplat.utils.plotting import plot_umap_pure_classes
+from suplat.trainer.trainer import byol_loss, get_ema_decay, get_warmup_lr, extract_embeddings_from_loader
+from suplat.utils.plotting import plot_umap_pure_classes, plot_training_curves
 
 # Check device availability
 if torch.cuda.is_available(): 
@@ -533,15 +533,13 @@ for epoch in range(NUM_EPOCHS):
     # -------------------------------------------------------------------------
     model.train()
     train_loss = 0.0
-    
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
+
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
     for x1, x1_trans, x2_friend, _ in pbar:
         x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
         if LOSS_MODE == "either":
-            # Randomly choose to pair with friend or transformed version. 
-            u = torch.rand(x1.size(0), device=device).unsqueeze(1).unsqueeze(2).unsqueeze(3)*torch.ones(x1.size(), device=device)  # Shape: (B, 1, 1, 1)
+            u = torch.rand(x1.size(0), device=device).unsqueeze(1).unsqueeze(2).unsqueeze(3)*torch.ones(x1.size(), device=device)
             x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
-            # Forward pass (different for each model type)
             if MODEL_TYPE == "efficient":
                 pred1, pred2, proj1, proj2 = model(x1, x2)
                 loss = byol_loss(pred1, pred2, proj1, proj2)
@@ -550,7 +548,6 @@ for epoch in range(NUM_EPOCHS):
                 loss = model(images)
         else:  # "both"
             if MODEL_TYPE == "efficient":
-                # Compute loss for both pairs and combine
                 pred1_f, pred2_f, proj1_f, proj2_f = model(x1, x2_friend)
                 loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
                 pred1_t, pred2_t, proj1_t, proj2_t = model(x1, x1_trans)
@@ -561,40 +558,32 @@ for epoch in range(NUM_EPOCHS):
                 images_trans = torch.cat((x1, x1_trans), dim=0)
                 loss_trans = model(images_trans)
             loss = loss_trans + SUPERVISION_STRENGTH * loss_friend
-       
-        
-        # Backward pass
+
         optimizer.zero_grad()
         loss.backward()
-        
-        # Gradient clipping (if enabled)
         if GRAD_CLIP:
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        
         optimizer.step()
-        
-        # Update target network
+
         if MODEL_TYPE == "efficient":
             model.update_target_network(momentum=current_ema_decay)
         else:  # original
             model.update_moving_average()
-        
-        # Track loss
+
         train_loss += loss.item()
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
+        pbar.set_postfix({'train': f'{loss.item():.4f}'})
+
     avg_train_loss = train_loss / len(train_loader)
-    
+
     # -------------------------------------------------------------------------
     # VALIDATION
     # -------------------------------------------------------------------------
     model.eval()
     val_loss = 0.0
-    
+
     with torch.no_grad():
-        for x1, x1_trans, x2_friend, _ in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]  ", leave=False):
+        for x1, x1_trans, x2_friend, _ in val_loader:
             x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
-            
             if LOSS_MODE == "either":
                 u = torch.rand(x1.size(0), device=device).unsqueeze(1).unsqueeze(2).unsqueeze(3)*torch.ones(x1.size(), device=device)
                 x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
@@ -616,9 +605,9 @@ for epoch in range(NUM_EPOCHS):
                     images_trans = torch.cat((x1, x1_trans), dim=0)
                     loss_trans = model(images_trans)
                 val_loss += (loss_trans + SUPERVISION_STRENGTH * loss_friend).item()
-    
+
     avg_val_loss = val_loss / len(val_loader)
-    
+
     # -------------------------------------------------------------------------
     # LOGGING
     # -------------------------------------------------------------------------
@@ -627,21 +616,15 @@ for epoch in range(NUM_EPOCHS):
     history['val_loss'].append(avg_val_loss)
     history['lr'].append(current_lr)
     history['ema_decay'].append(current_ema_decay)
-    
-    print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
-    print(f"  Train Loss: {avg_train_loss:.4f}")
-    print(f"  Val Loss:   {avg_val_loss:.4f}")
-    print(f"  LR:         {current_lr:.6f}")
-    print(f"  EMA decay:  {current_ema_decay:.4f}")
-    
-    # Save best model
-    if avg_val_loss < best_val_loss:
+
+    is_best = avg_val_loss < best_val_loss
+    if is_best:
         best_val_loss = avg_val_loss
         best_model_state = copy.deepcopy(model.state_dict())
         best_epoch = epoch + 1
-        print(f"  ✓ New best model (val_loss: {best_val_loss:.4f})")
-    
-    print()
+
+    best_marker = ' ★' if is_best else ''
+    print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | train: {avg_train_loss:.4f} | val: {avg_val_loss:.4f} | lr: {current_lr:.2e} | ema: {current_ema_decay:.4f}{best_marker}")
     
     # Step scheduler (after warmup phase)
     if epoch >= WARMUP_EPOCHS:
@@ -745,160 +728,32 @@ print(f"✓ Training history saved to {OUTPUT_DIR / 'training_history.npy'}")
 # Plot training history (default behavior unless disabled)
 if not args.no_plot_history:
     print("\nGenerating training curve plots...")
-    
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f'Training History - {MODEL_TYPE.upper()} Model', fontsize=16)
-    
-    epochs = range(1, len(history['train_loss']) + 1)
-    
-    # Plot 1: Training and Validation Loss
-    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
-    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
-    axes[0, 0].axhline(y=best_val_loss, color='g', linestyle='--', label=f'Best Val ({best_val_loss:.4f})', alpha=0.7)
-    axes[0, 0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})', alpha=0.7)
-    axes[0, 0].set_xlabel('Epoch')
-    axes[0, 0].set_ylabel('Loss')
-    axes[0, 0].set_title('Training and Validation Loss')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    # Plot 2: Loss Difference (Overfitting indicator)
-    loss_diff = [val - train for train, val in zip(history['train_loss'], history['val_loss'])]
-    axes[0, 1].plot(epochs, loss_diff, 'purple', linewidth=2)
-    axes[0, 1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
-    axes[0, 1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
-    axes[0, 1].set_xlabel('Epoch')
-    axes[0, 1].set_ylabel('Val Loss - Train Loss')
-    axes[0, 1].set_title('Overfitting Indicator (Val - Train)')
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    # Plot 3: Learning Rate
-    axes[1, 0].plot(epochs, history['lr'], 'orange', linewidth=2)
-    axes[1, 0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Learning Rate')
-    axes[1, 0].set_title('Learning Rate Schedule')
-    axes[1, 0].grid(True, alpha=0.3)
-    axes[1, 0].set_yscale('log')
-    
-    # Plot 4: EMA Decay
-    axes[1, 1].plot(epochs, history['ema_decay'], 'green', linewidth=2)
-    axes[1, 1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
-    axes[1, 1].set_xlabel('Epoch')
-    axes[1, 1].set_ylabel('EMA Decay')
-    axes[1, 1].set_title('EMA Decay Schedule')
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save plot
-    plot_path = OUTPUT_DIR / 'training_curves.png'
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    print(f"✓ Training curves saved to {plot_path}")
-    
-    # Also save a zoomed version (last 20% of training)
-    if len(epochs) > 10:
-        start_idx = int(len(epochs) * 0.8)
-        
-        fig2, axes2 = plt.subplots(1, 2, figsize=(12, 4))
-        fig2.suptitle(f'Training History (Final 20%) - {MODEL_TYPE.upper()} Model', fontsize=14)
-        
-        epochs_zoom = list(epochs)[start_idx:]
-        train_zoom = history['train_loss'][start_idx:]
-        val_zoom = history['val_loss'][start_idx:]
-        
-        # Zoomed loss plot
-        axes2[0].plot(epochs_zoom, train_zoom, 'b-', label='Train Loss', linewidth=2)
-        axes2[0].plot(epochs_zoom, val_zoom, 'r-', label='Val Loss', linewidth=2)
-        axes2[0].axhline(y=best_val_loss, color='g', linestyle='--', label=f'Best Val ({best_val_loss:.4f})', alpha=0.7)
-        if best_epoch >= start_idx:  # Only show vertical line if best epoch is in zoomed range
-            axes2[0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})', alpha=0.7)
-        axes2[0].set_xlabel('Epoch')
-        axes2[0].set_ylabel('Loss')
-        axes2[0].set_title('Loss (Zoomed)')
-        axes2[0].legend()
-        axes2[0].grid(True, alpha=0.3)
-        
-        # Zoomed loss difference
-        loss_diff_zoom = loss_diff[start_idx:]
-        axes2[1].plot(epochs_zoom, loss_diff_zoom, 'purple', linewidth=2)
-        axes2[1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
-        if best_epoch >= start_idx:  # Only show vertical line if best epoch is in zoomed range
-            axes2[1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
-        axes2[1].set_xlabel('Epoch')
-        axes2[1].set_ylabel('Val Loss - Train Loss')
-        axes2[1].set_title('Overfitting Indicator (Zoomed)')
-        axes2[1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        zoom_plot_path = OUTPUT_DIR / 'training_curves_zoomed.png'
-        plt.savefig(zoom_plot_path, dpi=150, bbox_inches='tight')
-        print(f"✓ Zoomed training curves saved to {zoom_plot_path}")
-    
-    plt.close('all')
+    plot_training_curves(history, best_val_loss, best_epoch, MODEL_TYPE, OUTPUT_DIR)
 
 # =============================================================================
 # EXTRACT EMBEDDINGS
 # =============================================================================
-def extract_embeddings_from_loader(model, dataloader, model_type, max_batches=None):
-    """
-    Extract representations and projections from a DataLoader.
-    
-    Args:
-        model: Trained BYOL model
-        dataloader: DataLoader that yields (x1, x2, mdist) tuples
-        model_type: "efficient" or "original"
-        max_batches: Limit number of batches (None = all)
-    
-    Returns:
-        projections: (N, 256) projections from projector head
-    """
-    model.eval()
-    
-    all_projections = []
-    
-    with torch.no_grad():
-        for batch_idx, (x1, x1_trans, x2_friend, _) in enumerate(tqdm(dataloader, desc="Extracting")):
-            if max_batches and batch_idx >= max_batches:
-                break
-            
-            x1 = x1.to(device)
-            
-            if model_type == "efficient":
-                # Extract from efficient model
-                representation = model.online_encoder(x1)
-                projection = model.online_projector(representation)
-            else:  # original
-                # Extract from original model using return_embedding
-                projection, _ = model(x1, return_embedding=True, return_projection=True)
-            
-            all_projections.append(projection.cpu().numpy())
-
-    projections = np.vstack(all_projections)
-    
-    return projections
 
 print("\nExtracting embeddings from DataLoaders...")
 
 # Extract from train loader
 print("\n  Train set:")
 train_projections = extract_embeddings_from_loader(
-    model, train_loader, MODEL_TYPE, max_batches=None
+    model, train_loader, MODEL_TYPE, device, max_batches=None
 )
 print(f"    Projections: {train_projections.shape}")
 
 # Extract from val loader
 print("\n  Val set:")
 val_projections = extract_embeddings_from_loader(
-    model, val_loader, MODEL_TYPE, max_batches=None
+    model, val_loader, MODEL_TYPE, device, max_batches=None
 )
 print(f"    Projections: {val_projections.shape}")
 
 # Extract from test loader
 print("\n  Test set:")
 test_projections = extract_embeddings_from_loader(
-    model, test_loader, MODEL_TYPE, max_batches=None
+    model, test_loader, MODEL_TYPE, device, max_batches=None
 )
 print(f"    Projections: {test_projections.shape}")
 

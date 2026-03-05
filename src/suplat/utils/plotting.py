@@ -158,3 +158,102 @@ def plot_umap_pure_classes(
         plt.savefig(umap_path, dpi=150, bbox_inches='tight')
         print(f"    ✓ Saved {class_type} to {umap_path}")
         plt.close()
+
+
+# =============================================================================
+# TRAINING CURVES
+# =============================================================================
+
+def plot_training_curves(
+    history: dict,
+    best_val_loss: float,
+    best_epoch: int,
+    model_type: str,
+    output_dir: Path,
+) -> None:
+    """
+    Plot and save training history curves.
+
+    Args:
+        history:       dict with keys 'train_loss', 'val_loss', 'lr', 'ema_decay'
+        best_val_loss: best validation loss achieved
+        best_epoch:    epoch at which best_val_loss was achieved
+        model_type:    'efficient' or 'original' (used in plot title)
+        output_dir:    directory where PNGs are saved
+    """
+    epochs = range(1, len(history['train_loss']) + 1)
+    loss_diff = [v - t for t, v in zip(history['train_loss'], history['val_loss'])]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f'Training History - {model_type.upper()} Model', fontsize=16)
+
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+    axes[0, 0].axhline(y=best_val_loss, color='g', linestyle='--', label=f'Best Val ({best_val_loss:.4f})', alpha=0.7)
+    axes[0, 0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})', alpha=0.7)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(epochs, loss_diff, 'purple', linewidth=2)
+    axes[0, 1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
+    axes[0, 1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Val Loss - Train Loss')
+    axes[0, 1].set_title('Overfitting Indicator (Val - Train)')
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(epochs, history['lr'], 'orange', linewidth=2)
+    axes[1, 0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Learning Rate')
+    axes[1, 0].set_title('Learning Rate Schedule')
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].set_yscale('log')
+
+    axes[1, 1].plot(epochs, history['ema_decay'], 'green', linewidth=2)
+    axes[1, 1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('EMA Decay')
+    axes[1, 1].set_title('EMA Decay Schedule')
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'training_curves.png', dpi=150, bbox_inches='tight')
+    print(f"✓ Training curves saved to {output_dir / 'training_curves.png'}")
+
+    # Zoomed view of final 20%
+    if len(history['train_loss']) > 10:
+        start_idx = int(len(epochs) * 0.8)
+        epochs_zoom = list(epochs)[start_idx:]
+
+        fig2, axes2 = plt.subplots(1, 2, figsize=(12, 4))
+        fig2.suptitle(f'Training History (Final 20%) - {model_type.upper()} Model', fontsize=14)
+
+        axes2[0].plot(epochs_zoom, history['train_loss'][start_idx:], 'b-', label='Train Loss', linewidth=2)
+        axes2[0].plot(epochs_zoom, history['val_loss'][start_idx:], 'r-', label='Val Loss', linewidth=2)
+        axes2[0].axhline(y=best_val_loss, color='g', linestyle='--', label=f'Best Val ({best_val_loss:.4f})', alpha=0.7)
+        if best_epoch >= start_idx:
+            axes2[0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})', alpha=0.7)
+        axes2[0].set_xlabel('Epoch')
+        axes2[0].set_ylabel('Loss')
+        axes2[0].set_title('Loss (Zoomed)')
+        axes2[0].legend()
+        axes2[0].grid(True, alpha=0.3)
+
+        axes2[1].plot(epochs_zoom, loss_diff[start_idx:], 'purple', linewidth=2)
+        axes2[1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        if best_epoch >= start_idx:
+            axes2[1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+        axes2[1].set_xlabel('Epoch')
+        axes2[1].set_ylabel('Val Loss - Train Loss')
+        axes2[1].set_title('Overfitting Indicator (Zoomed)')
+        axes2[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(output_dir / 'training_curves_zoomed.png', dpi=150, bbox_inches='tight')
+        print(f"✓ Zoomed training curves saved to {output_dir / 'training_curves_zoomed.png'}")
+
+    plt.close('all')

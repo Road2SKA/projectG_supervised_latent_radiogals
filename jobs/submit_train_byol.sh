@@ -4,7 +4,7 @@
 #SBATCH --mem=16G
 #SBATCH --partition=debug
 #SBATCH --gres=gpu:1
-#SBATCH --time=00:02:00
+#SBATCH --time=00:01:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
 

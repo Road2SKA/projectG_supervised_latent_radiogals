@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -53,3 +54,41 @@ def byol_loss(
     loss_2 = (2 - 2 * (online_pred_2 * target_proj_1).sum(dim=-1)).mean()
     
     return loss_1 + loss_2
+
+# =============================================================================
+# EMBEDDING EXTRACTION
+# =============================================================================
+
+def extract_embeddings_from_loader(model, dataloader, model_type, device, max_batches=None):
+    """
+    Extract projections from a DataLoader using the trained model.
+
+    Args:
+        model:        Trained BYOL model
+        dataloader:   DataLoader yielding (x1, x1_trans, x2_friend, _) tuples
+        model_type:   'efficient' or 'original'
+        device:       torch.device to run inference on
+        max_batches:  Limit number of batches (None = all)
+
+    Returns:
+        projections: (N, D) array of projected embeddings
+    """
+    model.eval()
+    all_projections = []
+
+    with torch.no_grad():
+        for batch_idx, (x1, x1_trans, x2_friend, _) in enumerate(tqdm(dataloader, desc="Extracting")):
+            if max_batches and batch_idx >= max_batches:
+                break
+
+            x1 = x1.to(device)
+
+            if model_type == "efficient":
+                representation = model.online_encoder(x1)
+                projection = model.online_projector(representation)
+            else:  # original
+                projection, _ = model(x1, return_embedding=True, return_projection=True)
+
+            all_projections.append(projection.cpu().numpy())
+
+    return np.vstack(all_projections)
