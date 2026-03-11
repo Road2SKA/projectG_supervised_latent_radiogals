@@ -12,7 +12,8 @@ Idea: apply a self-supervised classification
 #### DL techniques
  - [Grill et al. 2020](https://arxiv.org/abs/2006.07733): Self-supervised representation learning with BYOL.
  - [Zeng et al. 2023](https://arxiv.org/pdf/2306.00112): BYOL guided by labels (search for BYOL-Sup in the paper).
- - [Khosla et al. 2020](https://arxiv.org/abs/2004.11362): Supervised contrastive learning with SimCLR (positive pairs are sampled through data augmentation and label similarity).
+ - [Khosla et al. 2020](https://arxiv.org/abs/2004.11362): Supervised contrastive learning with SimCLR (positive pairs are sampled through data augmentation and label similarity).\
+ - [Drozdova et al.](https://arxiv.org/pdf/2410.02069) Semi-supervised fine-tuning of Vision Foundation Models with Content-Style Decomposition
 
 
 #### Self-supervised learning on radio astronomy images
