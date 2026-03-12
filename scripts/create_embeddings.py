@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader #, Dataset
 import torchvision.transforms as T
 import argparse
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -21,6 +22,7 @@ from tqdm import tqdm
 import copy
 import random
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 import matplotlib.pyplot as plt
 import umap
 
@@ -154,7 +156,9 @@ def parse_args():
                     help="UMAP n_neighbors parameter (default: 15)")
     ap.add_argument("--umap-min-dist", type=float, default=0.1,
                     help="UMAP min_dist parameter (default: 0.1)")
-    
+    # METRICS
+    ap.add_argument("--no-metrics", action="store_true",
+                    help="Disable projection clustering metrics (enabled by default)")
     
     return ap.parse_args()
 
@@ -360,10 +364,10 @@ indices = np.arange(len(images))
 
 # Split
 train_idx, temp_idx = train_test_split(
-    indices, test_size=(VAL_RATIO + TEST_RATIO), random_state=42
+    indices, test_size=(VAL_RATIO + TEST_RATIO), random_state=SEED
 )
 val_idx, test_idx = train_test_split(
-    temp_idx, test_size=TEST_RATIO/(VAL_RATIO+TEST_RATIO), random_state=42
+    temp_idx, test_size=TEST_RATIO/(VAL_RATIO+TEST_RATIO), random_state=SEED
 )
 
 train_images = images[train_idx]
@@ -932,6 +936,49 @@ if not args.no_plot_umap:
     )
 
     print(f"\n✓ UMAP plots saved to {FIGURES_DIR}/")
+
+# Compute metrics (silhouette, Davies-Bouldin, Calinski-Harabasz) for test and train projections
+if not args.no_metrics:
+    # take the following cases : 
+    # - only FRI vs only FRII; 
+    # - all the base classes (FRI only, FRII only, all Hybrids, Spirals only, Relaxed doubles only) together
+
+    metrics = {}
+    for split, projections, labels in zip(
+        ['train', 'test'], 
+        [train_projections, test_projections], 
+        [train_labels[:len(train_projections)], test_labels[:len(test_projections)]]
+    ):
+        metrics[split] = {'fri_vs_frii':{}, 'base_classes':{}}
+        fri_only = (labels[:, 0] == 1) & (labels[:,1] == 0)
+        frii_only = (labels[:, 1] == 1) & (labels[:,0] == 0)
+        combined_fri_frii = fri_only | frii_only
+        #the labels are in the format of a one-hot encoding, so we need to convert them to a single label for each class
+        labels_hot = np.argmax(labels[combined_fri_frii][:,:2], axis=1)
+        metrics[split]['fri_vs_frii'] = {
+            'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot).item(),
+            'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot).item(),
+            'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot).item()
+        }
+        fri_only = (labels[:, 0] == 1) & (labels[:,:5].sum(axis=1) == 1)
+        frii_only = (labels[:, 1] == 1) & (labels[:,:5].sum(axis=1) == 1)
+        all_hybrids = (labels[:, 2] == 1)
+        spirals_only = (labels[:, 3] == 1) & (labels[:,:5].sum(axis=1) == 1)
+        relaxed_doubles_only = (labels[:, 4] == 1) & (labels[:,:5].sum(axis=1) == 1)
+        combined = fri_only | frii_only | all_hybrids | spirals_only | relaxed_doubles_only
+        print("DEBUG", labels.shape, fri_only.shape, all_hybrids.shape, combined.shape)
+        labels_hot = np.argmax(labels[combined][:,:5], axis=1)
+        labels_hot[all_hybrids[combined]] = 2  # assign hybrid label (index 2) to all hybrids, even if they also have spiral or relaxed double labels
+        metrics[split]['base_classes'] = {
+            'silhouette': silhouette_score(projections[combined], labels_hot).item(),
+            'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot).item(),
+            'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot).item()
+        }
+
+    # and save to a json file
+    with open(OUTPUT_DIR / 'projection_metrics.json', 'w') as f:
+        json.dump(metrics, f, indent=4)
+    print(f"✓ Projection clustering metrics saved to {OUTPUT_DIR / 'projection_metrics.json'}")
 
 print(f"\n{'='*70}")
 print(f"SCRIPT COMPLETE")

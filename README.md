@@ -20,3 +20,12 @@ Idea: apply a self-supervised classification
 
  - [Lochner and Rudnick 2025](https://iopscience.iop.org/article/10.3847/1538-3881/ada14c): BYOL applied on MGCLS data.
  - [Perez et al. 2025](https://www.aanda.org/articles/aa/full_html/2025/07/aa54735-25/aa54735-25.html): SimCLR applied to LoTSS-DR2 data.
+ - [Cecconello et al. 2024](https://arxiv.org/pdf/2411.14078): Benchmark of Self supervised learning algorithms on radio galaxy datasets.
+
+
+ #### Semi-supervised learning on radio astronomy images
+ - [Hossain et al. 2023](https://www.sciencedirect.com/science/article/pii/S1877050923009638): BYOL and SimCLR + classification finetuning on GalaxyZoo
+
+
+ #### Supervised learning on radio astronomy images
+ - [Ndung'u et al. 2024](https://academic.oup.com/mnras/article/530/1/783/7634374): Classification of radio galaxies with trainable COSFIRE filters
