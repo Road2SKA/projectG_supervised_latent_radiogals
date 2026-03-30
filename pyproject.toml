@@ -5,7 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "suplat"
 version = "0.1.0"
-requires-python = ">=3.9"
+description = "Semi-supervised contrastive learning for radio galaxy classification"
+requires-python = ">=3.10"
+
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "scipy",
+    "torch",
+    "torchvision",
+    "tqdm",
+    "umap-learn",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

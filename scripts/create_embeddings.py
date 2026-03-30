@@ -8,27 +8,24 @@ Supports both efficient and original (snippet-style) architectures
 # =============================================================================
 # IMPORTS
 # =============================================================================
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader #, Dataset
-import torchvision.transforms as T
 import argparse
+import copy
+import sys as _sys
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from tqdm import tqdm
-import copy
-import random
+import torch
 from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
-import umap
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from suplat.data.data_samplers import BYOLSupDataset, weights_closest, weights_ponderate
 from suplat.data.augmentations import get_augmentation
 from suplat.models.byol_models import BYOLEfficient, BYOLOriginal, BYOLEncoder
 from suplat.trainer.trainer import byol_loss, get_ema_decay, get_warmup_lr, get_supervision_weight, extract_embeddings_from_loader
-from suplat.utils.plotting import plot_umap_pure_classes, plot_umap_overlay, plot_umap_outliers, plot_training_curves
+from suplat.utils.plotting import plot_umap_pure_classes, plot_umap_outliers, plot_training_curves
 
 # Check device availability
 if torch.cuda.is_available(): 
@@ -49,7 +46,7 @@ def parse_args():
     
     # Data configuration
     ap.add_argument("--data-dir", type=Path, 
-                    default=Path('/users/mbredber/supervised_latent/'),
+                    default=Path('.'),
                     help="Root directory containing images.npy and labels.npy")
     ap.add_argument("--dataset", type=str, default="LOTSS",
                     choices=["LOTSS", "MOCK"],
@@ -209,8 +206,8 @@ if torch.cuda.is_available():
 
 else:
     device = torch.device('cpu')
-    print(f"⚠ CUDA not available, using CPU")
-    print(f"  This will be VERY slow and may crash with large batches")
+    print("⚠ CUDA not available, using CPU")
+    print("  This will be VERY slow and may crash with large batches")
 
 use_cuda = torch.cuda.is_available()
 
@@ -219,7 +216,6 @@ OUTPUT_BASE = args.output_dir
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
 # Create run directory
-from datetime import datetime
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     RUN_ID = f"{args.run_name}_{_timestamp}"
@@ -252,14 +248,16 @@ for _d in [FIGURES_DIR, EMBEDDINGS_DIR, LOGS_DIR, DATA_DIR]:
 checkpoint_path = OUTPUT_DIR / 'byol_model_best.pt'
 
 # Tee stdout to logs/run.log (SLURM also keeps its own copy)
-import sys as _sys
 class _Tee:
     def __init__(self, *files):
         self.files = files
     def write(self, obj):
-        for f in self.files: f.write(obj); f.flush()
+        for f in self.files: 
+            f.write(obj)
+            f.flush()
     def flush(self):
-        for f in self.files: f.flush()
+        for f in self.files: 
+            f.flush()
 _log_file = open(LOGS_DIR / 'run.log', 'w')
 _sys.stdout = _Tee(_sys.__stdout__, _log_file)
 
@@ -273,7 +271,7 @@ with open(LOGS_DIR / 'configuration_log.txt', 'w') as _cfg:
 label_dims = LABEL_RANGES[args.label_type][1] - LABEL_RANGES[args.label_type][0]
 
 print(f"\n{'='*70}")
-print(f"CONFIGURATION")
+print("CONFIGURATION")
 print(f"Output directory: {OUTPUT_DIR}")
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
@@ -342,7 +340,7 @@ if MOCK_DATA_SIZE is not None and len(images) > MOCK_DATA_SIZE:
     images = images[indices]
     labels = labels[indices]
 
-print(f"\n✓ Data loaded")
+print("\n✓ Data loaded")
 print(f"  Images: {images.shape} ({images.dtype})")
 print(f"  Labels: {labels.shape} ({labels.dtype})")
 print(f"  Range: [{images.min():.2f}, {images.max():.2f}]")
@@ -389,7 +387,7 @@ train_labels_df = pd.DataFrame(train_labels)
 val_labels_df = pd.DataFrame(val_labels)
 test_labels_df = pd.DataFrame(test_labels)
 
-print(f"  Converted labels to DataFrames")
+print("  Converted labels to DataFrames")
 
 # Transforms
 byol_strong_aug = get_augmentation(args.augmentation)
@@ -449,7 +447,7 @@ test_loader = DataLoader(
 )
 
 print(f"\n{'='*70}")
-print(f"✓ DATA LOADED")
+print("✓ DATA LOADED")
 print(f"{'='*70}")
 print(f"Train: {len(train_loader)} batches × {BATCH_SIZE}")
 print(f"Val:   {len(val_loader)} batches × {BATCH_SIZE}")
@@ -512,7 +510,7 @@ print(f"MODEL ARCHITECTURE ({MODEL_TYPE.upper()})")
 print(f"{'='*70}")
 print(f"Total parameters:     {total_params:,}")
 print(f"Trainable parameters: {trainable_params:,}")
-print(f"Encoder output:       512-dim representation")
+print("Encoder output:       512-dim representation")
 print(f"Projector output:     {PROJECTION_DIM}-dim projection")
 print(f"Predictor output:     {PROJECTION_DIM}-dim prediction")
 print(f"{'='*70}\n")
@@ -554,13 +552,13 @@ if WARMUP_EPOCHS > 0:
     print(f"✓ Warmup: {WARMUP_EPOCHS} epochs")
 if GRAD_CLIP:
     print(f"✓ Gradient clipping: max_norm={GRAD_CLIP}")
-print(f"✓ Loss: BYOL symmetric MSE")
+print("✓ Loss: BYOL symmetric MSE")
 
 # =============================================================================
 # TRAINING LOOP
 # =============================================================================
 print(f"\n{'='*70}")
-print(f"STARTING TRAINING")
+print("STARTING TRAINING")
 print(f"{'='*70}\n")
 
 for epoch in range(NUM_EPOCHS):
@@ -710,7 +708,7 @@ for epoch in range(NUM_EPOCHS):
         scheduler.step()
 
 print(f"{'='*70}")
-print(f"TRAINING COMPLETE")
+print("TRAINING COMPLETE")
 print(f"{'='*70}")
 print(f"Best validation loss: {best_val_loss:.4f}")
 print(f"{'='*70}\n")
@@ -754,7 +752,7 @@ with torch.no_grad():
 avg_test_loss = test_loss / len(test_loader)
 
 print(f"\n{'='*70}")
-print(f"TEST SET RESULTS (Best Model)")
+print("TEST SET RESULTS (Best Model)")
 print(f"{'='*70}")
 print(f"Test Loss:  {avg_test_loss:.4f}")
 print(f"Best Val:   {best_val_loss:.4f}")
@@ -934,7 +932,7 @@ if not args.no_plot_umap:
     print(f"\n✓ UMAP plots saved to {FIGURES_DIR}/")
 
 print(f"\n{'='*70}")
-print(f"SCRIPT COMPLETE")
+print("SCRIPT COMPLETE")
 print(f"{'='*70}")
 print(f"All outputs saved to: {OUTPUT_DIR.absolute()}")
 print(f"{'='*70}\n")
