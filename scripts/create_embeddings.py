@@ -532,12 +532,18 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # Scheduler: warmup + cosine annealing
 if WARMUP_EPOCHS > 0:
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=NUM_EPOCHS - WARMUP_EPOCHS
+    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - WARMUP_EPOCHS)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, 
+        milestones=[int(0.7*(NUM_EPOCHS - WARMUP_EPOCHS))], 
+        gamma=0.2
     )
 else:
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=NUM_EPOCHS
+    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, 
+        milestones=[int(0.7*NUM_EPOCHS)], 
+        gamma=0.2
     )
 
 # Training history
