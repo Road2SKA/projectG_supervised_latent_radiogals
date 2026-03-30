@@ -19,8 +19,8 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
-from torch.utils.data from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
-import DataLoader
+from torch.utils.data import DataLoader
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from tqdm import tqdm
 
 from suplat.data.data_samplers import BYOLSupDataset, weights_closest, weights_ponderate
