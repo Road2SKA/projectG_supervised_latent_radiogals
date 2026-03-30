@@ -11,3 +11,5 @@ Dockerfile
 *.sqsh
 src/*.egg-info/
 *.npy
+*.DS_store
+jobs/submit_train_byol.sh
