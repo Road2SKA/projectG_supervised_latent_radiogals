@@ -349,6 +349,7 @@ def plot_training_curves(
     best_epoch: int,
     model_type: str,
     output_dir: Path,
+    suffix: str = "",
 ) -> None:
     """
     Plot and save training history curves.
@@ -362,12 +363,15 @@ def plot_training_curves(
     """
     epochs = range(1, len(history['train_loss']) + 1)
     loss_diff = [v - t for t, v in zip(history['train_loss'], history['val_loss'])]
+    monitor = history.get('monitor_val_loss')
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     fig.suptitle(f'Training History - {model_type.upper()} Model', fontsize=16)
 
     axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
-    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss (scheduled)', linewidth=2)
+    if monitor:
+        axes[0, 0].plot(epochs, monitor, color='orange', linestyle='--', label='Val Monitor (fixed p=0.5)', linewidth=2, alpha=0.85)
     axes[0, 0].axhline(y=best_val_loss, color='g', linestyle='--', label=f'Best Val ({best_val_loss:.4f})', alpha=0.7)
     axes[0, 0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})', alpha=0.7)
     axes[0, 0].set_xlabel('Epoch')
@@ -400,8 +404,8 @@ def plot_training_curves(
     axes[1, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(output_dir / 'training_curves.png', dpi=150, bbox_inches='tight')
-    print(f"✓ Training curves saved to {output_dir / 'training_curves.png'}")
+    plt.savefig(output_dir / f'training_curves{suffix}.png', dpi=150, bbox_inches='tight')
+    print(f"✓ Training curves saved to {output_dir / f'training_curves{suffix}.png'}")
 
     # Zoomed view of final 20%
     if len(history['train_loss']) > 10:
@@ -412,7 +416,9 @@ def plot_training_curves(
         fig2.suptitle(f'Training History (Final 20%) - {model_type.upper()} Model', fontsize=14)
 
         axes2[0].plot(epochs_zoom, history['train_loss'][start_idx:], 'b-', label='Train Loss', linewidth=2)
-        axes2[0].plot(epochs_zoom, history['val_loss'][start_idx:], 'r-', label='Val Loss', linewidth=2)
+        axes2[0].plot(epochs_zoom, history['val_loss'][start_idx:], 'r-', label='Val Loss (scheduled)', linewidth=2)
+        if monitor:
+            axes2[0].plot(epochs_zoom, monitor[start_idx:], color='orange', linestyle='--', label='Val Monitor (fixed p=0.5)', linewidth=2, alpha=0.85)
         axes2[0].axhline(y=best_val_loss, color='g', linestyle='--', label=f'Best Val ({best_val_loss:.4f})', alpha=0.7)
         if best_epoch >= start_idx:
             axes2[0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, label=f'Best Epoch ({best_epoch})', alpha=0.7)
@@ -432,7 +438,7 @@ def plot_training_curves(
         axes2[1].grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(output_dir / 'training_curves_zoomed.png', dpi=150, bbox_inches='tight')
-        print(f"✓ Zoomed training curves saved to {output_dir / 'training_curves_zoomed.png'}")
+        plt.savefig(output_dir / f'training_curves_zoomed{suffix}.png', dpi=150, bbox_inches='tight')
+        print(f"✓ Zoomed training curves saved to {output_dir / f'training_curves_zoomed{suffix}.png'}")
 
     plt.close('all')
