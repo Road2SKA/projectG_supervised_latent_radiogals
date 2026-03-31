@@ -132,6 +132,8 @@ def parse_args():
                     help="Ending EMA decay for scheduled decay (default: 0.9999)")
     
     # Model architecture
+    ap.add_argument("--no-projector", action="store_true",
+                    help="Drop the projection MLP: encoder feeds directly into the predictor MLP (Astronomaly Protege style)")
     ap.add_argument("--projection-dim", type=int, default=256,
                     help="Projection head output dimension (default: 256)")
     ap.add_argument("--hidden-dim", type=int, default=4096,
@@ -150,7 +152,7 @@ def parse_args():
     # UMAP visualization
     ap.add_argument("--no-plot-umap", action="store_true",
                     help="Disable UMAP plots (enabled by default)")
-    ap.add_argument("--umap-n-neighbors", type=int, default=15,
+    ap.add_argument("--umap-n-neighbors", type=int, default=30,
                     help="UMAP n_neighbors parameter (default: 15)")
     ap.add_argument("--umap-min-dist", type=float, default=0.1,
                     help="UMAP min_dist parameter (default: 0.1)")
@@ -188,6 +190,7 @@ GRAD_CLIP = args.grad_clip
 WARMUP_EPOCHS = args.warmup_epochs
 NUM_WORKERS = args.num_workers
 CV_FOLDS = args.cv_folds
+USE_PROJECTOR = not args.no_projector
 
 # EMA decay scheduling
 EMA_DECAY_SCHEDULE = args.ema_decay_schedule
@@ -426,7 +429,8 @@ def train_fold(train_loader, val_loader):
             encoder_dim=512,
             projection_dim=PROJECTION_DIM,
             hidden_dim=HIDDEN_DIM,
-            bn_momentum=BN_MOMENTUM
+            bn_momentum=BN_MOMENTUM,
+            use_projector=USE_PROJECTOR,
         )
     else:
         enc = BYOLEncoder(bn_momentum=BN_MOMENTUM)
@@ -443,15 +447,19 @@ def train_fold(train_loader, val_loader):
 
     total_params = sum(p.numel() for p in fold_model.parameters())
     trainable_params = sum(p.numel() for p in fold_model.parameters() if p.requires_grad)
-    print(f"\nInitializing model...")
+    print("\nInitializing model...")
     print(f"{'='*70}")
     print(f"MODEL ARCHITECTURE ({MODEL_TYPE.upper()})")
     print(f"{'='*70}")
     print(f"Total parameters:     {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Encoder output:       512-dim representation")
-    print(f"Projector output:     {PROJECTION_DIM}-dim projection")
-    print(f"Predictor output:     {PROJECTION_DIM}-dim prediction")
+    print("Encoder output:       512-dim representation")
+    if USE_PROJECTOR:
+        print(f"Projector output:     {PROJECTION_DIM}-dim projection")
+        print(f"Predictor output:     {PROJECTION_DIM}-dim prediction")
+    else:
+        print("Projector:            disabled (encoder → predictor directly)")
+        print("Predictor output:     512-dim prediction")
     print(f"{'='*70}\n")
 
     if use_cuda:
@@ -483,7 +491,7 @@ def train_fold(train_loader, val_loader):
         print(f"✓ Warmup: {WARMUP_EPOCHS} epochs")
     if GRAD_CLIP:
         print(f"✓ Gradient clipping: max_norm={GRAD_CLIP}")
-    print(f"✓ Loss: BYOL symmetric MSE")
+    print("✓ Loss: BYOL symmetric MSE")
 
     history = {
         'train_loss': [],
@@ -637,9 +645,9 @@ def train_fold(train_loader, val_loader):
         history['lr'].append(current_lr)
         history['ema_decay'].append(current_ema_decay)
 
-        is_best = avg_val_loss < best_val_loss
+        is_best = avg_monitor_loss < best_val_loss
         if is_best:
-            best_val_loss = avg_val_loss
+            best_val_loss = avg_monitor_loss
             best_model_state = copy.deepcopy(fold_model.state_dict())
             best_epoch = epoch + 1
 
@@ -656,7 +664,7 @@ def train_fold(train_loader, val_loader):
     print(f"{'='*70}")
     print("TRAINING COMPLETE")
     print(f"{'='*70}")
-    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Best monitor loss: {best_val_loss:.4f}")
     print(f"{'='*70}\n")
 
     fold_model.load_state_dict(best_model_state)
@@ -826,7 +834,7 @@ else:
     print(f"\n{'='*70}")
     print("CROSS-VALIDATION SUMMARY")
     print(f"{'='*70}")
-    print(f"{'Fold':>6} | {'Best Val Loss':>13} | {'Test Loss':>9}")
+    print(f"{'Fold':>6} | {'Best Mon Loss':>13} | {'Test Loss':>9}")
     print("-" * 37)
     for i, r in enumerate(fold_results):
         print(f"{i+1:>6} | {r['best_val_loss']:>13.4f} | {r['test_loss']:>9.4f}")

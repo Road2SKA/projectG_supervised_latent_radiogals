@@ -176,24 +176,30 @@ class BYOLEfficient(nn.Module):
     
     Loss compares online prediction with target projection.
     """
-    def __init__(self, encoder_dim=512, projection_dim=256, hidden_dim=4096, bn_momentum=0.1):
+    def __init__(self, encoder_dim=512, projection_dim=256, hidden_dim=4096, bn_momentum=0.1,
+                 use_projector=True):
         super().__init__()
-        
+
         # Online network: encoder → projector → predictor
         self.online_encoder = BYOLEncoder(bn_momentum=bn_momentum)
-        self.online_projector = ProjectionHead(
-            in_dim=encoder_dim, 
-            hidden_dim=hidden_dim, 
-            out_dim=projection_dim,
-            bn_momentum=bn_momentum
-        )
+        if use_projector:
+            self.online_projector = ProjectionHead(
+                in_dim=encoder_dim,
+                hidden_dim=hidden_dim,
+                out_dim=projection_dim,
+                bn_momentum=bn_momentum
+            )
+            predictor_in_dim = projection_dim
+        else:
+            self.online_projector = nn.Identity()
+            predictor_in_dim = encoder_dim
         self.online_predictor = PredictionHead(
-            in_dim=projection_dim, 
-            hidden_dim=hidden_dim, 
-            out_dim=projection_dim,
+            in_dim=predictor_in_dim,
+            hidden_dim=hidden_dim,
+            out_dim=predictor_in_dim,
             bn_momentum=bn_momentum
         )
-        
+
         # Target network: encoder → projector (no predictor!)
         self.target_encoder = copy.deepcopy(self.online_encoder)
         self.target_projector = copy.deepcopy(self.online_projector)
