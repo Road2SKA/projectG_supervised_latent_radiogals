@@ -138,7 +138,7 @@ def parse_args():
     
     # Output configuration
     ap.add_argument("--output-dir", type=Path,
-                    default=Path('/users/mbredber/supervised_latent/outputs'),
+                    default=Path('./outputs'),
                     help="Base output directory for checkpoints and embeddings")
     ap.add_argument("--run-name", type=str, default=None,
                     help="Custom run name (default: timestamp)")
@@ -960,9 +960,9 @@ if not args.no_metrics:
         #the labels are in the format of a one-hot encoding, so we need to convert them to a single label for each class
         labels_hot = np.argmax(labels[combined_fri_frii][:,:2], axis=1)
         metrics[split]['fri_vs_frii'] = {
-            'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot).item(),
-            'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot).item(),
-            'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot).item()
+            'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot),
+            'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot),
+            'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot)
         }
         fri_only = (labels[:, 0] == 1) & (labels[:,:5].sum(axis=1) == 1)
         frii_only = (labels[:, 1] == 1) & (labels[:,:5].sum(axis=1) == 1)
@@ -974,9 +974,9 @@ if not args.no_metrics:
         labels_hot = np.argmax(labels[combined][:,:5], axis=1)
         labels_hot[all_hybrids[combined]] = 2  # assign hybrid label (index 2) to all hybrids, even if they also have spiral or relaxed double labels
         metrics[split]['base_classes'] = {
-            'silhouette': silhouette_score(projections[combined], labels_hot).item(),
-            'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot).item(),
-            'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot).item()
+            'silhouette': silhouette_score(projections[combined], labels_hot),
+            'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot),
+            'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot)
         }
 
     # and save to a json file
