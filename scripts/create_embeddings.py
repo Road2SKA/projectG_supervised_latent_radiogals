@@ -27,7 +27,7 @@ from tqdm import tqdm
 from suplat.data.data_samplers import BYOLSupDataset, weights_closest, weights_ponderate
 from suplat.data.augmentations import get_augmentation
 from suplat.models.byol_models import BYOLEfficient, BYOLOriginal, BYOLEncoder
-from suplat.trainer.trainer import byol_loss, get_ema_decay, get_warmup_lr, get_supervision_weight, extract_embeddings_from_loader
+from suplat.trainer.trainer import byol_loss, get_warmup_lr, get_supervision_weight, extract_embeddings_from_loader
 from suplat.utils.plotting import plot_umap_pure_classes, plot_umap_outliers, plot_training_curves
 
 # Check device availability
@@ -67,7 +67,7 @@ def parse_args():
     ap.add_argument("--weighting", type=str, default="closest",
                     choices=["closest", "ponderate"],
                     help="Weight function for sampling pairs: 'closest' or 'ponderate' (default: closest)")
-    ap.add_argument("--loss-mode", type=str, default="either", choices=["either", "both"],
+    ap.add_argument("--loss-mode", type=str, default="both", choices=["either", "both"],
                     help="Whether to use 'either' (randomly choose friend or transformed) or 'both' (compute loss for both pairs) in BYOL loss")
     ap.add_argument("--prob", type=float, default=0.5,
                     help="Probability of pairing from same class (default: 0.5). Only applicable if loss_mode is 'either'.")
@@ -109,27 +109,13 @@ def parse_args():
                     help="Learning rate (default: 0.0003)")
     ap.add_argument("--epochs", type=int, default=100,
                     help="Number of training epochs (default: 100)")
-    ap.add_argument("--ema-decay", type=float, default=0.996,
-                    help="EMA decay rate for target network (default: 0.996)")
-    
     # Gradient and optimization
+    ap.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "step"],
+                    help="Learning rate schedule: 'constant' or 'step' (step decay at 70%% of epochs, gamma=0.2) (default: constant)")
     ap.add_argument("--grad-clip", type=float, default=None,
                     help="Gradient clipping max norm (default: None, no clipping)")
     ap.add_argument("--warmup-epochs", type=int, default=0,
                     help="Number of learning rate warmup epochs (default: 0)")
-    
-    # Batch normalization
-    ap.add_argument("--bn-momentum", type=float, default=0.1,
-                    help="BatchNorm momentum (default: 0.1, PyTorch default)")
-    
-    # EMA decay scheduling
-    ap.add_argument("--ema-decay-schedule", type=str, default="constant",
-                    choices=["constant", "cosine"],
-                    help="EMA decay scheduling strategy (default: constant)")
-    ap.add_argument("--ema-decay-start", type=float, default=0.996,
-                    help="Starting EMA decay for scheduled decay (default: 0.996)")
-    ap.add_argument("--ema-decay-end", type=float, default=0.9999,
-                    help="Ending EMA decay for scheduled decay (default: 0.9999)")
     
     # Model architecture
     ap.add_argument("--no-projector", action="store_true",
@@ -179,23 +165,18 @@ args = parse_args()
 BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.lr
 NUM_EPOCHS = args.epochs
-EMA_DECAY = args.ema_decay
+EMA_DECAY = 0.99
 PROJECTION_DIM = args.projection_dim
 HIDDEN_DIM = args.hidden_dim
-BN_MOMENTUM = args.bn_momentum
 MODEL_TYPE = args.model_type
 
 # Optimization hyperparameters
 GRAD_CLIP = args.grad_clip
+LR_SCHEDULE = args.lr_schedule
 WARMUP_EPOCHS = args.warmup_epochs
 NUM_WORKERS = args.num_workers
 CV_FOLDS = args.cv_folds
 USE_PROJECTOR = not args.no_projector
-
-# EMA decay scheduling
-EMA_DECAY_SCHEDULE = args.ema_decay_schedule
-EMA_DECAY_START = args.ema_decay_start
-EMA_DECAY_END = args.ema_decay_end
 
 # Dataset configuration
 DATASET_NAME = args.dataset
@@ -304,13 +285,7 @@ print(f"Learning rate:  {LEARNING_RATE}")
 print(f"Epochs:         {NUM_EPOCHS}")
 print(f"Warmup epochs:  {WARMUP_EPOCHS}")
 print(f"Grad clip:      {GRAD_CLIP if GRAD_CLIP else 'None'}")
-print(f"BN momentum:    {BN_MOMENTUM}")
-print(f"EMA decay:      {EMA_DECAY_SCHEDULE}")
-if EMA_DECAY_SCHEDULE == "cosine":
-    print(f"  Start:        {EMA_DECAY_START}")
-    print(f"  End:          {EMA_DECAY_END}")
-else:
-    print(f"  Value:        {EMA_DECAY}")
+print(f"EMA decay:      {EMA_DECAY}")
 print(f"Weighting:      {args.weighting}")
 print(f"Pair prob:      {PROB_PAIR_FROM_CLASS}")
 print(f"Num workers:    {NUM_WORKERS}")
@@ -429,11 +404,11 @@ def train_fold(train_loader, val_loader):
             encoder_dim=512,
             projection_dim=PROJECTION_DIM,
             hidden_dim=HIDDEN_DIM,
-            bn_momentum=BN_MOMENTUM,
+            bn_momentum=0.1,
             use_projector=USE_PROJECTOR,
         )
     else:
-        enc = BYOLEncoder(bn_momentum=BN_MOMENTUM)
+        enc = BYOLEncoder(bn_momentum=0.1)
         fold_model = BYOLOriginal(
             enc,
             image_size=89,
@@ -441,7 +416,7 @@ def train_fold(train_loader, val_loader):
             projection_hidden_size=HIDDEN_DIM,
             moving_average_decay=EMA_DECAY,
             use_momentum=True,
-            bn_momentum=BN_MOMENTUM
+            bn_momentum=0.1
         )
     fold_model = fold_model.to(device)
 
@@ -470,23 +445,14 @@ def train_fold(train_loader, val_loader):
     # OPTIMIZER AND SCHEDULER
     # -------------------------------------------------------------------------
     optimizer = torch.optim.Adam(fold_model.parameters(), lr=LEARNING_RATE)
-    if WARMUP_EPOCHS > 0:
-        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - WARMUP_EPOCHS)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer,
-            milestones=[int(0.7*(NUM_EPOCHS - WARMUP_EPOCHS))],
-            gamma=0.2
-        )
+    if LR_SCHEDULE == "step":
+        milestone = int(0.7 * (NUM_EPOCHS - WARMUP_EPOCHS if WARMUP_EPOCHS > 0 else NUM_EPOCHS))
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[milestone], gamma=0.2)
     else:
-        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer,
-            milestones=[int(0.7*NUM_EPOCHS)],
-            gamma=0.2
-        )
+        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
     print(f"✓ Optimizer: Adam (lr={LEARNING_RATE})")
-    print(f"✓ Scheduler: MultiStepLR (milestone={int(0.7*NUM_EPOCHS)} epochs, gamma=0.2)")
+    print(f"✓ Scheduler: {LR_SCHEDULE}" + (f" (milestone={int(0.7*NUM_EPOCHS)} epochs, gamma=0.2)" if LR_SCHEDULE == "step" else ""))
     if WARMUP_EPOCHS > 0:
         print(f"✓ Warmup: {WARMUP_EPOCHS} epochs")
     if GRAD_CLIP:
@@ -518,16 +484,7 @@ def train_fold(train_loader, val_loader):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
 
-        # -------------------------------------------------------------------
-        # EMA DECAY SCHEDULING
-        # -------------------------------------------------------------------
-        current_ema_decay = get_ema_decay(
-            epoch, NUM_EPOCHS,
-            schedule=EMA_DECAY_SCHEDULE,
-            base_decay=EMA_DECAY,
-            start_decay=EMA_DECAY_START,
-            end_decay=EMA_DECAY_END
-        )
+        current_ema_decay = EMA_DECAY
 
         # -------------------------------------------------------------------
         # SUPERVISION WEIGHT AND PAIRING PROB SCHEDULING
@@ -909,11 +866,7 @@ for _item in _items:
             'num_epochs': NUM_EPOCHS,
             'warmup_epochs': WARMUP_EPOCHS,
             'grad_clip': GRAD_CLIP,
-            'bn_momentum': BN_MOMENTUM,
             'ema_decay': EMA_DECAY,
-            'ema_decay_schedule': EMA_DECAY_SCHEDULE,
-            'ema_decay_start': EMA_DECAY_START,
-            'ema_decay_end': EMA_DECAY_END,
             'projection_dim': PROJECTION_DIM,
             'hidden_dim': HIDDEN_DIM,
             'encoder_dim': 512,

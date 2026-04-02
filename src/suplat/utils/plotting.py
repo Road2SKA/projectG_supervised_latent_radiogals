@@ -311,6 +311,8 @@ def plot_umap_outliers(
     fig, axes = plt.subplots(n_outliers, 2, figsize=(10, 4 * n_outliers))
     fig.suptitle('Most Extreme UMAP Outliers', fontsize=14)
 
+    other_color = 'orange'
+
     for row, idx in enumerate(outlier_indices):
         x, y = train_2d[idx]
         dist = distances[idx]
@@ -321,12 +323,20 @@ def plot_umap_outliers(
         ax_img.set_title(f'Outlier #{row + 1} | UMAP: ({x:.2f}, {y:.2f}) | dist: {dist:.2f}')
         ax_img.axis('off')
 
-        # Right: UMAP overview with outlier marked
+        # Right: UMAP overview with all outliers marked
         ax_umap = axes[row, 1]
         ax_umap.scatter(train_2d[:, 0], train_2d[:, 1],
                         c='lightgrey', s=3, alpha=0.3, zorder=1)
-        ax_umap.scatter(x, y, c='red', s=100, marker='*',
-                        zorder=2, label=f'Outlier #{row + 1}')
+        # Mark all other outliers in orange
+        for other_row, other_idx in enumerate(outlier_indices):
+            if other_idx == idx:
+                continue
+            ox, oy = train_2d[other_idx]
+            ax_umap.scatter(ox, oy, c=other_color, s=60, marker='*',
+                            zorder=2, label=f'Outlier #{other_row + 1}')
+        # Highlight current outlier in red (on top)
+        ax_umap.scatter(x, y, c='red', s=120, marker='*',
+                        zorder=3, label=f'Outlier #{row + 1} (this)')
         ax_umap.set_xlabel('UMAP 1')
         ax_umap.set_ylabel('UMAP 2')
         ax_umap.legend(fontsize=8)
