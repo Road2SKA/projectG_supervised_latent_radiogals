@@ -377,23 +377,23 @@ def _make_dataset_loader(img_data, label_data, shuffle, drop_last=False):
 
 
 def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
-    """Fixed monitoring loss for one batch: prob=0.5, curriculum-independent."""
-    u = (torch.rand(x1.size(0), device=device)
-         .unsqueeze(1).unsqueeze(2).unsqueeze(3)
-         .expand_as(x1))
-    x2_m = torch.where(u < 0.5, x2_friend, x1_trans)
+    """Fixed monitoring loss for one batch: both mode, supervision weight=1, curriculum-independent."""
     if MODEL_TYPE == "efficient":
-        pred1, pred2, proj1, proj2 = fold_model(x1, x2_m)
-        return byol_loss(pred1, pred2, proj1, proj2).item()
+        pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
+        loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
+        pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
+        loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
     else:
-        return fold_model(torch.cat((x1, x2_m), dim=0)).item()
+        loss_friend = fold_model(torch.cat((x1, x2_friend), dim=0))
+        loss_trans  = fold_model(torch.cat((x1, x1_trans),  dim=0))
+    return (loss_trans + loss_friend).item()
 
 
 def train_fold(train_loader, val_loader):
     """
     Train one model fold from scratch.
     Model selection uses the scheduled val loss.
-    The fixed monitoring loss (prob=0.5) is tracked separately for visualization.
+    The fixed monitoring loss (both mode, supervision weight=1) is tracked separately for visualization.
     Returns: (model, history, best_val_loss, best_epoch)
     """
     # -------------------------------------------------------------------------
