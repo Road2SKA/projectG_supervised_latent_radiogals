@@ -139,7 +139,7 @@ def parse_args():
     ap.add_argument("--no-plot-umap", action="store_true",
                     help="Disable UMAP plots (enabled by default)")
     ap.add_argument("--umap-n-neighbors", type=int, default=30,
-                    help="UMAP n_neighbors parameter (default: 15)")
+                    help="UMAP n_neighbors parameter (default: 30)")
     ap.add_argument("--umap-min-dist", type=float, default=0.1,
                     help="UMAP min_dist parameter (default: 0.1)")
     # DataLoader workers
@@ -300,8 +300,8 @@ print(f"{'='*70}\n")
 # =============================================================================
 
 # Data paths
-IMAGES_PATH = args.data_dir / 'images.npy'
-LABELS_PATH = args.data_dir / 'labels.npy'
+IMAGES_PATH = args.data_dir / 'images_filtered.npy'
+LABELS_PATH = args.data_dir / 'labels_filtered.npy'
 
 print(f"Attempting to load {DATASET_NAME} data...")
 print(f"  Images: {IMAGES_PATH}")
@@ -353,6 +353,7 @@ SUPERVISION_WEIGHT_END = args.supervision_weight_end
 PROB_SCHEDULE = args.prob_schedule
 PROB_START = args.prob_start
 PROB_END = args.prob_end
+USE_CURRICULUM = SUPERVISION_WEIGHT_SCHEDULE != "constant" or PROB_SCHEDULE != "constant"
 
 # =============================================================================
 # WEIGHTING, AUGMENTATION, AND HELPER FUNCTIONS
@@ -392,8 +393,9 @@ def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
 def train_fold(train_loader, val_loader):
     """
     Train one model fold from scratch.
-    Model selection uses the scheduled val loss.
-    The fixed monitoring loss (both mode, supervision weight=1) is tracked separately for visualization.
+    When curriculum scheduling is active, model selection uses the monitoring val loss
+    (both mode, supervision_weight=1, curriculum-independent). Otherwise, the regular
+    val loss is used for model selection.
     Returns: (model, history, best_val_loss, best_epoch)
     """
     # -------------------------------------------------------------------------
@@ -464,7 +466,7 @@ def train_fold(train_loader, val_loader):
         'val_loss': [],
         'monitor_val_loss': [],
         'lr': [],
-        'ema_decay': [],
+        'supervision_schedule': [],
     }
 
     best_val_loss = float('inf')
@@ -554,7 +556,7 @@ def train_fold(train_loader, val_loader):
         avg_train_loss = train_loss / len(train_loader)
 
         # -------------------------------------------------------------------
-        # VALIDATION: scheduled loss (model selection) + monitor loss (viz)
+        # VALIDATION: scheduled loss + (if curriculum) monitoring loss
         # -------------------------------------------------------------------
         fold_model.eval()
         val_loss = 0.0
@@ -564,7 +566,7 @@ def train_fold(train_loader, val_loader):
             for x1, x1_trans, x2_friend, _ in val_loader:
                 x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
 
-                # Scheduled val loss (used for model selection within fold)
+                # Scheduled val loss (mirrors training loss)
                 if LOSS_MODE == "either":
                     u = (torch.rand(x1.size(0), device=device)
                          .unsqueeze(1).unsqueeze(2).unsqueeze(3)
@@ -586,11 +588,12 @@ def train_fold(train_loader, val_loader):
                         loss_trans  = fold_model(torch.cat((x1, x1_trans),  dim=0))
                     val_loss += (loss_trans + current_supervision_weight * loss_friend).item()
 
-                # Fixed monitoring loss: prob=0.5, curriculum-independent
-                monitor_loss += _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend)
+                # Monitoring loss: only computed when curriculum scheduling is active
+                if USE_CURRICULUM:
+                    monitor_loss += _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend)
 
         avg_val_loss = val_loss / len(val_loader)
-        avg_monitor_loss = monitor_loss / len(val_loader)
+        avg_monitor_loss = monitor_loss / len(val_loader) if USE_CURRICULUM else None
 
         # -------------------------------------------------------------------
         # LOGGING
@@ -600,20 +603,24 @@ def train_fold(train_loader, val_loader):
         history['val_loss'].append(avg_val_loss)
         history['monitor_val_loss'].append(avg_monitor_loss)
         history['lr'].append(current_lr)
-        history['ema_decay'].append(current_ema_decay)
+        sched_val = current_supervision_weight if LOSS_MODE == "both" else current_prob
+        history['supervision_schedule'].append(sched_val)
 
-        is_best = avg_monitor_loss < best_val_loss
+        # Model selection: use monitor loss when curriculum is active, otherwise val loss
+        selection_loss = avg_monitor_loss if USE_CURRICULUM else avg_val_loss
+        is_best = selection_loss < best_val_loss
         if is_best:
-            best_val_loss = avg_monitor_loss
+            best_val_loss = selection_loss
             best_model_state = copy.deepcopy(fold_model.state_dict())
             best_epoch = epoch + 1
 
         best_marker = ' ★' if is_best else ''
         sup_str = (f" | sup: {current_supervision_weight:.3f}" if LOSS_MODE == "both"
                    else f" | prob: {current_prob:.3f}")
+        mon_str = f" | mon: {avg_monitor_loss:.4f}" if USE_CURRICULUM else ""
         print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | train: {avg_train_loss:.4f}"
-              f" | val: {avg_val_loss:.4f} | mon: {avg_monitor_loss:.4f}"
-              f" | lr: {current_lr:.2e} | ema: {current_ema_decay:.4f}{sup_str}{best_marker}")
+              f" | val: {avg_val_loss:.4f}{mon_str}"
+              f" | lr: {current_lr:.2e}{sup_str}{best_marker}")
 
         if epoch >= WARMUP_EPOCHS:
             scheduler.step()
@@ -621,7 +628,8 @@ def train_fold(train_loader, val_loader):
     print(f"{'='*70}")
     print("TRAINING COMPLETE")
     print(f"{'='*70}")
-    print(f"Best monitor loss: {best_val_loss:.4f}")
+    loss_label = "Best monitor loss" if USE_CURRICULUM else "Best val loss"
+    print(f"{loss_label}: {best_val_loss:.4f}")
     print(f"{'='*70}\n")
 
     fold_model.load_state_dict(best_model_state)
@@ -802,8 +810,19 @@ else:
     print(f"{'Std':>6} | {np.std(_cv_val_losses):>13.4f} | {np.std(_cv_test_losses):>9.4f}")
     print(f"{'='*70}\n")
 
-    np.save(DATA_DIR / 'fold_results.npy', fold_results, allow_pickle=True)
-    print(f"✓ All fold results saved to {DATA_DIR / 'fold_results.npy'}")
+    _fold_results_meta = [
+        {
+            'fold_idx':      i,
+            'best_val_loss': r['best_val_loss'],
+            'test_loss':     r['test_loss'],
+            'best_epoch':    r['best_epoch'],
+            'train_idx':     r['train_idx'],
+            'val_idx':       r['val_idx'],
+        }
+        for i, r in enumerate(fold_results)
+    ]
+    np.save(DATA_DIR / 'fold_results.npy', _fold_results_meta, allow_pickle=True)
+    print(f"✓ Fold metadata saved to {DATA_DIR / 'fold_results.npy'}")
 
 # =============================================================================
 # DOWNSTREAM: per-model loop (single model for CV_FOLDS==1, N models for CV_FOLDS>1)
@@ -890,7 +909,7 @@ for _item in _items:
     if not args.no_plot_history:
         print(f"\nGenerating training curve plots{_label}...")
         plot_training_curves(history, best_val_loss, best_epoch, MODEL_TYPE, FIGURES_DIR,
-                             suffix=_suffix)
+                             suffix=_suffix, loss_mode=LOSS_MODE)
 
     # =========================================================================
     # EXTRACT EMBEDDINGS
@@ -953,8 +972,8 @@ for _item in _items:
         train_reducer, train_2d = plot_umap_pure_classes(
             train_projections,
             train_labels[:len(train_projections)],
-            "Train Projections (256-dim)",
-            f"umap_train_projections{_suffix}",
+            "Train (256-dim)",
+            f"umap_train{_suffix}",
             "train",
             args=args,
             SEED=SEED,
@@ -966,12 +985,12 @@ for _item in _items:
         )
         np.save(EMBEDDINGS_DIR / f'umap_train_coords{_suffix}.npy', train_2d)
 
-        # Test UMAP: independent fit with centroid annotations
+        # Test UMAP: independent fit
         _, _test_2d = plot_umap_pure_classes(
             test_projections,
             test_labels[:len(test_projections)],
-            "Test Projections (256-dim)",
-            f"umap_test_projections{_suffix}",
+            "Test (256-dim)",
+            f"umap_test{_suffix}",
             "test",
             args=args,
             SEED=SEED,
@@ -980,7 +999,6 @@ for _item in _items:
             OUTPUT_DIR=FIGURES_DIR,
             train_labels_full=train_labels_full,
             test_labels_full=test_labels_full,
-            annotate_centroids=True,
         )
         np.save(EMBEDDINGS_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
 
@@ -988,8 +1006,8 @@ for _item in _items:
         plot_umap_pure_classes(
             test_projections,
             test_labels[:len(test_projections)],
-            "Test Projections in Train UMAP Space (256-dim)",
-            f"umap_test_projections_transformed{_suffix}",
+            "Test in Train UMAP Space (256-dim)",
+            f"umap_test_transformed{_suffix}",
             "test",
             args=args,
             SEED=SEED,
