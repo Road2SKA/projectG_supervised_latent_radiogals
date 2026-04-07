@@ -79,11 +79,11 @@ def _plot_umap_ax(
             cy = embedding_2d[mask_class, 1].mean()
             ax.annotate(
                 f'{class_name} ({n_class})', (cx, cy),
-                fontsize=7, fontweight='bold',
+                fontsize=10.5, fontweight='bold',
                 ha='center', va='center',
-                color=color,
-                bbox=dict(boxstyle='round,pad=0.25', facecolor='grey',
-                          alpha=0.5, edgecolor='none'),
+                color='black',
+                bbox=dict(boxstyle='round,pad=0.35', facecolor=color,
+                          alpha=0.6, edgecolor='none'),
             )
 
     ax.set_xlabel('UMAP 1')
@@ -146,10 +146,6 @@ def plot_umap_pure_classes(
     else:
         print(f"  Transforming {title_suffix} with pre-fitted UMAP...")
         embedding_2d = reducer.transform(embeddings)
-
-    # Save 2D coordinates
-    np.save(OUTPUT_DIR / f'{save_prefix}_coords.npy', embedding_2d)
-    print(f"    ✓ UMAP coordinates saved to {save_prefix}_coords.npy")
 
     # 2×2 grid
     fig, axes = plt.subplots(2, 2, figsize=(20, 16))
@@ -330,7 +326,7 @@ def plot_umap_outliers(
 
         # Left: galaxy image
         ax_img = axes[row, 0]
-        ax_img.imshow(images[idx], cmap='gray', origin='lower')
+        ax_img.imshow(images[idx], cmap='viridis', origin='lower')
         ax_img.set_title(f'Outlier #{row + 1} | idx: {idx} | UMAP: ({x:.2f}, {y:.2f}) | dist: {dist:.2f}')
         ax_img.axis('off')
 

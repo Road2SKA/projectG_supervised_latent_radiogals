@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
 
@@ -36,18 +36,18 @@ BASE="python scripts/create_embeddings.py --epochs=400"
 #$BASE \
 #    --lr-schedule=step \
 #    --run-name=cond_lr_step
-#
-## --- Variation 3: LR warmup (10 epochs) --------------------------------------
+##
+### --- Variation 3: LR warmup (10 epochs) --------------------------------------
 #$BASE \
 #    --warmup-epochs=10 \
 #    --run-name=cond_warmup10
 #
 ## --- Variation 4: Supervision weight cosine scheduling (0 → 1) ---------------
-#$BASE \
-#    --supervision-weight-schedule=cosine \
-#    --supervision-weight-start=0.0 \
-#    --supervision-weight-end=1.0 \
-#    --run-name=cond_sup_cosine
+$BASE \
+    --supervision-weight-schedule=cosine \
+    --supervision-weight-start=0.0 \
+    --supervision-weight-end=1.0 \
+    --run-name=cond_sup_cosine
 
 # =============================================================================
 # SUPERVISION PARAMETER VARIATIONS (one by one vs base)
@@ -67,7 +67,6 @@ $BASE \
 python scripts/create_embeddings.py \
     --model-type=efficient \
     --cv-folds=1 \
-    --epochs=200 \
     --loss-mode=either \
     --prob=0.5 \
     --weighting=closest \

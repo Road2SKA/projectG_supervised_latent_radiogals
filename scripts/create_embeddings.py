@@ -983,7 +983,7 @@ for _item in _items:
             train_labels_full=train_labels_full,
             test_labels_full=test_labels_full,
         )
-        np.save(EMBEDDINGS_DIR / f'umap_train_coords{_suffix}.npy', train_2d)
+        np.save(DATA_DIR / f'umap_train_coords{_suffix}.npy', train_2d)
 
         # Test UMAP: independent fit
         _, _test_2d = plot_umap_pure_classes(
@@ -1000,10 +1000,10 @@ for _item in _items:
             train_labels_full=train_labels_full,
             test_labels_full=test_labels_full,
         )
-        np.save(EMBEDDINGS_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
+        np.save(DATA_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
 
         # Test UMAP: transformed into train space (fair comparison)
-        plot_umap_pure_classes(
+        _, _test_transformed_2d = plot_umap_pure_classes(
             test_projections,
             test_labels[:len(test_projections)],
             "Test in Train UMAP Space (256-dim)",
@@ -1018,6 +1018,7 @@ for _item in _items:
             test_labels_full=test_labels_full,
             reducer=train_reducer,
         )
+        np.save(DATA_DIR / f'umap_test_transformed_coords{_suffix}.npy', _test_transformed_2d)
 
         # Outlier plot: 4 most extreme points in train UMAP space
         plot_umap_outliers(
