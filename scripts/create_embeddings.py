@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from suplat.data.data_samplers import BYOLSupDataset, weights_closest, weights_ponderate
 from suplat.data.augmentations import get_augmentation
-from suplat.models.byol_models import BYOLEfficient, BYOLOriginal, BYOLEncoder
+from suplat.models.byol_models import BYOLEfficient, BYOLEfficientNetB0, BYOLOriginal, BYOLEncoder
 from suplat.trainer.trainer import byol_loss, get_warmup_lr, get_supervision_weight, extract_embeddings_from_loader
 from suplat.utils.plotting import plot_umap_pure_classes, plot_umap_outliers, plot_training_curves
 
@@ -98,9 +98,9 @@ def parse_args():
                     help="Augmentation pipeline: 'standard' (flip+rotate) or 'extended' (+ gaussian noise + intensity scaling)")
     
     # Model selection
-    ap.add_argument("--model-type", type=str, default="efficient",
-                    choices=["efficient", "original"],
-                    help="Model architecture: 'efficient' (simple forward) or 'original' (snippet-style NetWrapper)")
+    ap.add_argument("--model-type", type=str, default="efficientnet",
+                    choices=["efficientnet", "efficient", "original"],
+                    help="Model architecture: 'efficientnet' (EfficientNet-B0, 1280-dim), 'efficient' (custom ResNet, 512-dim), or 'original' (snippet-style NetWrapper)")
     
     # Training hyperparameters
     ap.add_argument("--batch-size", type=int, default=32,
@@ -110,16 +110,17 @@ def parse_args():
     ap.add_argument("--epochs", type=int, default=100,
                     help="Number of training epochs (default: 100)")
     # Gradient and optimization
-    ap.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "step"],
-                    help="Learning rate schedule: 'constant' or 'step' (step decay at 70%% of epochs, gamma=0.2) (default: constant)")
+    ap.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "step", "cosine"],
+                    help="Learning rate schedule: 'constant', 'step' (step decay at 70%% of epochs, gamma=0.2), or 'cosine' (cosine annealing to 0) (default: constant)")
     ap.add_argument("--grad-clip", type=float, default=None,
                     help="Gradient clipping max norm (default: None, no clipping)")
     ap.add_argument("--warmup-epochs", type=int, default=0,
                     help="Number of learning rate warmup epochs (default: 0)")
     
     # Model architecture
-    ap.add_argument("--no-projector", action="store_true",
-                    help="Drop the projection MLP: encoder feeds directly into the predictor MLP (Astronomaly Protege style)")
+    ap.add_argument("--feature-compression-mode", type=str, default="pca",
+                    choices=["pca", "mlp", "none"],
+                    help="Projector type: 'pca' (PCA keeping 95%% variance, default), 'mlp' (learned MLP head), 'none' (no projector)")
     ap.add_argument("--projection-dim", type=int, default=256,
                     help="Projection head output dimension (default: 256)")
     ap.add_argument("--hidden-dim", type=int, default=4096,
@@ -176,7 +177,7 @@ LR_SCHEDULE = args.lr_schedule
 WARMUP_EPOCHS = args.warmup_epochs
 NUM_WORKERS = args.num_workers
 CV_FOLDS = args.cv_folds
-USE_PROJECTOR = not args.no_projector
+FEATURE_COMPRESSION_MODE = args.feature_compression_mode
 
 # Dataset configuration
 DATASET_NAME = args.dataset
@@ -379,7 +380,7 @@ def _make_dataset_loader(img_data, label_data, shuffle, drop_last=False):
 
 def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
     """Fixed monitoring loss for one batch: both mode, supervision weight=1, curriculum-independent."""
-    if MODEL_TYPE == "efficient":
+    if MODEL_TYPE in ("efficient", "efficientnet"):
         pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
         loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
         pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
@@ -390,24 +391,32 @@ def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
     return (loss_trans + loss_friend).item()
 
 
-def train_fold(train_loader, val_loader):
+def train_fold(train_loader, val_loader, extract_loader=None):
     """
     Train one model fold from scratch.
     When curriculum scheduling is active, model selection uses the monitoring val loss
     (both mode, supervision_weight=1, curriculum-independent). Otherwise, the regular
     val loss is used for model selection.
+    extract_loader: DataLoader used to fit PCA when FEATURE_COMPRESSION_MODE='pca'.
     Returns: (model, history, best_val_loss, best_epoch)
     """
     # -------------------------------------------------------------------------
     # MODEL INITIALIZATION
     # -------------------------------------------------------------------------
-    if MODEL_TYPE == "efficient":
+    if MODEL_TYPE == "efficientnet":
+        fold_model = BYOLEfficientNetB0(
+            projection_dim=PROJECTION_DIM,
+            hidden_dim=HIDDEN_DIM,
+            bn_momentum=0.1,
+            feature_compression_mode=FEATURE_COMPRESSION_MODE,
+        )
+    elif MODEL_TYPE == "efficient":
         fold_model = BYOLEfficient(
             encoder_dim=512,
             projection_dim=PROJECTION_DIM,
             hidden_dim=HIDDEN_DIM,
             bn_momentum=0.1,
-            use_projector=USE_PROJECTOR,
+            feature_compression_mode=FEATURE_COMPRESSION_MODE,
         )
     else:
         enc = BYOLEncoder(bn_momentum=0.1)
@@ -422,6 +431,18 @@ def train_fold(train_loader, val_loader):
         )
     fold_model = fold_model.to(device)
 
+    # Fit PCA projector before training (requires one pass through data)
+    if MODEL_TYPE in ("efficient", "efficientnet") and FEATURE_COMPRESSION_MODE == 'pca':
+        assert extract_loader is not None, "extract_loader required for PCA fitting"
+        fold_model.eval()
+        _enc_outputs = []
+        with torch.no_grad():
+            for _x1, _, _, _ in extract_loader:
+                _enc_outputs.append(fold_model.online_encoder(_x1.to(device)).cpu())
+        fold_model.fit_pca(torch.cat(_enc_outputs, dim=0))
+        fold_model = fold_model.to(device)
+        print(f"✓ PCA fitted: {fold_model.online_projector.out_dim} components")
+
     total_params = sum(p.numel() for p in fold_model.parameters())
     trainable_params = sum(p.numel() for p in fold_model.parameters() if p.requires_grad)
     print("\nInitializing model...")
@@ -430,13 +451,17 @@ def train_fold(train_loader, val_loader):
     print(f"{'='*70}")
     print(f"Total parameters:     {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
-    print("Encoder output:       512-dim representation")
-    if USE_PROJECTOR:
-        print(f"Projector output:     {PROJECTION_DIM}-dim projection")
+    _enc_dim = 1280 if MODEL_TYPE == "efficientnet" else 512
+    print(f"Encoder output:       {_enc_dim}-dim representation")
+    if FEATURE_COMPRESSION_MODE == 'mlp':
+        print(f"Projector:            MLP → {PROJECTION_DIM}-dim projection")
         print(f"Predictor output:     {PROJECTION_DIM}-dim prediction")
+    elif FEATURE_COMPRESSION_MODE == 'pca':
+        print("Projector:            PCA (fitted, 95% variance)")
+        print("Predictor output:     PCA-dim prediction (set after fit_pca)")
     else:
-        print("Projector:            disabled (encoder → predictor directly)")
-        print("Predictor output:     512-dim prediction")
+        print("Projector:            none (encoder → predictor directly)")
+        print(f"Predictor output:     {_enc_dim}-dim prediction")
     print(f"{'='*70}\n")
 
     if use_cuda:
@@ -447,14 +472,22 @@ def train_fold(train_loader, val_loader):
     # OPTIMIZER AND SCHEDULER
     # -------------------------------------------------------------------------
     optimizer = torch.optim.Adam(fold_model.parameters(), lr=LEARNING_RATE)
+    _sched_epochs = max(NUM_EPOCHS - WARMUP_EPOCHS, 1)
     if LR_SCHEDULE == "step":
-        milestone = int(0.7 * (NUM_EPOCHS - WARMUP_EPOCHS if WARMUP_EPOCHS > 0 else NUM_EPOCHS))
+        milestone = int(0.7 * _sched_epochs)
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[milestone], gamma=0.2)
+    elif LR_SCHEDULE == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=_sched_epochs, eta_min=0)
     else:
         scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
     print(f"✓ Optimizer: Adam (lr={LEARNING_RATE})")
-    print(f"✓ Scheduler: {LR_SCHEDULE}" + (f" (milestone={int(0.7*NUM_EPOCHS)} epochs, gamma=0.2)" if LR_SCHEDULE == "step" else ""))
+    if LR_SCHEDULE == "step":
+        print(f"✓ Scheduler: step (milestone={int(0.7*_sched_epochs)} epochs, gamma=0.2)")
+    elif LR_SCHEDULE == "cosine":
+        print(f"✓ Scheduler: cosine (T_max={_sched_epochs} epochs, eta_min=0)")
+    else:
+        print(f"✓ Scheduler: constant")
     if WARMUP_EPOCHS > 0:
         print(f"✓ Warmup: {WARMUP_EPOCHS} epochs")
     if GRAD_CLIP:
@@ -523,13 +556,13 @@ def train_fold(train_loader, val_loader):
                      .unsqueeze(1).unsqueeze(2).unsqueeze(3)
                      .expand_as(x1))
                 x2 = torch.where(u < current_prob, x2_friend, x1_trans)
-                if MODEL_TYPE == "efficient":
+                if MODEL_TYPE in ("efficient", "efficientnet"):
                     pred1, pred2, proj1, proj2 = fold_model(x1, x2)
                     loss = byol_loss(pred1, pred2, proj1, proj2)
                 else:  # original
                     loss = fold_model(torch.cat((x1, x2), dim=0))
             else:  # "both"
-                if MODEL_TYPE == "efficient":
+                if MODEL_TYPE in ("efficient", "efficientnet"):
                     pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
                     loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
                     pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
@@ -545,7 +578,7 @@ def train_fold(train_loader, val_loader):
                 torch.nn.utils.clip_grad_norm_(fold_model.parameters(), GRAD_CLIP)
             optimizer.step()
 
-            if MODEL_TYPE == "efficient":
+            if MODEL_TYPE in ("efficient", "efficientnet"):
                 fold_model.update_target_network(momentum=current_ema_decay)
             else:  # original
                 fold_model.update_moving_average()
@@ -572,13 +605,13 @@ def train_fold(train_loader, val_loader):
                          .unsqueeze(1).unsqueeze(2).unsqueeze(3)
                          .expand_as(x1))
                     x2 = torch.where(u < current_prob, x2_friend, x1_trans)
-                    if MODEL_TYPE == "efficient":
+                    if MODEL_TYPE in ("efficient", "efficientnet"):
                         pred1, pred2, proj1, proj2 = fold_model(x1, x2)
                         val_loss += byol_loss(pred1, pred2, proj1, proj2).item()
                     else:  # original
                         val_loss += fold_model(torch.cat((x1, x2), dim=0)).item()
                 else:  # "both"
-                    if MODEL_TYPE == "efficient":
+                    if MODEL_TYPE in ("efficient", "efficientnet"):
                         pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
                         loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
                         pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
@@ -656,13 +689,13 @@ def evaluate_test(eval_model, test_loader_ref):
                      .unsqueeze(1).unsqueeze(2).unsqueeze(3)
                      .expand_as(x1))
                 x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
-                if MODEL_TYPE == "efficient":
+                if MODEL_TYPE in ("efficient", "efficientnet"):
                     pred1, pred2, proj1, proj2 = eval_model(x1, x2)
                     test_loss_total += byol_loss(pred1, pred2, proj1, proj2).item()
                 else:  # original
                     test_loss_total += eval_model(torch.cat((x1, x2), dim=0)).item()
             else:  # "both"
-                if MODEL_TYPE == "efficient":
+                if MODEL_TYPE in ("efficient", "efficientnet"):
                     pred1_f, pred2_f, proj1_f, proj2_f = eval_model(x1, x2_friend)
                     loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
                     pred1_t, pred2_t, proj1_t, proj2_t = eval_model(x1, x1_trans)
@@ -723,7 +756,7 @@ if CV_FOLDS == 1:
     print(f"✓ Test batch: {x1.shape}, {x1_trans.shape}, {x2_friend.shape}")
     print(f"  Different: {not torch.allclose(x1, x1_trans)}")
 
-    model, history, best_val_loss, best_epoch = train_fold(train_loader, val_loader)
+    model, history, best_val_loss, best_epoch = train_fold(train_loader, val_loader, extract_loader=train_extract_loader)
 
     print("\nEvaluating on TEST set (held-out)...")
     avg_test_loss = evaluate_test(model, test_loader)
@@ -774,7 +807,7 @@ else:
         print(f"Val:   {len(fold_val_loader)} batches × {BATCH_SIZE}\n")
 
         fold_model, fold_history, fold_best_val, fold_best_epoch = train_fold(
-            fold_train_loader, fold_val_loader
+            fold_train_loader, fold_val_loader, extract_loader=fold_train_extract_loader
         )
 
         print(f"\nEvaluating fold {fold_idx+1} on test set...")
@@ -888,7 +921,7 @@ for _item in _items:
             'ema_decay': EMA_DECAY,
             'projection_dim': PROJECTION_DIM,
             'hidden_dim': HIDDEN_DIM,
-            'encoder_dim': 512,
+            'encoder_dim': 1280 if MODEL_TYPE == "efficientnet" else 512,
             'weighting': args.weighting,
             'p_pair_from_class': PROB_PAIR_FROM_CLASS,
             'prob_schedule': PROB_SCHEDULE,
