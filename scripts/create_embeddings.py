@@ -1025,6 +1025,7 @@ for _item in _items:
             train_2d,
             train_images[:len(train_2d)],
             OUTPUT_DIR=FIGURES_DIR,
+            labels=train_labels[:len(train_2d)],
             save_prefix=f"umap_outliers{_suffix}",
         )
 

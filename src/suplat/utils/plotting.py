@@ -274,10 +274,19 @@ def plot_umap_overlay(
 # UMAP OUTLIER IMAGES
 # =============================================================================
 
+ALL_CLASS_NAMES = [
+    'FRI', 'FRII', 'Hybrids', 'Spirals', 'Relaxed doubles',
+    'C-curv', 'S-curv', 'Misalign', 'Wings', 'X-shaped',
+    'Straight jets', 'Multi hotspots', 'Cont. jets', 'Banding', 'One-sided', 'Restarted',
+    'Cluster', 'Merger', 'Diffuse', 'Unknown',
+]
+
+
 def plot_umap_outliers(
     train_2d: np.ndarray,
     images: np.ndarray,
     OUTPUT_DIR: Path,
+    labels: np.ndarray | None = None,
     save_prefix: str = "umap_outliers",
     n_outliers: int = 4,
 ) -> None:
@@ -294,6 +303,7 @@ def plot_umap_outliers(
         train_2d:    (N, 2) UMAP coordinates, aligned with images
         images:      (N, H, W) original image array
         OUTPUT_DIR:  directory where PNG is saved
+        labels:      (N, C) multi-hot label array aligned with images (optional)
         save_prefix: filename prefix
         n_outliers:  number of outliers to show (default 4)
     """
@@ -327,7 +337,12 @@ def plot_umap_outliers(
         # Left: galaxy image
         ax_img = axes[row, 0]
         ax_img.imshow(images[idx], cmap='viridis', origin='lower')
-        ax_img.set_title(f'Outlier #{row + 1} | idx: {idx} | UMAP: ({x:.2f}, {y:.2f}) | dist: {dist:.2f}')
+        if labels is not None and idx < len(labels):
+            active = [ALL_CLASS_NAMES[j] for j in range(labels.shape[1]) if labels[idx, j] == 1]
+            class_str = ', '.join(active) if active else '—'
+        else:
+            class_str = '—'
+        ax_img.set_title(f'Outlier #{row + 1} | {class_str} | dist: {dist:.2f}')
         ax_img.axis('off')
 
         # Right: UMAP overview with all outliers marked
