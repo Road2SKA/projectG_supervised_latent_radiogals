@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=02:05:00
+#SBATCH --time=06:05:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
 
@@ -14,7 +14,7 @@ source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 
 # Shared fixed settings
 # Model: EfficientNet-B0 (default), PCA compression (default), both loss mode, sw=1, initial labels, standard aug
-BASE="python scripts/create_embeddings.py --epochs=5 --label-type=initial --weighting=ponderate"
+BASE="python scripts/create_embeddings.py --epochs=400 --label-type=initial --weighting=ponderate"
 
 # =============================================================================
 # BEST CONDITIONS (EfficientNet-B0 + PCA)

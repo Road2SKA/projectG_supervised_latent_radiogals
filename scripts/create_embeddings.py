@@ -731,6 +731,10 @@ if CV_FOLDS == 1:
     test_images  = images[test_idx]
     test_labels  = labels[test_idx]
 
+    np.save(DATA_DIR / 'train_idx.npy', train_idx)
+    np.save(DATA_DIR / 'val_idx.npy',   val_idx)
+    np.save(DATA_DIR / 'test_idx.npy',  test_idx)
+
     print(f"  Train: {len(train_images)}")
     print(f"  Val:   {len(val_images)}")
     print(f"  Test:  {len(test_images)}")
@@ -778,6 +782,10 @@ else:
 
     test_images = images[test_idx]
     test_labels = labels[test_idx]
+
+    np.save(DATA_DIR / 'test_idx.npy',      test_idx)
+    np.save(DATA_DIR / 'trainval_idx.npy',  trainval_idx)
+
     print(f"  Test set: {len(test_images)} samples (constant across all folds)")
     print(f"  TrainVal: {len(trainval_idx)} samples (split {CV_FOLDS} ways)")
     print(f"  Augmentation: {args.augmentation}")
