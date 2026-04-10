@@ -87,7 +87,7 @@ def extract_embeddings_from_loader(model, dataloader, model_type, device, max_ba
     Args:
         model:        Trained BYOL model
         dataloader:   DataLoader yielding (x1, x1_trans, x2_friend, _) tuples
-        model_type:   'efficient' or 'original'
+        model_type:   'efficientnet', 'efficient', or 'original'
         device:       torch.device to run inference on
         max_batches:  Limit number of batches (None = all)
 
@@ -104,7 +104,7 @@ def extract_embeddings_from_loader(model, dataloader, model_type, device, max_ba
 
             x1 = x1.to(device)
 
-            if model_type == "efficient":
+            if model_type in ("efficient", "efficientnet"):
                 representation = model.online_encoder(x1)
                 projection = model.online_projector(representation)
             else:  # original
