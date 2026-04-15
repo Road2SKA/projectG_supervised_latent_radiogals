@@ -535,14 +535,14 @@ if WARMUP_EPOCHS > 0:
     #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - WARMUP_EPOCHS)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, 
-        milestones=[int(0.7*(NUM_EPOCHS - WARMUP_EPOCHS))], 
+        milestones=[int(0.8*(NUM_EPOCHS - WARMUP_EPOCHS))], 
         gamma=0.2
     )
 else:
     #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, 
-        milestones=[int(0.7*NUM_EPOCHS)], 
+        milestones=[int(0.8*NUM_EPOCHS)], 
         gamma=0.2
     )
 
