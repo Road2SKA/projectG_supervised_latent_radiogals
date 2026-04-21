@@ -2,7 +2,7 @@
 """
 BYOL Implementation for Radio Galaxy Classification
 Training script for SLURM GPU submission
-Supports both efficient and original (snippet-style) architectures
+Supports both convnet, efficientnet-b0, and original (snippet-style) architectures
 """
 
 # =============================================================================
@@ -12,6 +12,7 @@ import argparse
 import copy
 import os
 import sys as _sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -98,9 +99,9 @@ def parse_args():
                     help="Augmentation pipeline: 'standard' (flip+rotate) or 'extended' (+ gaussian noise + intensity scaling)")
     
     # Model selection
-    ap.add_argument("--model-type", type=str, default="efficientnet",
-                    choices=["efficientnet", "efficient", "original"],
-                    help="Model architecture: 'efficientnet' (EfficientNet-B0, 1280-dim), 'efficient' (custom ResNet, 512-dim), or 'original' (snippet-style NetWrapper)")
+    ap.add_argument("--model-type", type=str, default="efficientnet-b0",
+                    choices=["efficientnet-b0", "convnet", "original"],
+                    help="Model architecture: 'efficientnet-b0' (EfficientNet-B0, 1280-dim), 'convnet' (custom plain CNN, 512-dim), or 'original' (snippet-style NetWrapper)")
     
     # Training hyperparameters
     ap.add_argument("--batch-size", type=int, default=32,
@@ -114,9 +115,14 @@ def parse_args():
                     help="Learning rate schedule: 'constant', 'step' (step decay at 70%% of epochs, gamma=0.2), or 'cosine' (cosine annealing to 0) (default: constant)")
     ap.add_argument("--grad-clip", type=float, default=None,
                     help="Gradient clipping max norm (default: None, no clipping)")
+    ap.add_argument("--weight-decay", type=float, default=0.0,
+                    help="L2 weight decay for Adam optimizer (default: 0.0)")
+    ap.add_argument("--dropout", type=float, default=0.0,
+                    help="Dropout rate applied after EfficientNet-B0 encoder (default: 0.0, no dropout)")
     ap.add_argument("--warmup-epochs", type=int, default=0,
                     help="Number of learning rate warmup epochs (default: 0)")
-    
+    ap.add_argument("--compile", action="store_true", default=False,
+                    help="torch.compile the model (EfficientNet-B0 only; ~30s overhead, then faster)")
     # Model architecture
     ap.add_argument("--feature-compression-mode", type=str, default="pca",
                     choices=["pca", "mlp", "none"],
@@ -173,12 +179,14 @@ MODEL_TYPE = args.model_type
 
 # Optimization hyperparameters
 GRAD_CLIP = args.grad_clip
+WEIGHT_DECAY = args.weight_decay
+DROPOUT = args.dropout
 LR_SCHEDULE = args.lr_schedule
 WARMUP_EPOCHS = args.warmup_epochs
 NUM_WORKERS = args.num_workers
 CV_FOLDS = args.cv_folds
 FEATURE_COMPRESSION_MODE = args.feature_compression_mode
-
+USE_COMPILE = args.compile
 # Dataset configuration
 DATASET_NAME = args.dataset
 PROB_PAIR_FROM_CLASS = args.prob
@@ -278,6 +286,9 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
 print(f"{'='*70}")
 print(f"Model type:     {MODEL_TYPE}")
+print(f"Feature compression mode: {FEATURE_COMPRESSION_MODE}")
+print(f"Projection dim: {PROJECTION_DIM}")
+print(f"Hidden dim:     {HIDDEN_DIM}")
 print(f"Dataset:        {DATASET_NAME}")
 print(f"Data dir:       {args.data_dir}")
 print(f"Label type:     {args.label_type} ({label_dims} dims)")
@@ -291,6 +302,7 @@ print(f"Weighting:      {args.weighting}")
 print(f"Pair prob:      {PROB_PAIR_FROM_CLASS}")
 print(f"Num workers:    {NUM_WORKERS}")
 print(f"CV folds:       {CV_FOLDS}")
+print(f"Compile:        {'enabled' if USE_COMPILE else 'disabled'}")
 print(f"Device:         {device}")
 if SUBSAMPLE_SIZE:
     print(f"Subsampling:    {SUBSAMPLE_SIZE} samples")
@@ -380,7 +392,7 @@ def _make_dataset_loader(img_data, label_data, shuffle, drop_last=False):
 
 def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
     """Fixed monitoring loss for one batch: both mode, supervision weight=1, curriculum-independent."""
-    if MODEL_TYPE in ("efficient", "efficientnet"):
+    if MODEL_TYPE in ("convnet", "efficientnet-b0"):
         pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
         loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
         pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
@@ -403,14 +415,15 @@ def train_fold(train_loader, val_loader, extract_loader=None):
     # -------------------------------------------------------------------------
     # MODEL INITIALIZATION
     # -------------------------------------------------------------------------
-    if MODEL_TYPE == "efficientnet":
+    if MODEL_TYPE == "efficientnet-b0":
         fold_model = BYOLEfficientNetB0(
             projection_dim=PROJECTION_DIM,
             hidden_dim=HIDDEN_DIM,
             bn_momentum=0.1,
             feature_compression_mode=FEATURE_COMPRESSION_MODE,
+            dropout_rate=DROPOUT,
         )
-    elif MODEL_TYPE == "efficient":
+    elif MODEL_TYPE == "convnet":
         fold_model = BYOLEfficient(
             encoder_dim=512,
             projection_dim=PROJECTION_DIM,
@@ -432,16 +445,26 @@ def train_fold(train_loader, val_loader, extract_loader=None):
     fold_model = fold_model.to(device)
 
     # Fit PCA projector before training (requires one pass through data)
-    if MODEL_TYPE in ("efficient", "efficientnet") and FEATURE_COMPRESSION_MODE == 'pca':
+    if MODEL_TYPE in ("convnet", "efficientnet-b0") and FEATURE_COMPRESSION_MODE == 'pca':
         assert extract_loader is not None, "extract_loader required for PCA fitting"
         fold_model.eval()
         _enc_outputs = []
+        _t0_pca_pass = time.perf_counter()
         with torch.no_grad():
             for _x1, _, _, _ in extract_loader:
-                _enc_outputs.append(fold_model.online_encoder(_x1.to(device)).cpu())
+                _enc_outputs.append(fold_model.online_encoder(_x1.to(device)).float().cpu())
+        print(f"[TIMER] PCA encoder pass (full train set): {time.perf_counter()-_t0_pca_pass:.2f}s")
+        _t0_pca_svd = time.perf_counter()
         fold_model.fit_pca(torch.cat(_enc_outputs, dim=0))
+        print(f"[TIMER] PCA SVD fit: {time.perf_counter()-_t0_pca_svd:.2f}s")
         fold_model = fold_model.to(device)
         print(f"✓ PCA fitted: {fold_model.online_projector.out_dim} components")
+
+    if USE_COMPILE and MODEL_TYPE == "efficientnet-b0":
+        print("Compiling model with torch.compile() ...")
+        _t0_compile = time.perf_counter()
+        fold_model = torch.compile(fold_model, backend="cudagraphs")
+        print(f"[TIMER] torch.compile(): {time.perf_counter()-_t0_compile:.2f}s (compilation happens on first forward pass)")
 
     total_params = sum(p.numel() for p in fold_model.parameters())
     trainable_params = sum(p.numel() for p in fold_model.parameters() if p.requires_grad)
@@ -451,7 +474,7 @@ def train_fold(train_loader, val_loader, extract_loader=None):
     print(f"{'='*70}")
     print(f"Total parameters:     {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
-    _enc_dim = 1280 if MODEL_TYPE == "efficientnet" else 512
+    _enc_dim = 1280 if MODEL_TYPE == "efficientnet-b0" else 512
     print(f"Encoder output:       {_enc_dim}-dim representation")
     if FEATURE_COMPRESSION_MODE == 'mlp':
         print(f"Projector:            MLP → {PROJECTION_DIM}-dim projection")
@@ -471,7 +494,7 @@ def train_fold(train_loader, val_loader, extract_loader=None):
     # -------------------------------------------------------------------------
     # OPTIMIZER AND SCHEDULER
     # -------------------------------------------------------------------------
-    optimizer = torch.optim.Adam(fold_model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.Adam(fold_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     _sched_epochs = max(NUM_EPOCHS - WARMUP_EPOCHS, 1)
     if LR_SCHEDULE == "step":
         milestone = int(0.7 * _sched_epochs)
@@ -511,6 +534,7 @@ def train_fold(train_loader, val_loader, extract_loader=None):
     print(f"{'='*70}\n")
 
     for epoch in range(NUM_EPOCHS):
+        _t_epoch = time.perf_counter()
         # -------------------------------------------------------------------
         # LEARNING RATE WARMUP
         # -------------------------------------------------------------------
@@ -549,20 +573,22 @@ def train_fold(train_loader, val_loader, extract_loader=None):
         train_loss = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        for x1, x1_trans, x2_friend, _ in pbar:
+        for batch_idx, (x1, x1_trans, x2_friend, _) in enumerate(pbar):
+            if batch_idx == 0:
+                _t0_first_batch = time.perf_counter()
             x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
             if LOSS_MODE == "either":
                 u = (torch.rand(x1.size(0), device=device)
                      .unsqueeze(1).unsqueeze(2).unsqueeze(3)
                      .expand_as(x1))
                 x2 = torch.where(u < current_prob, x2_friend, x1_trans)
-                if MODEL_TYPE in ("efficient", "efficientnet"):
+                if MODEL_TYPE in ("convnet", "efficientnet-b0"):
                     pred1, pred2, proj1, proj2 = fold_model(x1, x2)
                     loss = byol_loss(pred1, pred2, proj1, proj2)
                 else:  # original
                     loss = fold_model(torch.cat((x1, x2), dim=0))
             else:  # "both"
-                if MODEL_TYPE in ("efficient", "efficientnet"):
+                if MODEL_TYPE in ("convnet", "efficientnet-b0"):
                     pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
                     loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
                     pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
@@ -578,11 +604,13 @@ def train_fold(train_loader, val_loader, extract_loader=None):
                 torch.nn.utils.clip_grad_norm_(fold_model.parameters(), GRAD_CLIP)
             optimizer.step()
 
-            if MODEL_TYPE in ("efficient", "efficientnet"):
+            if MODEL_TYPE in ("convnet", "efficientnet-b0"):
                 fold_model.update_target_network(momentum=current_ema_decay)
             else:  # original
                 fold_model.update_moving_average()
 
+            if batch_idx == 0:
+                print(f"[TIMER] First batch (fwd+bwd): {time.perf_counter()-_t0_first_batch:.2f}s")
             train_loss += loss.item()
             pbar.set_postfix({'train': f'{loss.item():.4f}'})
 
@@ -605,13 +633,13 @@ def train_fold(train_loader, val_loader, extract_loader=None):
                          .unsqueeze(1).unsqueeze(2).unsqueeze(3)
                          .expand_as(x1))
                     x2 = torch.where(u < current_prob, x2_friend, x1_trans)
-                    if MODEL_TYPE in ("efficient", "efficientnet"):
+                    if MODEL_TYPE in ("convnet", "efficientnet-b0"):
                         pred1, pred2, proj1, proj2 = fold_model(x1, x2)
                         val_loss += byol_loss(pred1, pred2, proj1, proj2).item()
                     else:  # original
                         val_loss += fold_model(torch.cat((x1, x2), dim=0)).item()
                 else:  # "both"
-                    if MODEL_TYPE in ("efficient", "efficientnet"):
+                    if MODEL_TYPE in ("convnet", "efficientnet-b0"):
                         pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
                         loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
                         pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
@@ -655,6 +683,8 @@ def train_fold(train_loader, val_loader, extract_loader=None):
               f" | val: {avg_val_loss:.4f}{mon_str}"
               f" | lr: {current_lr:.2e}{sup_str}{best_marker}")
 
+        print(f"[TIMER] Epoch {epoch+1} total: {time.perf_counter()-_t_epoch:.2f}s")
+
         if epoch >= WARMUP_EPOCHS:
             scheduler.step()
 
@@ -689,13 +719,13 @@ def evaluate_test(eval_model, test_loader_ref):
                      .unsqueeze(1).unsqueeze(2).unsqueeze(3)
                      .expand_as(x1))
                 x2 = torch.where(u < PROB_PAIR_FROM_CLASS, x2_friend, x1_trans)
-                if MODEL_TYPE in ("efficient", "efficientnet"):
+                if MODEL_TYPE in ("convnet", "efficientnet-b0"):
                     pred1, pred2, proj1, proj2 = eval_model(x1, x2)
                     test_loss_total += byol_loss(pred1, pred2, proj1, proj2).item()
                 else:  # original
                     test_loss_total += eval_model(torch.cat((x1, x2), dim=0)).item()
             else:  # "both"
-                if MODEL_TYPE in ("efficient", "efficientnet"):
+                if MODEL_TYPE in ("convnet", "efficientnet-b0"):
                     pred1_f, pred2_f, proj1_f, proj2_f = eval_model(x1, x2_friend)
                     loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
                     pred1_t, pred2_t, proj1_t, proj2_t = eval_model(x1, x1_trans)
@@ -743,10 +773,12 @@ if CV_FOLDS == 1:
     print("  Converted labels to DataFrames")
     print(f"  Augmentation: {args.augmentation}")
 
+    _t0_ds = time.perf_counter()
     _, train_loader         = _make_dataset_loader(train_images, train_labels, shuffle=True,  drop_last=True)
     _, train_extract_loader = _make_dataset_loader(train_images, train_labels, shuffle=False)
-    _, val_loader           = _make_dataset_loader(val_images,   val_labels,   shuffle=False)
-    _, test_loader          = _make_dataset_loader(test_images,  test_labels,  shuffle=False)
+    _, val_loader           = _make_dataset_loader(val_images,   val_labels,   shuffle=False, drop_last=USE_COMPILE)
+    _, test_loader          = _make_dataset_loader(test_images,  test_labels,  shuffle=False, drop_last=USE_COMPILE)
+    print(f"[TIMER] Dataset creation (incl. Manhattan dist matrix): {time.perf_counter()-_t0_ds:.2f}s")
 
     print(f"\n{'='*70}")
     print("✓ DATA LOADED")
@@ -806,7 +838,7 @@ else:
 
         _, fold_train_loader         = _make_dataset_loader(fold_train_images, fold_train_labels, shuffle=True,  drop_last=True)
         _, fold_train_extract_loader = _make_dataset_loader(fold_train_images, fold_train_labels, shuffle=False)
-        _, fold_val_loader           = _make_dataset_loader(fold_val_images,   fold_val_labels,   shuffle=False)
+        _, fold_val_loader           = _make_dataset_loader(fold_val_images,   fold_val_labels,   shuffle=False, drop_last=USE_COMPILE)
 
         print(f"\n{'='*70}")
         print(f"FOLD {fold_idx+1}/{CV_FOLDS}  |  train={len(fold_train_images)}, val={len(fold_val_images)}")
@@ -929,7 +961,7 @@ for _item in _items:
             'ema_decay': EMA_DECAY,
             'projection_dim': PROJECTION_DIM,
             'hidden_dim': HIDDEN_DIM,
-            'encoder_dim': 1280 if MODEL_TYPE == "efficientnet" else 512,
+            'encoder_dim': 1280 if MODEL_TYPE == "efficientnet-b0" else 512,
             'weighting': args.weighting,
             'p_pair_from_class': PROB_PAIR_FROM_CLASS,
             'prob_schedule': PROB_SCHEDULE,
@@ -958,6 +990,7 @@ for _item in _items:
 
     print(f"\nExtracting embeddings{_label}...")
 
+    _t0_extract = time.perf_counter()
     # Extract from train loader (no-shuffle for ordered alignment with images)
     print("\n  Train set:")
     train_projections = extract_embeddings_from_loader(
@@ -978,6 +1011,7 @@ for _item in _items:
         model, test_loader, MODEL_TYPE, device, max_batches=None
     )
     print(f"    Projections: {test_projections.shape}")
+    print(f"[TIMER] Embedding extraction: {time.perf_counter()-_t0_extract:.2f}s")
 
     # Save embeddings
     np.save(EMBEDDINGS_DIR / f'train_projections{_suffix}.npy', train_projections)
@@ -1091,9 +1125,9 @@ for _item in _items:
             #the labels are in the format of a one-hot encoding, so we need to convert them to a single label for each class
             labels_hot = np.argmax(split_labels[combined_fri_frii][:, :2], axis=1)
             metrics[split]['fri_vs_frii'] = {
-                'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot).item(),
-                'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot).item(),
-                'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot).item()
+                'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot),
+                'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot),
+                'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot)
             }
             fri_only = (split_labels[:, 0] == 1) & (split_labels[:, :5].sum(axis=1) == 1)
             frii_only = (split_labels[:, 1] == 1) & (split_labels[:, :5].sum(axis=1) == 1)
@@ -1105,9 +1139,9 @@ for _item in _items:
             labels_hot = np.argmax(split_labels[combined][:, :5], axis=1)
             labels_hot[all_hybrids[combined]] = 2  # assign hybrid label (index 2) to all hybrids, even if they also have spiral or relaxed double labels
             metrics[split]['base_classes'] = {
-                'silhouette': silhouette_score(projections[combined], labels_hot).item(),
-                'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot).item(),
-                'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot).item()
+                'silhouette': silhouette_score(projections[combined], labels_hot),
+                'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot),
+                'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot)
             }
 
         # and save to a json file

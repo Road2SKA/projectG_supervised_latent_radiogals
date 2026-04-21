@@ -80,12 +80,12 @@ def MLP(dim, projection_size, hidden_size=4096, bn_momentum=0.1):
 # BYOL ARCHITECTURES
 # =============================================================================
 
-def create_efficientnet_b0_backbone(num_channels=1, img_size=89):
+def create_efficientnet_b0_backbone(num_channels=1, img_size=89, dropout_rate=0.0):
     """
     EfficientNet-B0 backbone for single-channel radio images.
     Outputs 1280-dim representation (vs 512 from BYOLEncoder).
     Initialised with ImageNet weights; first conv adapted to num_channels;
-    classifier head removed.
+    classifier head removed (replaced with Dropout if dropout_rate > 0).
     """
     # Load with ImageNet weights
     model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
@@ -105,8 +105,8 @@ def create_efficientnet_b0_backbone(num_channels=1, img_size=89):
         new_conv.weight.copy_(original_conv.weight.mean(dim=1, keepdim=True))
     model.features[0][0] = new_conv
 
-    # Drop classifier — keep feature extractor only
-    model.classifier = nn.Identity()
+    # Replace classifier with Dropout (or Identity if no dropout)
+    model.classifier = nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else nn.Identity()
 
     return model
 
@@ -215,11 +215,18 @@ class PCAProjection(nn.Module):
         """
         X = X.detach().float()
         mean = X.mean(dim=0)
-        _, S, Vh = torch.linalg.svd(X - mean, full_matrices=False)
+        X_centered = X - mean
+        # Drop zero-variance features to avoid LAPACK SLASCL degenerate-matrix error
+        active = X_centered.var(dim=0) > 1e-8
+        n_dropped = int((~active).sum().item())
+        if n_dropped > 0:
+            print(f"  [PCA] Dropped {n_dropped}/{active.numel()} zero-variance features")
+        self.register_buffer('mean_', mean)
+        self.register_buffer('active_mask_', active)
+        _, S, Vh = torch.linalg.svd(X_centered[:, active], full_matrices=False)
         cumvar = (S ** 2).cumsum(0) / (S ** 2).sum()
         n_components = int((cumvar < self.variance_threshold).sum().item()) + 1
-        self.register_buffer('mean_', mean)
-        self.register_buffer('components_', Vh[:n_components])  # (n_components, D)
+        self.register_buffer('components_', Vh[:n_components])  # (n_components, n_active)
         self._fitted = True
 
     @property
@@ -231,7 +238,7 @@ class PCAProjection(nn.Module):
     def forward(self, x):
         if not self._fitted:
             raise RuntimeError("PCAProjection must be fitted before use; call fit_pca() first")
-        return (x.float() - self.mean_) @ self.components_.T
+        return (x.float() - self.mean_)[:, self.active_mask_] @ self.components_.T
 
 
 class BYOLEfficientNetB0(nn.Module):
@@ -249,12 +256,12 @@ class BYOLEfficientNetB0(nn.Module):
         'none'           — no compression; predictor operates on raw 1280-dim repr
     """
     def __init__(self, projection_dim=256, hidden_dim=4096, bn_momentum=0.1,
-                 feature_compression_mode='pca'):
+                 feature_compression_mode='pca', dropout_rate=0.0):
         super().__init__()
         encoder_dim = 1280
         self.feature_compression_mode = feature_compression_mode
 
-        self.online_encoder = create_efficientnet_b0_backbone(num_channels=1)
+        self.online_encoder = create_efficientnet_b0_backbone(num_channels=1, dropout_rate=dropout_rate)
 
         if feature_compression_mode == 'mlp':
             self.online_projector = ProjectionHead(

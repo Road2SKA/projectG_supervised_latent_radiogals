@@ -63,7 +63,7 @@ def byol_loss(
     target_proj_1: torch.Tensor,
     target_proj_2: torch.Tensor,
 ) -> torch.Tensor:    
-    """BYOL loss for efficient model: normalized Mean Squared Error."""
+    """BYOL loss: normalized Mean Squared Error."""
     # L2 normalize all vectors
     online_pred_1 = F.normalize(online_pred_1, dim=-1, p=2)
     online_pred_2 = F.normalize(online_pred_2, dim=-1, p=2)
@@ -87,7 +87,7 @@ def extract_embeddings_from_loader(model, dataloader, model_type, device, max_ba
     Args:
         model:        Trained BYOL model
         dataloader:   DataLoader yielding (x1, x1_trans, x2_friend, _) tuples
-        model_type:   'efficientnet', 'efficient', or 'original'
+        model_type:   'efficientnet-b0', 'convnet', or 'original'
         device:       torch.device to run inference on
         max_batches:  Limit number of batches (None = all)
 
@@ -104,7 +104,7 @@ def extract_embeddings_from_loader(model, dataloader, model_type, device, max_ba
 
             x1 = x1.to(device)
 
-            if model_type in ("efficient", "efficientnet"):
+            if model_type in ("convnet", "efficientnet-b0"):
                 representation = model.online_encoder(x1)
                 projection = model.online_projector(representation)
             else:  # original

@@ -22,10 +22,10 @@ class BYOLSupDataset(Dataset):
     - img_friend: image from similar (or close) class
     - mdist: Manhattan distance between the labels img and img_friend
     """
-    def __init__(self, 
-                 tags_data, 
-                 img_data, 
-                 transform=None, 
+    def __init__(self,
+                 tags_data,
+                 img_data,
+                 transform=None,
                  friend_transform=None,
                  weightfunc=weights_closest,
                  p_pair_from_class=0.5):

@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=00:30:00
+#SBATCH --time=00:15:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
 
@@ -15,13 +15,13 @@ source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 # =============================================================================
 # CONFIGURATION — edit before submitting
 # =============================================================================
-RUN_DIR="/users/mbredber/p3_SUPLAT/outputs/GOOD_EN_old/GOOD_cond_ponderate_lr_step_20260408_1453"
+RUN_DIR="/users/mbredber/p3_SUPLAT/outputs/"
 DATA_DIR="./data"
 LABEL_SET="classical"
-EPOCHS=100
-BATCH_SIZE=64
-LR=1e-3
-PATIENCE=15
+EPOCHS=200
+BATCH_SIZE=256
+LR=3e-4
+PATIENCE=20
 SEED=42
 # =============================================================================
 

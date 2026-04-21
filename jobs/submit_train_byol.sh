@@ -4,32 +4,46 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=06:05:00
+#SBATCH --time=00:05:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
+#SBATCH --mail-type=END
+#SBATCH --mail-user=markus.bredberg@epfl.ch
 
 REPO_ROOT=$SLURM_SUBMIT_DIR
 
 source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 
-# Shared fixed settings
-# Model: EfficientNet-B0 (default), PCA compression (default), both loss mode, sw=1, initial labels, standard aug
-BASE="python scripts/create_embeddings.py --epochs=400 --label-type=initial --weighting=ponderate"
-
 # =============================================================================
-# BEST CONDITIONS (EfficientNet-B0 + PCA)
+# CONFIGURATION — edit before submitting
+# =============================================================================
+MODEL=efficientnet-b0
+FCM=pca
+LABEL_SET=initial
+EPOCHS=400
 # =============================================================================
 
-# --- LR step scheduling (3e-4 → ×0.2 at 70%) --------------------------------
-$BASE \
-    --lr-schedule=step \
-    --run-name=enb0_pca_ponderate_lr_step
+BASE="python scripts/create_embeddings.py \
+    --model-type=$MODEL \
+    --feature-compression-mode=$FCM \
+    --label-type=$LABEL_SET \
+    --epochs=$EPOCHS \
+    --batch-size=256 \
+    --compile"
 
-# --- Ponderate weighting (no LR scheduling) ----------------------------------
-$BASE \
-    --run-name=enb0_pca_ponderate
+# --- Extended augmentation ---------------------------------------------------
+$BASE --weighting=ponderate --augmentation=extended --run-name=enb0_mlp_pond_extaug
 
-# --- Cosine LR scheduling ----------------------------------------------------
-$BASE \
-    --lr-schedule=cosine \
-    --run-name=enb0_pca_ponderate_lr_cosine
+# --- Closest weighting -------------------------------------------------------
+$BASE --weighting=closest --run-name=enb0_pca_closest
+
+# --- Baseline: ponderate weighting -------------------------------------------
+$BASE --weighting=ponderate --run-name=enb0_pca_pond
+
+# --- Dropout + weight decay --------------------------------------------------
+$BASE --weighting=ponderate --dropout=0.2 --weight-decay=1e-4 --run-name=enb0_pca_pond_reg
+
+# --- LR step decay -----------------------------------------------------------
+$BASE --weighting=ponderate --lr-schedule=step --run-name=enb0_pca_pond_lrstep
+
+
