@@ -80,7 +80,7 @@ def MLP(dim, projection_size, hidden_size=4096, bn_momentum=0.1):
 # BYOL ARCHITECTURES
 # =============================================================================
 
-def create_efficientnet_b0_backbone(num_channels=1, img_size=89, dropout_rate=0.0):
+def create_efficientnet_b0_backbone(num_channels=1, img_size=89, dropout_rate=0.2):
     """
     EfficientNet-B0 backbone for single-channel radio images.
     Outputs 1280-dim representation (vs 512 from BYOLEncoder).
@@ -105,10 +105,51 @@ def create_efficientnet_b0_backbone(num_channels=1, img_size=89, dropout_rate=0.
         new_conv.weight.copy_(original_conv.weight.mean(dim=1, keepdim=True))
     model.features[0][0] = new_conv
 
-    # Replace classifier with Dropout (or Identity if no dropout)
-    model.classifier = nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else nn.Identity()
+    # Replace classifier with Dropout
+    model.classifier = nn.Dropout(p=dropout_rate)
 
     return model
+
+def create_resnet50_backbone(num_channels=1, dropout_rate=0.2):
+    """ResNet-50 backbone for single-channel images. Outputs 2048-dim."""
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    orig = model.conv1
+    new_conv = nn.Conv2d(num_channels, orig.out_channels,
+                         kernel_size=orig.kernel_size, stride=orig.stride,
+                         padding=orig.padding, bias=False)
+    with torch.no_grad():
+        new_conv.weight.copy_(orig.weight.mean(dim=1, keepdim=True))
+    model.conv1 = new_conv
+    model.fc = nn.Dropout(p=dropout_rate)
+    return model, 2048
+
+def create_resnet18_backbone(num_channels=1, dropout_rate=0.2):
+    """ResNet-18 backbone for single-channel images. Outputs 512-dim."""
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    orig = model.conv1
+    new_conv = nn.Conv2d(num_channels, orig.out_channels,
+                         kernel_size=orig.kernel_size, stride=orig.stride,
+                         padding=orig.padding, bias=False)
+    with torch.no_grad():
+        new_conv.weight.copy_(orig.weight.mean(dim=1, keepdim=True))
+    model.conv1 = new_conv
+    model.fc = nn.Dropout(p=dropout_rate)
+    return model, 512
+
+def create_convnext_tiny_backbone(num_channels=1, dropout_rate=0.2):
+    """ConvNeXt-Tiny backbone for single-channel images. Outputs 768-dim."""
+    model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+    orig = model.features[0][0]
+    new_conv = nn.Conv2d(num_channels, orig.out_channels,
+                         kernel_size=orig.kernel_size, stride=orig.stride,
+                         padding=orig.padding, bias=orig.bias is not None)
+    with torch.no_grad():
+        new_conv.weight.copy_(orig.weight.mean(dim=1, keepdim=True))
+        if orig.bias is not None:
+            new_conv.bias.copy_(orig.bias)
+    model.features[0][0] = new_conv
+    model.classifier = nn.Dropout(p=dropout_rate)
+    return model, 768
 
 # Shared encoder architecture
 class BYOLEncoder(nn.Module):
@@ -116,7 +157,7 @@ class BYOLEncoder(nn.Module):
     ResNet-style encoder (f_θ in BYOL paper) for 89x89 greyscale images.
     Outputs 512-dimensional representation (y_θ in BYOL vocabulary).
     """
-    def __init__(self, bn_momentum=0.1):
+    def __init__(self, bn_momentum=0.1, dropout_rate=0.2):
         super().__init__()
 
         # Initial conv: 89x89 -> 45x45
@@ -130,6 +171,7 @@ class BYOLEncoder(nn.Module):
 
         # Global pooling: 6x6 -> 1x1
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(p=dropout_rate)
 
     def _make_layer(self, in_channels, out_channels, stride=1, bn_momentum=0.1):
         """Create a residual block"""
@@ -154,6 +196,7 @@ class BYOLEncoder(nn.Module):
         # Global pooling - output: representation y (batch, 512)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
+        x = self.dropout(x)
 
         return x
 
@@ -256,7 +299,7 @@ class BYOLEfficientNetB0(nn.Module):
         'none'           — no compression; predictor operates on raw 1280-dim repr
     """
     def __init__(self, projection_dim=256, hidden_dim=4096, bn_momentum=0.1,
-                 feature_compression_mode='pca', dropout_rate=0.0):
+                 feature_compression_mode='pca', dropout_rate=0.2):
         super().__init__()
         encoder_dim = 1280
         self.feature_compression_mode = feature_compression_mode
@@ -359,6 +402,103 @@ class BYOLEfficientNetB0(nn.Module):
                 )
 
 
+class BYOLPretrainedBackbone(nn.Module):
+    """
+    Generic BYOL wrapper for any pretrained torchvision backbone.
+    Mirrors BYOLEfficientNetB0 exactly; accepts backbone and encoder_dim as arguments.
+    """
+    def __init__(self, backbone, encoder_dim, projection_dim=256, hidden_dim=4096,
+                 bn_momentum=0.1, feature_compression_mode='pca'):
+        super().__init__()
+        self.feature_compression_mode = feature_compression_mode
+
+        self.online_encoder = backbone
+
+        if feature_compression_mode == 'mlp':
+            self.online_projector = ProjectionHead(
+                in_dim=encoder_dim, hidden_dim=hidden_dim,
+                out_dim=projection_dim, bn_momentum=bn_momentum
+            )
+            self.online_predictor = PredictionHead(
+                in_dim=projection_dim, hidden_dim=hidden_dim,
+                out_dim=projection_dim, bn_momentum=bn_momentum
+            )
+        elif feature_compression_mode == 'pca':
+            self.online_projector = PCAProjection(variance_threshold=0.95)
+            self.online_predictor = None
+            self._predictor_config = (hidden_dim, bn_momentum)
+        elif feature_compression_mode == 'none':
+            self.online_projector = nn.Identity()
+            self.online_predictor = PredictionHead(
+                in_dim=encoder_dim, hidden_dim=hidden_dim,
+                out_dim=encoder_dim, bn_momentum=bn_momentum
+            )
+        else:
+            raise ValueError(f"Unknown feature_compression_mode: {feature_compression_mode!r}. "
+                             "Choose from 'pca', 'mlp', 'none'.")
+
+        self.target_encoder = copy.deepcopy(self.online_encoder)
+        self.target_projector = copy.deepcopy(self.online_projector)
+
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+        for param in self.target_projector.parameters():
+            param.requires_grad = False
+
+    def fit_pca(self, encoder_outputs: torch.Tensor):
+        assert self.feature_compression_mode == 'pca', \
+            "fit_pca() should only be called when feature_compression_mode='pca'"
+        self.online_projector.fit(encoder_outputs)
+        self.target_projector = copy.deepcopy(self.online_projector)
+        for param in self.target_projector.parameters():
+            param.requires_grad = False
+        hidden_dim, bn_momentum = self._predictor_config
+        pca_dim = self.online_projector.out_dim
+        self.online_predictor = PredictionHead(
+            in_dim=pca_dim, hidden_dim=hidden_dim,
+            out_dim=pca_dim, bn_momentum=bn_momentum
+        )
+
+    def forward(self, x1, x2):
+        if self.feature_compression_mode == 'pca' and self.online_predictor is None:
+            raise RuntimeError("Call fit_pca() before the first forward pass")
+
+        online_repr_1 = self.online_encoder(x1)
+        online_repr_2 = self.online_encoder(x2)
+
+        online_proj_1 = self.online_projector(online_repr_1)
+        online_proj_2 = self.online_projector(online_repr_2)
+
+        online_pred_1 = self.online_predictor(online_proj_1)
+        online_pred_2 = self.online_predictor(online_proj_2)
+
+        with torch.no_grad():
+            target_repr_1 = self.target_encoder(x1)
+            target_repr_2 = self.target_encoder(x2)
+
+            target_proj_1 = self.target_projector(target_repr_1)
+            target_proj_2 = self.target_projector(target_repr_2)
+
+        return online_pred_1, online_pred_2, target_proj_1, target_proj_2
+
+    @torch.no_grad()
+    def update_target_network(self, momentum=0.996):
+        for online_params, target_params in zip(
+            self.online_encoder.parameters(), self.target_encoder.parameters()
+        ):
+            target_params.data = (
+                momentum * target_params.data + (1 - momentum) * online_params.data
+            )
+
+        if self.feature_compression_mode != 'pca':
+            for online_params, target_params in zip(
+                self.online_projector.parameters(), self.target_projector.parameters()
+            ):
+                target_params.data = (
+                    momentum * target_params.data + (1 - momentum) * online_params.data
+                )
+
+
 class BYOLEfficient(nn.Module):
     """
     Efficient BYOL model (Document 2 style).
@@ -374,12 +514,12 @@ class BYOLEfficient(nn.Module):
         'none'           — no compression; predictor operates on raw 512-dim repr
     """
     def __init__(self, encoder_dim=512, projection_dim=256, hidden_dim=4096, bn_momentum=0.1,
-                 feature_compression_mode='pca'):
+                 feature_compression_mode='pca', dropout_rate=0.2):
         super().__init__()
         self.feature_compression_mode = feature_compression_mode
 
         # Online network: encoder → projector → predictor
-        self.online_encoder = BYOLEncoder(bn_momentum=bn_momentum)
+        self.online_encoder = BYOLEncoder(bn_momentum=bn_momentum, dropout_rate=dropout_rate)
 
         if feature_compression_mode == 'mlp':
             self.online_projector = ProjectionHead(

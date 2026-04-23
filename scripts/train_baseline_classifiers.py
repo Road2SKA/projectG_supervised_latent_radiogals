@@ -285,6 +285,8 @@ def main():
     parser.add_argument('--lr',         type=float, default=1e-3)
     parser.add_argument('--patience',   type=int, default=15)
     parser.add_argument('--cv_folds',   type=int, default=1)
+    parser.add_argument('--run_name',   type=str, default=None,
+                        help="Custom run name prefix (default: run_dir basename + timestamp)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -293,9 +295,9 @@ def main():
     print(f"Device: {device}")
 
     # ── Output directory ──────────────────────────────────────────────────
-    _ts  = datetime.now().strftime('%Y%m%d_%H%M')
-    _run_name = args.run_dir.name
-    out_dir = args.run_dir / 'baselines' / f'{_run_name}_{args.model}_{_ts}'
+    _ts = datetime.now().strftime('%Y%m%d_%H%M')
+    _prefix = args.run_name if args.run_name else args.run_dir.name
+    out_dir = args.run_dir / 'baselines' / f'{_prefix}_{args.model}_{_ts}'
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir}")
 

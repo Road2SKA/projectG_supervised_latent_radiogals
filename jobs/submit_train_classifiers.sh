@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=00:15:00
+#SBATCH --time=00:30:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
 
@@ -26,29 +26,32 @@ SEED=42
 # =============================================================================
 
 BASE="python scripts/train_baseline_classifiers.py \
-    --run_dir   $RUN_DIR \
-    --data_dir  $DATA_DIR \
-    --label_set $LABEL_SET \
-    --epochs    $EPOCHS \
+    --run_dir    $RUN_DIR \
+    --data_dir   $DATA_DIR \
+    --label_set  $LABEL_SET \
+    --epochs     $EPOCHS \
     --batch_size $BATCH_SIZE \
-    --lr        $LR \
-    --patience  $PATIENCE \
-    --seed      $SEED"
+    --lr         $LR \
+    --patience   $PATIENCE \
+    --seed       $SEED \
+    --run_name   \"$RUN_NAME\""
 
 # --- CNN ---------------------------------------------------------------------
-$BASE --model cnn
-
-# --- ScatterNet (conv on scattering coefficients) ----------------------------
-$BASE --model scatternet
-
-# --- SimpleScatterNet (MLP on flattened scattering coefficients) -------------
-$BASE --model simplescatternet
+#$BASE --model cnn --run_name=cnn
 
 # --- DualSSN (image CNN + scattering CNN) ------------------------------------
-$BASE --model dualssn
+$BASE --model dualssn --run_name=dualssn
 
 # --- EfficientNet-B0 fine-tuned end-to-end -----------------------------------
-$BASE --model enb0
+$BASE --model enb0 --run_name=enb0
 
 # --- ViT-B/16 fine-tuned end-to-end ------------------------------------------
-$BASE --model vit
+$BASE --model vit --run_name=vit
+
+# --- ScatterNet (conv on scattering coefficients) ----------------------------
+$BASE --model scatternet --run_name=scatternet
+
+# --- SimpleScatterNet (MLP on flattened scattering coefficients) -------------
+$BASE --model simplescatternet --run_name=simplescatternet
+
+

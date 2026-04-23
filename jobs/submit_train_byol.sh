@@ -17,7 +17,7 @@ source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 # =============================================================================
 # CONFIGURATION — edit before submitting
 # =============================================================================
-MODEL=efficientnet-b0
+MODEL=resnet18
 FCM=pca
 LABEL_SET=initial
 EPOCHS=400
@@ -32,7 +32,7 @@ BASE="python scripts/create_embeddings.py \
     --compile"
 
 # --- Extended augmentation ---------------------------------------------------
-$BASE --weighting=ponderate --augmentation=extended --run-name=enb0_mlp_pond_extaug
+$BASE --weighting=ponderate --augmentation=extended --run-name=convnext_tiny_mlp_pond_extaug
 
 # --- Closest weighting -------------------------------------------------------
 $BASE --weighting=closest --run-name=enb0_pca_closest
