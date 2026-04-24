@@ -15,40 +15,43 @@ source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 # =============================================================================
 # CONFIGURATION — edit before submitting
 # =============================================================================
-RUN_DIR="/users/mbredber/p3_SUPLAT/outputs/GOOD_EN_old/GOOD_cond_ponderate_lr_step_20260408_1453"
+RUN_DIR="/users/mbredber/p3_SUPLAT/outputs/"
 DATA_DIR="./data"
 LABEL_SET="classical"
-EPOCHS=100
-BATCH_SIZE=64
-LR=1e-3
-PATIENCE=15
+EPOCHS=200
+BATCH_SIZE=256
+LR=3e-4
+PATIENCE=20
 SEED=42
 # =============================================================================
 
 BASE="python scripts/train_baseline_classifiers.py \
-    --run_dir   $RUN_DIR \
-    --data_dir  $DATA_DIR \
-    --label_set $LABEL_SET \
-    --epochs    $EPOCHS \
+    --run_dir    $RUN_DIR \
+    --data_dir   $DATA_DIR \
+    --label_set  $LABEL_SET \
+    --epochs     $EPOCHS \
     --batch_size $BATCH_SIZE \
-    --lr        $LR \
-    --patience  $PATIENCE \
-    --seed      $SEED"
+    --lr         $LR \
+    --patience   $PATIENCE \
+    --seed       $SEED \
+    --run_name   \"$RUN_NAME\""
 
 # --- CNN ---------------------------------------------------------------------
-$BASE --model cnn
-
-# --- ScatterNet (conv on scattering coefficients) ----------------------------
-$BASE --model scatternet
-
-# --- SimpleScatterNet (MLP on flattened scattering coefficients) -------------
-$BASE --model simplescatternet
+#$BASE --model cnn --run_name=cnn
 
 # --- DualSSN (image CNN + scattering CNN) ------------------------------------
-$BASE --model dualssn
+$BASE --model dualssn --run_name=dualssn
 
 # --- EfficientNet-B0 fine-tuned end-to-end -----------------------------------
-$BASE --model enb0
+$BASE --model enb0 --run_name=enb0
 
 # --- ViT-B/16 fine-tuned end-to-end ------------------------------------------
-$BASE --model vit
+$BASE --model vit --run_name=vit
+
+# --- ScatterNet (conv on scattering coefficients) ----------------------------
+$BASE --model scatternet --run_name=scatternet
+
+# --- SimpleScatterNet (MLP on flattened scattering coefficients) -------------
+$BASE --model simplescatternet --run_name=simplescatternet
+
+

@@ -11,9 +11,24 @@ Usage:
 Models: cnn | scatternet | simplescatternet | vit | dualssn | enb0
 """
 
+import sys
+import scipy.special
+
+# Mock the missing function so Kymatio doesn't crash on import
+if not hasattr(scipy.special, 'sph_harm'):
+    def dummy_sph_harm(*args, **kwargs):
+        raise NotImplementedError(
+            "sph_harm was mocked because it was missing from scipy.special. "
+            "This should only happen if you are trying to use 3D scattering, "
+            "but you are using 2D."
+        )
+    scipy.special.sph_harm = dummy_sph_harm
+
+# Now proceed with your original imports
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -235,7 +250,8 @@ def compute_scattering(images, J=2, L=8, device='cpu'):
 
     dummy = torch.zeros(1, 1, H, W, device=device)
     with torch.no_grad():
-        scat_shape = tuple(scat(dummy).shape[1:])  # (C, H_s, W_s)
+        scat_out = scat(dummy)  # (1, 1, C_scat, H_s, W_s)
+        scat_shape = tuple(scat_out.squeeze(0).flatten(0, 1).shape)  # (C_scat, H_s, W_s)
     print(f"  Scattering shape: {scat_shape}")
 
     if images.ndim == 3:
@@ -248,8 +264,8 @@ def compute_scattering(images, J=2, L=8, device='cpu'):
     for i in range(0, len(imgs_t), batch_size):
         batch = imgs_t[i:i + batch_size].to(device)
         with torch.no_grad():
-            coeffs = scat(batch)  # (B, C, H_s, W_s)
-        all_coeffs.append(coeffs.cpu())
+            coeffs = scat(batch)  # (B, 1, C_scat, H_s, W_s)
+        all_coeffs.append(coeffs.flatten(1, 2).cpu())  # (B, C_scat, H_s, W_s)
     return torch.cat(all_coeffs, dim=0).numpy(), scat_shape
 
 
@@ -268,6 +284,9 @@ def main():
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr',         type=float, default=1e-3)
     parser.add_argument('--patience',   type=int, default=15)
+    parser.add_argument('--cv_folds',   type=int, default=1)
+    parser.add_argument('--run_name',   type=str, default=None,
+                        help="Custom run name prefix (default: run_dir basename + timestamp)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -276,17 +295,13 @@ def main():
     print(f"Device: {device}")
 
     # ── Output directory ──────────────────────────────────────────────────
-    out_dir = args.run_dir / 'baselines' / args.model
+    _ts = datetime.now().strftime('%Y%m%d_%H%M')
+    _prefix = args.run_name if args.run_name else args.run_dir.name
+    out_dir = args.run_dir / 'baselines' / f'{_prefix}_{args.model}_{_ts}'
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir}")
 
-    # ── Load split indices ────────────────────────────────────────────────
-    data_dir = args.run_dir / 'data'
-    train_idx = np.load(data_dir / 'train_idx.npy')
-    test_idx  = np.load(data_dir / 'test_idx.npy')
-    print(f"Train idx: {len(train_idx)}, Test idx: {len(test_idx)}")
-
-    # ── Load images and labels ────────────────────────────────────────────
+    # ── Load data ─────────────────────────────────────────────────────────
     images = np.load(args.data_dir / 'images_filtered.npy')
     labels = np.load(args.data_dir / 'labels_filtered.npy')
     print(f"Images: {images.shape}, Labels: {labels.shape}")
@@ -297,139 +312,122 @@ def main():
     n_classes   = len(class_names)
     print(f"Label set: {args.label_set} ({n_classes} classes: {class_names})")
 
-    train_images = images[train_idx]
-    train_labels = labels[train_idx][:, label_cols]
-    test_images  = images[test_idx]
-    test_labels  = labels[test_idx][:, label_cols]
+    # ── 70/15/15 split — same logic as create_embeddings.py ──────────────
+    all_idx = np.arange(len(images))
+    trainval_idx, test_idx = train_test_split(all_idx,      test_size=0.30, random_state=args.seed)
+    train_idx,    val_idx  = train_test_split(trainval_idx, test_size=0.50, random_state=args.seed)
 
-    # ── Val split ─────────────────────────────────────────────────────────
-    tr_idx, va_idx = train_test_split(
-        np.arange(len(train_images)),
-        test_size=VAL_FRAC,
-        random_state=args.seed
-    )
-    val_images  = train_images[va_idx]
-    val_labels  = train_labels[va_idx]
-    train_images2 = train_images[tr_idx]
-    train_labels2 = train_labels[tr_idx]
+    test_images = images[test_idx]
+    test_labels = labels[test_idx][:, label_cols]
+    print(f"Test set: {len(test_images)}")
 
-    # ── Image size ────────────────────────────────────────────────────────
-    H, W = train_images.shape[-2], train_images.shape[-1]
-    img_shape = (1, H, W)
-
-    # ── Transforms ───────────────────────────────────────────────────────
-    needs_upsample = args.model in ('vit', 'enb0')
-    if needs_upsample:
-        tf = transforms.Compose([transforms.Resize(224)])
-        print(f"  Upsampling images to 224×224 for {args.model}")
+    # ── Fold definitions ──────────────────────────────────────────────────
+    if args.cv_folds == 1:
+        fold_splits = [(train_idx, val_idx)]
     else:
-        tf = None
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
+        fold_splits = [
+            (trainval_idx[tr], trainval_idx[va])
+            for tr, va in kf.split(trainval_idx)
+        ]
+        print(f"K-fold CV: {args.cv_folds} folds on {len(trainval_idx)} trainval samples")
 
-    # ── Scattering coefficients ───────────────────────────────────────────
-    scat_shape = None
-    if args.model in ('scatternet', 'simplescatternet', 'dualssn'):
-        print("Computing scattering coefficients...")
-        all_for_scat = np.concatenate([train_images2, val_images, test_images], axis=0)
-        all_scat, scat_shape = compute_scattering(all_for_scat, J=2, L=8,
-                                                   device=str(device))
-        n_tr2, n_va, n_te = len(train_images2), len(val_images), len(test_images)
-        scat_tr  = all_scat[:n_tr2]
-        scat_va  = all_scat[n_tr2:n_tr2 + n_va]
-        scat_te  = all_scat[n_tr2 + n_va:]
-        print(f"  Scattering done: train={scat_tr.shape}, val={scat_va.shape}, test={scat_te.shape}")
+    fold_results_list = []
 
-    # ── Build model ───────────────────────────────────────────────────────
-    print(f"Building model: {args.model}")
-    model = build_model(args.model, n_classes, img_shape, scat_shape)
-    model = model.to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Parameters: {n_params:,}")
+    for fold_i, (fold_train_idx, fold_val_idx) in enumerate(fold_splits):
+        if args.cv_folds > 1:
+            print(f"\n{'='*60}\nFold {fold_i + 1} / {args.cv_folds}\n{'='*60}")
 
-    # ── DataLoaders ───────────────────────────────────────────────────────
-    if args.model in ('scatternet', 'simplescatternet'):
-        # Only scattering input (no raw image)
-        scat_tr_ds  = ScatterDataset(train_images2, scat_tr, train_labels2)
-        scat_va_ds  = ScatterDataset(val_images,    scat_va, val_labels)
-        scat_te_ds  = ScatterDataset(test_images,   scat_te, test_labels)
+        train_images2 = images[fold_train_idx]
+        train_labels2 = labels[fold_train_idx][:, label_cols]
+        val_images    = images[fold_val_idx]
+        val_labels    = labels[fold_val_idx][:, label_cols]
+        print(f"  Train: {len(train_images2)}, Val: {len(val_images)}")
 
-        # Override forward to use only scat
-        class ScatOnlyWrapper(nn.Module):
-            def __init__(self, inner):
-                super().__init__()
-                self.inner = inner
+        fold_out = out_dir / f'fold{fold_i + 1}' if args.cv_folds > 1 else out_dir
+        fold_out.mkdir(parents=True, exist_ok=True)
 
-            def forward(self, img, scat, label=None):
-                return self.inner.forward_scat(scat)
+        # ── Image size ────────────────────────────────────────────────────
+        H, W = train_images2.shape[-2], train_images2.shape[-1]
+        img_shape = (1, H, W)
 
-        # Patch model to accept (img, scat, label) triples but use only scat
-        # We'll just unpack correctly in the loop instead.
-        train_dl = make_loader(scat_tr_ds, args.batch_size, shuffle=True)
-        val_dl   = make_loader(scat_va_ds, args.batch_size, shuffle=False)
-        test_dl  = make_loader(scat_te_ds, args.batch_size, shuffle=False)
-        use_scat_only = True
-    elif args.model == 'dualssn':
-        train_dl = make_loader(ScatterDataset(train_images2, scat_tr, train_labels2),
-                               args.batch_size, shuffle=True)
-        val_dl   = make_loader(ScatterDataset(val_images, scat_va, val_labels),
-                               args.batch_size, shuffle=False)
-        test_dl  = make_loader(ScatterDataset(test_images, scat_te, test_labels),
-                               args.batch_size, shuffle=False)
-        use_scat_only = False
-    else:
-        train_dl = make_loader(RadioImageDataset(train_images2, train_labels2, tf),
-                               args.batch_size, shuffle=True)
-        val_dl   = make_loader(RadioImageDataset(val_images, val_labels, tf),
-                               args.batch_size, shuffle=False)
-        test_dl  = make_loader(RadioImageDataset(test_images, test_labels, tf),
-                               args.batch_size, shuffle=False)
-        use_scat_only = False
+        # ── Transforms ───────────────────────────────────────────────────
+        needs_upsample = args.model in ('vit', 'enb0')
+        if needs_upsample:
+            tf = transforms.Compose([transforms.Resize(224)])
+            print(f"  Upsampling images to 224×224 for {args.model}")
+        else:
+            tf = None
 
-    # ── Pos weights ───────────────────────────────────────────────────────
-    pos_weights = compute_pos_weights(train_labels2, device)
+        # ── Scattering coefficients ───────────────────────────────────────
+        scat_shape = None
+        if args.model in ('scatternet', 'simplescatternet', 'dualssn'):
+            print("Computing scattering coefficients...")
+            all_for_scat = np.concatenate([train_images2, val_images, test_images], axis=0)
+            all_scat, scat_shape = compute_scattering(all_for_scat, J=2, L=8,
+                                                       device=str(device))
+            n_tr2, n_va, n_te = len(train_images2), len(val_images), len(test_images)
+            scat_tr  = all_scat[:n_tr2]
+            scat_va  = all_scat[n_tr2:n_tr2 + n_va]
+            scat_te  = all_scat[n_tr2 + n_va:]
+            print(f"  Scattering done: train={scat_tr.shape}, val={scat_va.shape}, test={scat_te.shape}")
 
-    # ── Optimiser ─────────────────────────────────────────────────────────
-    optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode='min', factor=0.5, patience=5
-    )
+        # ── Build model ───────────────────────────────────────────────────
+        print(f"Building model: {args.model}")
+        model = build_model(args.model, n_classes, img_shape, scat_shape)
+        model = model.to(device)
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  Parameters: {n_params:,}")
 
-    # ── Training loop ─────────────────────────────────────────────────────
-    train_losses, val_losses = [], []
-    best_val_loss  = float('inf')
-    best_state     = None
-    epochs_no_impr = 0
+        # ── DataLoaders ───────────────────────────────────────────────────
+        if args.model in ('scatternet', 'simplescatternet'):
+            # Only scattering input (no raw image)
+            scat_tr_ds  = ScatterDataset(train_images2, scat_tr, train_labels2)
+            scat_va_ds  = ScatterDataset(val_images,    scat_va, val_labels)
+            scat_te_ds  = ScatterDataset(test_images,   scat_te, test_labels)
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        epoch_loss = 0.0
+            train_dl = make_loader(scat_tr_ds, args.batch_size, shuffle=True)
+            val_dl   = make_loader(scat_va_ds, args.batch_size, shuffle=False)
+            test_dl  = make_loader(scat_te_ds, args.batch_size, shuffle=False)
+            use_scat_only = True
+        elif args.model == 'dualssn':
+            train_dl = make_loader(ScatterDataset(train_images2, scat_tr, train_labels2),
+                                   args.batch_size, shuffle=True)
+            val_dl   = make_loader(ScatterDataset(val_images, scat_va, val_labels),
+                                   args.batch_size, shuffle=False)
+            test_dl  = make_loader(ScatterDataset(test_images, scat_te, test_labels),
+                                   args.batch_size, shuffle=False)
+            use_scat_only = False
+        else:
+            train_dl = make_loader(RadioImageDataset(train_images2, train_labels2, tf),
+                                   args.batch_size, shuffle=True)
+            val_dl   = make_loader(RadioImageDataset(val_images, val_labels, tf),
+                                   args.batch_size, shuffle=False)
+            test_dl  = make_loader(RadioImageDataset(test_images, test_labels, tf),
+                                   args.batch_size, shuffle=False)
+            use_scat_only = False
 
-        for batch in train_dl:
-            if args.model == 'dualssn':
-                imgs, scats, labels_b = batch
-                imgs, scats, labels_b = imgs.to(device), scats.to(device), labels_b.to(device)
-                logits = model(imgs, scats)
-            elif use_scat_only:
-                _, scats, labels_b = batch
-                scats, labels_b = scats.to(device), labels_b.to(device)
-                logits = model(scats)
-            else:
-                imgs, labels_b = batch
-                imgs, labels_b = imgs.to(device), labels_b.to(device)
-                logits = model(imgs)
+        # ── Pos weights ───────────────────────────────────────────────────
+        pos_weights = compute_pos_weights(train_labels2, device)
 
-            loss = weighted_bce_loss(logits, labels_b, pos_weights, n_classes)
-            optimiser.zero_grad()
-            loss.backward()
-            optimiser.step()
-            epoch_loss += loss.item() * len(labels_b)
+        # ── Optimiser ─────────────────────────────────────────────────────
+        optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimiser, mode='min', factor=0.5, patience=5
+        )
 
-        train_losses.append(epoch_loss / len(train_dl.dataset))
+        # ── Training loop ─────────────────────────────────────────────────
+        train_losses, val_losses = [], []
+        best_val_loss  = float('inf')
+        best_state     = None
+        epochs_no_impr = 0
 
-        # Validation
-        model.eval()
-        val_loss_total = 0.0
-        with torch.no_grad():
-            for batch in val_dl:
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            epoch_loss = 0.0
+
+            for batch in train_dl:
                 if args.model == 'dualssn':
                     imgs, scats, labels_b = batch
                     imgs, scats, labels_b = imgs.to(device), scats.to(device), labels_b.to(device)
@@ -442,100 +440,148 @@ def main():
                     imgs, labels_b = batch
                     imgs, labels_b = imgs.to(device), labels_b.to(device)
                     logits = model(imgs)
-                val_loss_total += weighted_bce_loss(logits, labels_b, pos_weights, n_classes).item() * len(labels_b)
 
-        val_loss = val_loss_total / len(val_dl.dataset)
-        val_losses.append(val_loss)
-        scheduler.step(val_loss)
+                loss = weighted_bce_loss(logits, labels_b, pos_weights, n_classes)
+                optimiser.zero_grad()
+                loss.backward()
+                optimiser.step()
+                epoch_loss += loss.item() * len(labels_b)
 
-        if val_loss < best_val_loss:
-            best_val_loss  = val_loss
-            best_state     = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            epochs_no_impr = 0
-        else:
-            epochs_no_impr += 1
-            if epochs_no_impr >= args.patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
+            train_losses.append(epoch_loss / len(train_dl.dataset))
 
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}  train={train_losses[-1]:.4f}  "
-                  f"val={val_losses[-1]:.4f}  "
-                  f"lr={optimiser.param_groups[0]['lr']:.2e}")
+            # Validation
+            model.eval()
+            val_loss_total = 0.0
+            with torch.no_grad():
+                for batch in val_dl:
+                    if args.model == 'dualssn':
+                        imgs, scats, labels_b = batch
+                        imgs, scats, labels_b = imgs.to(device), scats.to(device), labels_b.to(device)
+                        logits = model(imgs, scats)
+                    elif use_scat_only:
+                        _, scats, labels_b = batch
+                        scats, labels_b = scats.to(device), labels_b.to(device)
+                        logits = model(scats)
+                    else:
+                        imgs, labels_b = batch
+                        imgs, labels_b = imgs.to(device), labels_b.to(device)
+                        logits = model(imgs)
+                    val_loss_total += weighted_bce_loss(logits, labels_b, pos_weights, n_classes).item() * len(labels_b)
 
-    model.load_state_dict(best_state)
-    print(f"Restored best model (val loss = {best_val_loss:.4f})")
+            val_loss = val_loss_total / len(val_dl.dataset)
+            val_losses.append(val_loss)
+            scheduler.step(val_loss)
 
-    # ── Training curve ────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.plot(train_losses, label='Train')
-    ax.plot(val_losses,   label='Validation')
-    best_ep = int(np.argmin(val_losses))
-    ax.axvline(best_ep, color='grey', linestyle='--', linewidth=1,
-               label=f'Best ({best_ep + 1})')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Loss')
-    ax.set_title(f'{args.model} training curve — {args.label_set}')
-    ax.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / 'training_curve.png', dpi=100)
-    plt.close()
-
-    # ── Test inference ────────────────────────────────────────────────────
-    model.eval()
-    all_probs, all_preds, all_labels = [], [], []
-
-    with torch.no_grad():
-        for batch in test_dl:
-            if args.model == 'dualssn':
-                imgs, scats, labels_b = batch
-                imgs, scats = imgs.to(device), scats.to(device)
-                logits = model(imgs, scats)
-            elif use_scat_only:
-                _, scats, labels_b = batch
-                scats = scats.to(device)
-                logits = model(scats)
+            if val_loss < best_val_loss:
+                best_val_loss  = val_loss
+                best_state     = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_impr = 0
             else:
-                imgs, labels_b = batch
-                imgs = imgs.to(device)
-                logits = model(imgs)
+                epochs_no_impr += 1
+                if epochs_no_impr >= args.patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
 
-            probs = F.softmax(logits, dim=-1)[:, :, 1].cpu().numpy()
-            preds = (probs >= 0.5).astype(int)
-            all_probs.append(probs)
-            all_preds.append(preds)
-            all_labels.append(labels_b.numpy())
+            if epoch % 10 == 0 or epoch == 1:
+                print(f"Epoch {epoch:3d}  train={train_losses[-1]:.4f}  "
+                      f"val={val_losses[-1]:.4f}  "
+                      f"lr={optimiser.param_groups[0]['lr']:.2e}")
 
-    test_probs  = np.concatenate(all_probs,  axis=0)
-    test_preds  = np.concatenate(all_preds,  axis=0)
-    test_labels_arr = np.concatenate(all_labels, axis=0)
+        model.load_state_dict(best_state)
+        print(f"Restored best model (val loss = {best_val_loss:.4f})")
 
-    # ── Metrics ───────────────────────────────────────────────────────────
-    results = evaluate_metrics(test_labels_arr, test_preds, test_probs, class_names)
-    print(f"\nMacro F1:  {results['f1_macro']:.4f}")
-    print(f"Macro AUC: {results['auc_macro']:.4f}")
-    print(f"Accuracy:  {results['accuracy']:.4f}")
+        # ── Training curve ────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(6, 3))
+        ax.plot(train_losses, label='Train')
+        ax.plot(val_losses,   label='Validation')
+        best_ep = int(np.argmin(val_losses))
+        ax.axvline(best_ep, color='grey', linestyle='--', linewidth=1,
+                   label=f'Best ({best_ep + 1})')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title(f'{args.model} training curve — {args.label_set}')
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(fold_out / 'training_curve.png', dpi=100)
+        plt.close()
 
-    # ── Save outputs ──────────────────────────────────────────────────────
-    np.save(out_dir / 'test_probs.npy',  test_probs)
-    np.save(out_dir / 'test_preds.npy',  test_preds)
-    np.save(out_dir / 'test_labels.npy', test_labels_arr)
+        # ── Test inference ────────────────────────────────────────────────
+        model.eval()
+        all_probs, all_preds, all_labels = [], [], []
 
-    torch.save({
-        'state_dict':  best_state,
-        'model':       args.model,
-        'label_set':   args.label_set,
-        'class_names': class_names,
-        'n_classes':   n_classes,
-        'scat_shape':  scat_shape,
-        'img_shape':   img_shape,
-        'seed':        args.seed,
-    }, out_dir / 'model_best.pt')
+        with torch.no_grad():
+            for batch in test_dl:
+                if args.model == 'dualssn':
+                    imgs, scats, labels_b = batch
+                    imgs, scats = imgs.to(device), scats.to(device)
+                    logits = model(imgs, scats)
+                elif use_scat_only:
+                    _, scats, labels_b = batch
+                    scats = scats.to(device)
+                    logits = model(scats)
+                else:
+                    imgs, labels_b = batch
+                    imgs = imgs.to(device)
+                    logits = model(imgs)
 
-    with open(out_dir / 'results.json', 'w') as f:
-        json.dump(results, f, indent=2)
+                probs = F.softmax(logits, dim=-1)[:, :, 1].cpu().numpy()
+                preds = (probs >= 0.5).astype(int)
+                all_probs.append(probs)
+                all_preds.append(preds)
+                all_labels.append(labels_b.numpy())
 
-    print(f"\nAll outputs saved to: {out_dir}")
+        test_probs      = np.concatenate(all_probs,  axis=0)
+        test_preds      = np.concatenate(all_preds,  axis=0)
+        test_labels_arr = np.concatenate(all_labels, axis=0)
+
+        # ── Metrics ───────────────────────────────────────────────────────
+        results = evaluate_metrics(test_labels_arr, test_preds, test_probs, class_names)
+        print(f"\nMacro F1:  {results['f1_macro']:.4f}")
+        print(f"Macro AUC: {results['auc_macro']:.4f}")
+        print(f"Accuracy:  {results['accuracy']:.4f}")
+
+        # ── Save outputs ──────────────────────────────────────────────────
+        np.save(fold_out / 'test_probs.npy',  test_probs)
+        np.save(fold_out / 'test_preds.npy',  test_preds)
+        np.save(fold_out / 'test_labels.npy', test_labels_arr)
+
+        torch.save({
+            'state_dict':  best_state,
+            'model':       args.model,
+            'label_set':   args.label_set,
+            'class_names': class_names,
+            'n_classes':   n_classes,
+            'scat_shape':  scat_shape,
+            'img_shape':   img_shape,
+            'seed':        args.seed,
+        }, fold_out / 'model_best.pt')
+
+        with open(fold_out / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
+        print(f"\nAll outputs saved to: {fold_out}")
+        fold_results_list.append(results)
+
+    if args.cv_folds > 1:
+        f1s  = [r['f1_macro']  for r in fold_results_list]
+        aucs = [r['auc_macro'] for r in fold_results_list]
+        accs = [r['accuracy']  for r in fold_results_list]
+        agg = {
+            'cv_folds':       args.cv_folds,
+            'f1_macro_mean':  float(np.mean(f1s)),
+            'f1_macro_std':   float(np.std(f1s)),
+            'auc_macro_mean': float(np.mean(aucs)),
+            'auc_macro_std':  float(np.std(aucs)),
+            'accuracy_mean':  float(np.mean(accs)),
+            'accuracy_std':   float(np.std(accs)),
+            'per_fold':       fold_results_list,
+        }
+        print(f"\nK-fold summary ({args.cv_folds} folds):")
+        print(f"  Macro F1:  {agg['f1_macro_mean']:.4f} ± {agg['f1_macro_std']:.4f}")
+        print(f"  Macro AUC: {agg['auc_macro_mean']:.4f} ± {agg['auc_macro_std']:.4f}")
+        print(f"  Accuracy:  {agg['accuracy_mean']:.4f} ± {agg['accuracy_std']:.4f}")
+        with open(out_dir / 'cv_results.json', 'w') as f:
+            json.dump(agg, f, indent=2)
 
 
 if __name__ == '__main__':

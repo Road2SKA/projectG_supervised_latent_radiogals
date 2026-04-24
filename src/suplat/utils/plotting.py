@@ -392,7 +392,7 @@ def plot_training_curves(
                        optionally 'monitor_val_loss' and 'supervision_schedule'
         best_val_loss: best validation loss achieved
         best_epoch:    epoch at which best_val_loss was achieved
-        model_type:    'efficient' or 'original' (used in plot title)
+        model_type:    'convnet' or 'original' (used in plot title)
         output_dir:    directory where PNGs are saved
         loss_mode:     'both' or 'either' (determines supervision schedule label)
     """

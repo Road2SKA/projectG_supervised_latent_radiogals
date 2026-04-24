@@ -4,12 +4,13 @@ __pycache__
 **/__pycache__/
 core_*
 outputs
+jobs
 logs
 *.sbatch
 .venv
 Dockerfile
 *.sqsh
 src/*.egg-info/
-*.npy
 *.DS_store
-jobs/submit_train_byol.sh
+notebooks/*generative*
+notebooks/*flow*

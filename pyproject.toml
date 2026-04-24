@@ -18,6 +18,7 @@ dependencies = [
     "torchvision",
     "tqdm",
     "umap-learn",
+    "zuko",
 ]
 
 [tool.setuptools.packages.find]
