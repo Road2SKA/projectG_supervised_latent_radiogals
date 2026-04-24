@@ -4,46 +4,89 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=00:05:00
+#SBATCH --time=2:00:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
 #SBATCH --mail-type=END
 #SBATCH --mail-user=markus.bredberg@epfl.ch
 
+echo "START: $(date)"
 REPO_ROOT=$SLURM_SUBMIT_DIR
 
 source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 
 # =============================================================================
-# CONFIGURATION — edit before submitting
+# SHARED DEFAULTS
 # =============================================================================
-MODEL=resnet18
-FCM=pca
-LABEL_SET=initial
 EPOCHS=400
+BS=256
+LABEL=initial
+
+# Shorthand builders — avoids repeating common flags in every run.
+# R18 / CNXT: no --compile (not supported for these architectures)
+WD=1e-4
+
+# Shorthand builders — avoids repeating common flags in every run.
+# R18 / CNXT: no --compile (not supported for these architectures)
+R18="python scripts/create_embeddings.py
+    --model-type=resnet18
+    --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS
+    --weight-decay=$WD"
+
+CNXT="python scripts/create_embeddings.py
+    --model-type=convnext-tiny
+    --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS
+    --weight-decay=$WD"
+
 # =============================================================================
+# 1. ARCHITECTURE SWEEP
+#    Baseline settings (pca + ponderate + lr-step) across two backbones.
+#    Isolates the effect of backbone alone.
+# =============================================================================
+$R18  --feature-compression-mode=pca --weighting=ponderate --lr-schedule=step \
+      --run-name=r18_pca_pond_step_wd
 
-BASE="python scripts/create_embeddings.py \
-    --model-type=$MODEL \
-    --feature-compression-mode=$FCM \
-    --label-type=$LABEL_SET \
-    --epochs=$EPOCHS \
-    --batch-size=256 \
-    --compile"
+$CNXT --feature-compression-mode=pca --weighting=ponderate --lr-schedule=step \
+      --run-name=cnxt_pca_pond_step_wd
 
-# --- Extended augmentation ---------------------------------------------------
-$BASE --weighting=ponderate --augmentation=extended --run-name=convnext_tiny_mlp_pond_extaug
+# =============================================================================
+# 2. ENB0 — FLAT LEARNING RATE
+#    Constant LR as a reference point alongside the step/cosine schedules.
+# =============================================================================
+python scripts/create_embeddings.py \
+    --model-type=efficientnet-b0 \
+    --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS \
+    --compile \
+    --weight-decay=$WD \
+    --feature-compression-mode=pca --weighting=ponderate --lr-schedule=constant \
+    --run-name=enb0_pca_pond_constant_wd
 
-# --- Closest weighting -------------------------------------------------------
-$BASE --weighting=closest --run-name=enb0_pca_closest
+# =============================================================================
+# 3. ENB0 — MLP PROJECTOR + WEIGHT DECAY
+#    Tests learned MLP head combined with WD across all three LR schedules.
+# =============================================================================
+python scripts/create_embeddings.py \
+    --model-type=efficientnet-b0 \
+    --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS \
+    --compile \
+    --weight-decay=$WD \
+    --feature-compression-mode=mlp --weighting=ponderate --lr-schedule=constant \
+    --run-name=enb0_mlp_pond_constant_wd
 
-# --- Baseline: ponderate weighting -------------------------------------------
-$BASE --weighting=ponderate --run-name=enb0_pca_pond
+python scripts/create_embeddings.py \
+    --model-type=efficientnet-b0 \
+    --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS \
+    --compile \
+    --weight-decay=$WD \
+    --feature-compression-mode=mlp --weighting=ponderate --lr-schedule=step \
+    --run-name=enb0_mlp_pond_step_wd
 
-# --- Dropout + weight decay --------------------------------------------------
-$BASE --weighting=ponderate --dropout=0.2 --weight-decay=1e-4 --run-name=enb0_pca_pond_reg
+python scripts/create_embeddings.py \
+    --model-type=efficientnet-b0 \
+    --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS \
+    --compile \
+    --weight-decay=$WD \
+    --feature-compression-mode=mlp --weighting=ponderate --lr-schedule=cosine \
+    --run-name=enb0_mlp_pond_cosine_wd
 
-# --- LR step decay -----------------------------------------------------------
-$BASE --weighting=ponderate --lr-schedule=step --run-name=enb0_pca_pond_lrstep
-
-
+echo "END: $(date)"

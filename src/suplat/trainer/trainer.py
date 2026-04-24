@@ -104,7 +104,7 @@ def extract_embeddings_from_loader(model, dataloader, model_type, device, max_ba
 
             x1 = x1.to(device)
 
-            if model_type in ("convnet", "efficientnet-b0"):
+            if model_type in ("convnet", "efficientnet-b0", "resnet18", "resnet50", "convnext-tiny"):
                 representation = model.online_encoder(x1)
                 projection = model.online_projector(representation)
             else:  # original
