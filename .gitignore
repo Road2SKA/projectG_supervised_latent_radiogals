@@ -12,5 +12,3 @@ Dockerfile
 *.sqsh
 src/*.egg-info/
 *.DS_store
-notebooks/*generative*
-notebooks/*flow*
