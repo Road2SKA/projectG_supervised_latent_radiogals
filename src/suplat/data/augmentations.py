@@ -53,6 +53,7 @@ def get_augmentation(name: str) -> T.Compose:
         ])
     elif name == "extended":
         return T.Compose([
+            T.RandomResizedCrop(89, scale=(0.5, 1.0)),
             T.RandomHorizontalFlip(),
             T.RandomVerticalFlip(),
             T.RandomRotation(180),

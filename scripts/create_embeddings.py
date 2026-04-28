@@ -63,8 +63,9 @@ def parse_args():
     
     # Label configuration
     ap.add_argument("--label-type", type=str, default="full",
-                    choices=["full", "initial", "morphology", "environment", "derived"],
-                    help="Label subset to use: 'full' (all 20), 'initial' (0-4: FRI, FRII, Hybrids, Spirals, Relaxed doubles), "
+                    choices=["full", "all", "classical", "initial", "morphology", "environment", "derived"],
+                    help="Label subset to use: 'full'/'all' (all 20), 'classical' (0-1: FRI, FRII), "
+                        "'initial' (0-4: FRI, FRII, Hybrids, Spirals, Relaxed doubles), "
                         "'morphology' (5-14: C-curve, S-curve, Misalignment, Wings, X-shaped, Straight jets, Multiple hotspots, "
                         "Continuous jets, Banding, One-sided, Restarted), 'environment' (15-18: Cluster, Merger, Diffuse emission, Unknown), "
                         "'derived' (19-23: Compact+hybrids, Hybrid FRI/FRII, Curved FRIs, Curved FRIIs, Straight+multi hotspots)")
@@ -240,11 +241,13 @@ else:
     
 # Truncate labels based on label type
 LABEL_RANGES = {
-    'full': (0, 20),          # All labels
-    'initial': (0, 5),        # FRI, FRII, Hybrids, Spirals, Relaxed doubles
-    'morphology': (5, 15),    # C-curve through Restarted
+    'full':        (0, 20),   # All labels
+    'all':         (0, 20),   # Alias for full
+    'classical':   (0, 2),    # FRI, FRII only
+    'initial':     (0, 5),    # FRI, FRII, Hybrids, Spirals, Relaxed doubles
+    'morphology':  (5, 15),   # C-curve through Restarted
     'environment': (15, 19),  # Cluster, Merger, Diffuse emission, Unknown
-    'derived': (19, 24)       # Compact+hybrids through Straight+multi hotspots (note: may only have 19-23, adjust if needed)
+    'derived':     (19, 24),  # Compact+hybrids through Straight+multi hotspots
 }
 
 OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'

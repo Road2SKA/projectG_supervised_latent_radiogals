@@ -89,4 +89,60 @@ python scripts/create_embeddings.py \
     --feature-compression-mode=mlp --weighting=ponderate --lr-schedule=cosine \
     --run-name=enb0_mlp_pond_cosine_wd
 
+# =============================================================================
+# 4. CNXT — LR SCHEDULE SWEEP
+#    Cosine and constant LR alongside the step baseline in section 1.
+# =============================================================================
+$CNXT --feature-compression-mode=pca --weighting=ponderate --lr-schedule=cosine \
+      --run-name=cnxt_pca_pond_cosine_wd
+
+$CNXT --feature-compression-mode=pca --weighting=ponderate --lr-schedule=constant \
+      --run-name=cnxt_pca_pond_constant_wd
+
+# =============================================================================
+# 5. CNXT — MLP PROJECTOR
+#    Learned MLP head instead of PCA; tested with step and cosine schedules.
+# =============================================================================
+$CNXT --feature-compression-mode=mlp --weighting=ponderate --lr-schedule=step \
+      --run-name=cnxt_mlp_pond_step_wd
+
+$CNXT --feature-compression-mode=mlp --weighting=ponderate --lr-schedule=cosine \
+      --run-name=cnxt_mlp_pond_cosine_wd
+
+# =============================================================================
+# 6. CNXT — SAMPLE WEIGHTING
+#    Closest weighting (distance-based) vs ponderate; pca + step and cosine.
+# =============================================================================
+$CNXT --feature-compression-mode=pca --weighting=closest --lr-schedule=step \
+      --run-name=cnxt_pca_closest_step_wd
+
+$CNXT --feature-compression-mode=pca --weighting=closest --lr-schedule=cosine \
+      --run-name=cnxt_pca_closest_cosine_wd
+
+# =============================================================================
+# 7. CNXT — EXTENDED AUGMENTATION
+#    Adds random resized crop, Gaussian noise, and intensity scaling on top
+#    of the standard flips/rotation. Tested with the two best-performing
+#    compression × schedule combos from above.
+# =============================================================================
+$CNXT --feature-compression-mode=pca --weighting=ponderate --lr-schedule=cosine \
+      --augmentation=extended \
+      --run-name=cnxt_pca_pond_cosine_wd_extaug
+
+$CNXT --feature-compression-mode=mlp --weighting=ponderate --lr-schedule=cosine \
+      --augmentation=extended \
+      --run-name=cnxt_mlp_pond_cosine_wd_extaug
+
+# =============================================================================
+# 8. CNXT — WEIGHT DECAY SWEEP
+#    Higher WD (1e-3) to test stronger regularisation with cosine LR.
+# =============================================================================
+$CNXT --feature-compression-mode=pca --weighting=ponderate --lr-schedule=cosine \
+      --weight-decay=1e-3 \
+      --run-name=cnxt_pca_pond_cosine_wd3
+
+$CNXT --feature-compression-mode=mlp --weighting=ponderate --lr-schedule=cosine \
+      --weight-decay=1e-3 \
+      --run-name=cnxt_mlp_pond_cosine_wd3
+
 echo "END: $(date)"
