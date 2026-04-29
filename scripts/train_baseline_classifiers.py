@@ -59,13 +59,16 @@ ALL_CLASS_NAMES = [
 ]
 
 LABEL_SETS = {
-    "classical":   [0, 1],
-    "initial":     list(range(0, 5)),
-    "environment": list(range(16, 20)),
-    "derived":     [2, 5, 6, 10, 11],
-    "morphology":  list(range(5, 15)),
-    "all":         list(range(0, 20)),
-    "pure":        list(range(0, 20)),
+    "classical":      [0, 1],
+    "classical_pure": [0, 1],
+    "initial":        list(range(0, 5)),
+    "initial_pure":   list(range(0, 5)),
+    "environment":    list(range(16, 20)),
+    "derived":        None,          # computed from label combinations
+    "morphology":     list(range(5, 15)),
+    "all":            list(range(0, 20)),
+    "pure":           list(range(0, 20)),
+    "full":           list(range(0, 20)),
 }
 
 VAL_FRAC = 0.15
@@ -279,6 +282,8 @@ def main():
                                  'vit', 'dualssn', 'enb0'])
     parser.add_argument('--label_set',  default='classical',
                         choices=list(LABEL_SETS.keys()))
+    parser.add_argument('--eval_fri_frii_pure', action='store_true',
+                        help='(with --label_set full) evaluate on FRI/FRII-pure sources only')
     parser.add_argument('--seed',       type=int, default=42)
     parser.add_argument('--epochs',     type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=64)
@@ -307,8 +312,29 @@ def main():
     print(f"Images: {images.shape}, Labels: {labels.shape}")
 
     # ── Label subset ──────────────────────────────────────────────────────
+    DERIVED_CLASS_NAMES = [
+        'Pure hybrid',       # col2 & ~col0 & ~col1
+        'FR hybrid',         # col2 & (col0 | col1)
+        'Curved FRI',        # col0 & (col5 | col6)
+        'Curved FRII',       # col1 & (col5 | col6)
+        'Straight+multi-HS', # col10 & col11
+    ]
+
+    def _make_derived(y):
+        c = lambda i: y[:, i].astype(bool)
+        return np.stack([
+            ( c(2) & ~c(0) & ~c(1)).astype(np.int64),
+            ( c(2) &  (c(0) | c(1))).astype(np.int64),
+            ( c(0) &  (c(5) | c(6))).astype(np.int64),
+            ( c(1) &  (c(5) | c(6))).astype(np.int64),
+            (c(10) &   c(11)).astype(np.int64),
+        ], axis=1)
+
     label_cols  = LABEL_SETS[args.label_set]
-    class_names = [ALL_CLASS_NAMES[i] for i in label_cols]
+    if args.label_set == "derived":
+        class_names = DERIVED_CLASS_NAMES
+    else:
+        class_names = [ALL_CLASS_NAMES[i] for i in label_cols]
     n_classes   = len(class_names)
     print(f"Label set: {args.label_set} ({n_classes} classes: {class_names})")
 
@@ -318,7 +344,29 @@ def main():
     train_idx,    val_idx  = train_test_split(trainval_idx, test_size=0.50, random_state=args.seed)
 
     test_images = images[test_idx]
-    test_labels = labels[test_idx][:, label_cols]
+    if args.label_set == "derived":
+        test_labels = _make_derived(labels[test_idx])
+    else:
+        test_labels = labels[test_idx][:, label_cols]
+
+    # ── Pure-source filtering (test set only for "full", both splits otherwise)
+    if args.label_set == "pure":
+        test_pure_mask  = labels[test_idx].sum(axis=1) == 1
+        test_images     = test_images[test_pure_mask]
+        test_labels     = test_labels[test_pure_mask]
+        print(f"Pure filter (all 20): {test_pure_mask.sum()} test retained")
+    elif args.label_set in ("classical_pure", "initial_pure"):
+        test_pure_mask  = labels[test_idx][:, 0:5].sum(axis=1) == 1
+        test_images     = test_images[test_pure_mask]
+        test_labels     = test_labels[test_pure_mask]
+        print(f"Initial-pure filter : {test_pure_mask.sum()} test retained")
+    elif args.label_set == "full" and args.eval_fri_frii_pure:
+        _y_te = labels[test_idx]
+        test_pure_mask  = (_y_te[:, 0:5].sum(axis=1) == 1) & (_y_te[:, 0] | _y_te[:, 1]).astype(bool)
+        test_images     = test_images[test_pure_mask]
+        test_labels     = test_labels[test_pure_mask]
+        print(f"FRI/FRII-pure eval filter : {test_pure_mask.sum()} test retained")
+
     print(f"Test set: {len(test_images)}")
 
     # ── Fold definitions ──────────────────────────────────────────────────
@@ -340,9 +388,26 @@ def main():
             print(f"\n{'='*60}\nFold {fold_i + 1} / {args.cv_folds}\n{'='*60}")
 
         train_images2 = images[fold_train_idx]
-        train_labels2 = labels[fold_train_idx][:, label_cols]
         val_images    = images[fold_val_idx]
-        val_labels    = labels[fold_val_idx][:, label_cols]
+        if args.label_set == "derived":
+            train_labels2 = _make_derived(labels[fold_train_idx])
+            val_labels    = _make_derived(labels[fold_val_idx])
+        else:
+            train_labels2 = labels[fold_train_idx][:, label_cols]
+            val_labels    = labels[fold_val_idx][:, label_cols]
+
+        # Pure-source filtering on training and val splits
+        if args.label_set == "pure":
+            tr_mask = labels[fold_train_idx].sum(axis=1) == 1
+            va_mask = labels[fold_val_idx].sum(axis=1)   == 1
+            train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
+            val_images,    val_labels    = val_images[va_mask],    val_labels[va_mask]
+        elif args.label_set in ("classical_pure", "initial_pure"):
+            tr_mask = labels[fold_train_idx][:, 0:5].sum(axis=1) == 1
+            va_mask = labels[fold_val_idx][:, 0:5].sum(axis=1)   == 1
+            train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
+            val_images,    val_labels    = val_images[va_mask],    val_labels[va_mask]
+
         print(f"  Train: {len(train_images2)}, Val: {len(val_images)}")
 
         fold_out = out_dir / f'fold{fold_i + 1}' if args.cv_folds > 1 else out_dir
@@ -556,6 +621,8 @@ def main():
             'seed':        args.seed,
         }, fold_out / 'model_best.pt')
 
+        results['label_set']        = args.label_set
+        results['eval_fri_frii_pure'] = args.eval_fri_frii_pure
         with open(fold_out / 'results.json', 'w') as f:
             json.dump(results, f, indent=2)
 
