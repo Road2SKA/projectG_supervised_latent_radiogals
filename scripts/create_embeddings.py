@@ -52,6 +52,8 @@ def parse_args():
     # Random seed
     ap.add_argument("--seed", type=int, default=42,
                     help="Random seed for reproducibility (default: 42)")
+    ap.add_argument("--data-seed", type=int, default=None,
+                    help="Random seed for data split (if default (None), uses --seed)")
     
     # Data configuration
     ap.add_argument("--data-dir", type=Path, 
@@ -202,6 +204,7 @@ SUBSAMPLE_SIZE = args.subsample
 
 # Random seed
 SEED = args.seed
+DATA_SEED = args.data_seed if args.data_seed is not None else SEED
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(SEED)
@@ -769,8 +772,8 @@ if CV_FOLDS == 1:
 
     print(f"\nSplitting data ({TRAIN_RATIO:.0%}/{VAL_RATIO:.0%}/{TEST_RATIO:.0%})...")
     all_idx = np.arange(len(images))
-    train_idx, temp_idx = train_test_split(all_idx, test_size=(VAL_RATIO + TEST_RATIO), random_state=SEED)
-    val_idx, test_idx   = train_test_split(temp_idx, test_size=TEST_RATIO/(VAL_RATIO+TEST_RATIO), random_state=SEED)
+    train_idx, temp_idx = train_test_split(all_idx, test_size=(VAL_RATIO + TEST_RATIO), random_state=DATA_SEED)
+    val_idx, test_idx   = train_test_split(temp_idx, test_size=TEST_RATIO/(VAL_RATIO+TEST_RATIO), random_state=DATA_SEED)
 
     train_images = images[train_idx]
     train_labels = labels[train_idx]
@@ -826,7 +829,7 @@ else:
     # -------------------------------------------------------------------------
     print(f"\n{CV_FOLDS}-fold cross-validation")
     all_idx = np.arange(len(images))
-    trainval_idx, test_idx = train_test_split(all_idx, test_size=0.15, random_state=SEED)
+    trainval_idx, test_idx = train_test_split(all_idx, test_size=0.15, random_state=DATA_SEED)
 
     test_images = images[test_idx]
     test_labels = labels[test_idx]
@@ -840,7 +843,7 @@ else:
 
     _, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False)
 
-    kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
+    kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=DATA_SEED) #unsure of data_seed vs seed here
     fold_results = []
 
     for fold_idx, (rel_train, rel_val) in enumerate(kf.split(trainval_idx)):
@@ -1139,9 +1142,9 @@ for _item in _items:
             #the labels are in the format of a one-hot encoding, so we need to convert them to a single label for each class
             labels_hot = np.argmax(split_labels[combined_fri_frii][:, :2], axis=1)
             metrics[split]['fri_vs_frii'] = {
-                'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot),
-                'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot),
-                'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot)
+                'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot).item(),
+                'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot).item(),
+                'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot).item()
             }
             fri_only = (split_labels[:, 0] == 1) & (split_labels[:, :5].sum(axis=1) == 1)
             frii_only = (split_labels[:, 1] == 1) & (split_labels[:, :5].sum(axis=1) == 1)
@@ -1153,9 +1156,9 @@ for _item in _items:
             labels_hot = np.argmax(split_labels[combined][:, :5], axis=1)
             labels_hot[all_hybrids[combined]] = 2  # assign hybrid label (index 2) to all hybrids, even if they also have spiral or relaxed double labels
             metrics[split]['base_classes'] = {
-                'silhouette': silhouette_score(projections[combined], labels_hot),
-                'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot),
-                'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot)
+                'silhouette': silhouette_score(projections[combined], labels_hot).item(),
+                'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot).item(),
+                'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot).item()
             }
 
         # and save to a json file
