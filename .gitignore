@@ -3,9 +3,11 @@
 __pycache__
 **/__pycache__/
 core_*
-outputs
 jobs
+data/processed
+data/raw
 logs
+outputs
 *.sbatch
 .venv
 Dockerfile

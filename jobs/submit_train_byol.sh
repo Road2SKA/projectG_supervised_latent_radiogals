@@ -30,11 +30,13 @@ WD=1e-4
 # R18 / CNXT: no --compile (not supported for these architectures)
 R18="python scripts/create_embeddings.py
     --model-type=resnet18
+    --data-dir=data/raw/lotss
     --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS
     --weight-decay=$WD"
 
 CNXT="python scripts/create_embeddings.py
     --model-type=convnext-tiny
+    --data-dir=data/raw/lotss
     --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS
     --weight-decay=$WD"
 
@@ -55,6 +57,7 @@ $CNXT --feature-compression-mode=pca --weighting=ponderate --lr-schedule=step \
 # =============================================================================
 python scripts/create_embeddings.py \
     --model-type=efficientnet-b0 \
+    --data-dir=data/raw/lotss \
     --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS \
     --compile \
     --weight-decay=$WD \
@@ -67,6 +70,7 @@ python scripts/create_embeddings.py \
 # =============================================================================
 python scripts/create_embeddings.py \
     --model-type=efficientnet-b0 \
+    --data-dir=data/raw/lotss \
     --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS \
     --compile \
     --weight-decay=$WD \
@@ -75,6 +79,7 @@ python scripts/create_embeddings.py \
 
 python scripts/create_embeddings.py \
     --model-type=efficientnet-b0 \
+    --data-dir=data/raw/lotss \
     --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS \
     --compile \
     --weight-decay=$WD \
@@ -83,6 +88,7 @@ python scripts/create_embeddings.py \
 
 python scripts/create_embeddings.py \
     --model-type=efficientnet-b0 \
+    --data-dir=data/raw/lotss \
     --label-type=$LABEL --epochs=$EPOCHS --batch-size=$BS \
     --compile \
     --weight-decay=$WD \

@@ -16,7 +16,7 @@ source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 # CONFIGURATION — edit before submitting
 # =============================================================================
 RUN_DIR="/users/mbredber/p3_SUPLAT/outputs/"
-DATA_DIR="./data"
+DATA_DIR="./data/raw/lotss"
 LABEL_SET="classical"
 EPOCHS=200
 BATCH_SIZE=256
