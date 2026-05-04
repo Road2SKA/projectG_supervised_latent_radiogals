@@ -4,7 +4,6 @@ __pycache__
 **/__pycache__/
 core_*
 jobs
-data/processed
 data/raw
 logs
 outputs
