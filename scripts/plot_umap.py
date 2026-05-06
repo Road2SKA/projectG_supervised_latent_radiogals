@@ -52,6 +52,8 @@ def load_embeddings(
         all_emb.append(emb)
         all_lbl.append(lbl)
         all_ds.append(np.full(len(emb), i, dtype=int))
+    if not all_emb:
+        raise RuntimeError(f"No embedding files found in {embeddings_dir}. Run extract_embeddings.py first.")
     return np.vstack(all_emb), np.concatenate(all_lbl), np.concatenate(all_ds)
 
 

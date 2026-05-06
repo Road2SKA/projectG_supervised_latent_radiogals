@@ -5,6 +5,7 @@ __pycache__
 core_*
 jobs
 data/raw
+data/processed
 logs
 outputs
 *.sbatch

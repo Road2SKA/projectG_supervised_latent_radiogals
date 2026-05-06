@@ -249,7 +249,10 @@ class PCAProjection(nn.Module):
     def __init__(self, variance_threshold=0.95):
         super().__init__()
         self.variance_threshold = variance_threshold
-        self._fitted = False
+        # Pre-register as None so load_state_dict can populate them from a checkpoint
+        self.register_buffer('mean_', None)
+        self.register_buffer('active_mask_', None)
+        self.register_buffer('components_', None)
 
     def fit(self, X: torch.Tensor):
         """
@@ -270,16 +273,28 @@ class PCAProjection(nn.Module):
         cumvar = (S ** 2).cumsum(0) / (S ** 2).sum()
         n_components = int((cumvar < self.variance_threshold).sum().item()) + 1
         self.register_buffer('components_', Vh[:n_components])  # (n_components, n_active)
-        self._fitted = True
 
     @property
     def out_dim(self) -> int:
-        if not self._fitted:
+        if self.components_ is None:
             raise RuntimeError("PCAProjection has not been fitted yet")
         return self.components_.shape[0]
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # PyTorch cannot copy_() into None-registered buffers, so assign them
+        # directly before the normal load path runs.
+        for name in ('mean_', 'active_mask_', 'components_'):
+            key = prefix + name
+            if key in state_dict and state_dict[key] is not None:
+                self._buffers[name] = state_dict[key]
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
     def forward(self, x):
-        if not self._fitted:
+        if self.components_ is None:
             raise RuntimeError("PCAProjection must be fitted before use; call fit_pca() first")
         return (x.float() - self.mean_)[:, self.active_mask_] @ self.components_.T
 

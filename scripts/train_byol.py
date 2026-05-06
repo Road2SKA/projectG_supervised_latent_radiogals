@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import json
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -205,10 +206,16 @@ SUBSAMPLE_SIZE = args.subsample
 # Random seed
 SEED = args.seed
 DATA_SEED = args.data_seed if args.data_seed is not None else SEED
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(SEED)
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(SEED)
 
 # Force CUDA if available
 if torch.cuda.is_available():
@@ -865,6 +872,7 @@ else:
         print(f"Train: {len(fold_train_loader)} batches × {BATCH_SIZE}")
         print(f"Val:   {len(fold_val_loader)} batches × {BATCH_SIZE}\n")
 
+        set_seed(SEED + fold_idx)
         fold_model, fold_history, fold_best_val, fold_best_epoch = train_fold(
             fold_train_loader, fold_val_loader, extract_loader=fold_train_extract_loader
         )
@@ -972,6 +980,7 @@ for _item in _items:
         'history': history,
         'config': {
             'model_type': MODEL_TYPE,
+            'feature_compression_mode': FEATURE_COMPRESSION_MODE,
             'batch_size': BATCH_SIZE,
             'learning_rate': LEARNING_RATE,
             'num_epochs': NUM_EPOCHS,

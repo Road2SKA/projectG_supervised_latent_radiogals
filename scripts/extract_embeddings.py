@@ -49,10 +49,12 @@ def load_model(checkpoint_path: Path, device: torch.device):
     proj_dim    = cfg.get("projection_dim", 256)
     hidden_dim  = cfg.get("hidden_dim", 4096)
     encoder_dim = cfg.get("encoder_dim", 512)
+    fcm         = cfg.get("feature_compression_mode", "pca")
 
     if model_type == "efficientnet-b0":
         model = BYOLEfficientNetB0(
-            projection_dim=proj_dim, hidden_dim=hidden_dim
+            projection_dim=proj_dim, hidden_dim=hidden_dim,
+            feature_compression_mode=fcm,
         )
     elif model_type == "convnet":
         model = BYOLEfficient(
@@ -65,18 +67,21 @@ def load_model(checkpoint_path: Path, device: torch.device):
         model = BYOLPretrainedBackbone(
             backbone, encoder_dim=encoder_dim,
             projection_dim=proj_dim, hidden_dim=hidden_dim,
+            feature_compression_mode=fcm,
         )
     elif model_type == "resnet50":
         backbone, _ = create_resnet50_backbone()
         model = BYOLPretrainedBackbone(
             backbone, encoder_dim=encoder_dim,
             projection_dim=proj_dim, hidden_dim=hidden_dim,
+            feature_compression_mode=fcm,
         )
     elif model_type == "convnext-tiny":
         backbone, _ = create_convnext_tiny_backbone()
         model = BYOLPretrainedBackbone(
             backbone, encoder_dim=encoder_dim,
             projection_dim=proj_dim, hidden_dim=hidden_dim,
+            feature_compression_mode=fcm,
         )
     else:
         enc = BYOLEncoder()
@@ -86,7 +91,7 @@ def load_model(checkpoint_path: Path, device: torch.device):
             projection_hidden_size=hidden_dim,
         )
 
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.to(device)
     model.eval()
     return model, model_type

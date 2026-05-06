@@ -31,6 +31,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -294,8 +295,15 @@ def main():
                         help="Custom run name prefix (default: run_dir basename + timestamp)")
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    def set_seed(seed: int) -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    set_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
@@ -439,6 +447,7 @@ def main():
             print(f"  Scattering done: train={scat_tr.shape}, val={scat_va.shape}, test={scat_te.shape}")
 
         # ── Build model ───────────────────────────────────────────────────
+        set_seed(args.seed + fold_i)
         print(f"Building model: {args.model}")
         model = build_model(args.model, n_classes, img_shape, scat_shape)
         model = model.to(device)

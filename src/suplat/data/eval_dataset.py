@@ -32,7 +32,7 @@ DATASET_REGISTRY = {
     "mightee":              ("data/processed/mightee",              None),
     "mightee_fr":           ("data/processed/mightee_fr",           "data/metadata/mightee_fr_labels.csv"),
     "mirabest":             ("data/processed/mirabest",             "data/metadata/mirabest_labels.csv"),
-    "radio_galaxy_dataset": ("data/processed/radio_galaxy_dataset", "data/metadata/radio_galaxy_dataset_labels.csv"),
+    "radio_galaxy_dataset": ("data/processed/first",                "data/metadata/radio_galaxy_dataset_labels.csv"),
 }
 
 

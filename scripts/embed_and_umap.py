@@ -48,7 +48,10 @@ import matplotlib.patches as mpatches
 import umap
 
 # Project imports — run from p3_SUPLAT root with the editable install active
-from suplat.models.byol_models import BYOLEfficient
+from suplat.models.byol_models import (
+    BYOLEfficient, BYOLEfficientNetB0, BYOLPretrainedBackbone, BYOLOriginal,
+    create_resnet18_backbone, create_resnet50_backbone, create_convnext_tiny_backbone,
+)
 from suplat.data.eval_dataset import EvalDataset, DATASET_REGISTRY
 
 # ---------------------------------------------------------------------------
@@ -57,6 +60,17 @@ from suplat.data.eval_dataset import EvalDataset, DATASET_REGISTRY
 BATCH_SIZE  = 128
 NUM_WORKERS = 4
 UMAP_SEED   = 42
+
+# Mapping from model-type string (same as train_byol.py) to class + kwargs
+MODEL_TYPE_MAP = {
+    "convnet":        (BYOLEfficient,        {}),
+    "efficientnet-b0":(BYOLEfficientNetB0,   {}),
+    "original":       (BYOLOriginal,         {}),
+    "resnet18":       (BYOLPretrainedBackbone, {"backbone": "resnet18"}),
+    "resnet50":       (BYOLPretrainedBackbone, {"backbone": "resnet50"}),
+    "convnext-tiny":  (BYOLPretrainedBackbone, {"backbone": "convnext-tiny"}),
+}
+MODEL_TYPE_CHOICES = list(MODEL_TYPE_MAP.keys())
 
 # Colour palette for datasets (up to 6 datasets)
 DATASET_COLOURS = [
@@ -81,9 +95,39 @@ LABEL_COLOURS = {
 # Step 1: Load model
 # ---------------------------------------------------------------------------
 
-def load_encoder(checkpoint_path, device):
+def _detect_model_type(checkpoint, checkpoint_path):
     """
-    Load a trained BYOLEfficient model and return it in eval mode.
+    Determine model type from:
+      1. checkpoint dict's 'config.model_type' key (saved by train_byol.py)
+      2. checkpoint dict's top-level 'model_type' key (legacy format)
+      3. heuristics on the checkpoint file path/name
+    Returns a string matching MODEL_TYPE_MAP keys, or None.
+    """
+    if isinstance(checkpoint, dict):
+        # Current format: nested under 'config'
+        mt = checkpoint.get("config", {}).get("model_type")
+        if mt and mt in MODEL_TYPE_MAP:
+            return mt
+        # Legacy format: top-level key
+        mt = checkpoint.get("model_type")
+        if mt:
+            if mt in MODEL_TYPE_MAP:
+                return mt
+            print(f"  WARNING: checkpoint model_type='{mt}' not recognised; "
+                  "falling back to path heuristics")
+
+    # Path heuristics: look for substrings in the path
+    path_lower = checkpoint_path.lower()
+    for key in MODEL_TYPE_MAP:
+        if key.replace("-", "_") in path_lower or key in path_lower:
+            return key
+
+    return None
+
+
+def load_encoder(checkpoint_path, device, model_type=None):
+    """
+    Load a trained BYOL model and return it in eval mode.
 
     We extract embeddings from the ONLINE branch:
         online_encoder → online_projector
@@ -93,11 +137,14 @@ def load_encoder(checkpoint_path, device):
     ----------
     checkpoint_path : str
     device          : torch.device
+    model_type      : str or None
+        One of MODEL_TYPE_MAP keys.  If None, auto-detected from the
+        checkpoint dict or path heuristics.  Falls back to 'convnet'.
 
     Returns
     -------
-    encoder   : nn.Module  (online_encoder, outputs 512-dim)
-    projector : nn.Module  (online_projector, outputs 256-dim)
+    encoder   : nn.Module  (online_encoder)
+    projector : nn.Module  (online_projector)
     """
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -110,7 +157,39 @@ def load_encoder(checkpoint_path, device):
     else:
         state_dict = checkpoint
 
-    model = BYOLEfficient()
+    # Resolve model type
+    if model_type is None:
+        model_type = _detect_model_type(checkpoint, checkpoint_path)
+    if model_type is None:
+        print("  WARNING: could not detect model type; defaulting to 'convnet'")
+        model_type = "convnet"
+    print(f"  Model type: {model_type}")
+
+    # Read feature_compression_mode from checkpoint; default 'pca' for back-compat
+    cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+    fcm         = cfg.get("feature_compression_mode", "pca")
+    encoder_dim = cfg.get("encoder_dim", 512)
+    proj_dim    = cfg.get("projection_dim", 256)
+    hidden_dim  = cfg.get("hidden_dim", 4096)
+    print(f"  Feature compression: {fcm}")
+
+    _BACKBONE_CREATORS = {
+        "resnet18":      create_resnet18_backbone,
+        "resnet50":      create_resnet50_backbone,
+        "convnext-tiny": create_convnext_tiny_backbone,
+    }
+    if model_type in _BACKBONE_CREATORS:
+        backbone, _ = _BACKBONE_CREATORS[model_type]()
+        model = BYOLPretrainedBackbone(
+            backbone, encoder_dim=encoder_dim,
+            projection_dim=proj_dim, hidden_dim=hidden_dim,
+            feature_compression_mode=fcm,
+        )
+    else:
+        model_cls, model_kwargs = MODEL_TYPE_MAP[model_type]
+        if model_cls is BYOLEfficientNetB0:
+            model_kwargs = {**model_kwargs, "feature_compression_mode": fcm}
+        model = model_cls(**model_kwargs)
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
@@ -118,9 +197,14 @@ def load_encoder(checkpoint_path, device):
     # Return just the online encoder and projector
     encoder   = model.online_encoder
     projector = model.online_projector
-    print(f"  Encoder output dim : 512")
-    print(f"  Projector output dim: "
-          f"{model.online_projector.net[-1].out_features}")
+    if hasattr(projector, 'net'):
+        proj_out_dim = projector.net[-1].out_features
+    else:
+        try:
+            proj_out_dim = projector.out_dim
+        except (AttributeError, RuntimeError):
+            proj_out_dim = '?'
+    print(f"  Projector output dim: {proj_out_dim}")
     return encoder, projector
 
 
@@ -129,7 +213,8 @@ def load_encoder(checkpoint_path, device):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def extract_embeddings(encoder, projector, dataset, device):
+def extract_embeddings(encoder, projector, dataset, device,
+                       batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
     """
     Pass all images in dataset through encoder → projector.
 
@@ -140,9 +225,9 @@ def extract_embeddings(encoder, projector, dataset, device):
     """
     loader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=NUM_WORKERS,
+        num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
     )
 
@@ -171,7 +256,8 @@ def embedding_paths(embed_dir, name):
 
 
 def load_or_extract(name, encoder, projector, device,
-                    embed_dir, force, root="."):
+                    embed_dir, force, root=".",
+                    batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
     """
     Load embeddings from cache if they exist, otherwise extract and save.
 
@@ -193,8 +279,10 @@ def load_or_extract(name, encoder, projector, device,
         print(f"  {name}: extracting embeddings")
 
     dataset    = EvalDataset(name, root=root)
-    embeddings, labels = extract_embeddings(encoder, projector,
-                                            dataset, device)
+    embeddings, labels = extract_embeddings(
+        encoder, projector, dataset, device,
+        batch_size=batch_size, num_workers=num_workers,
+    )
 
     np.save(emb_path, embeddings)
     np.save(lbl_path, labels)
@@ -206,7 +294,7 @@ def load_or_extract(name, encoder, projector, device,
 # Step 4: UMAP
 # ---------------------------------------------------------------------------
 
-def run_umap(all_embeddings, seed=UMAP_SEED):
+def run_umap(all_embeddings, seed=UMAP_SEED, n_neighbors=15, min_dist=0.1):
     """
     Fit UMAP on the concatenated embeddings from all datasets.
 
@@ -214,12 +302,13 @@ def run_umap(all_embeddings, seed=UMAP_SEED):
     i.e. you can see whether MGCLS and MIGHTEE crops cluster together or
     apart, and where labelled morphologies fall in that space.
     """
-    print(f"\nFitting UMAP on {len(all_embeddings)} points...")
+    print(f"\nFitting UMAP on {len(all_embeddings)} points "
+          f"(n_neighbors={n_neighbors}, min_dist={min_dist})...")
     reducer = umap.UMAP(
         n_components=2,
         random_state=seed,
-        n_neighbors=15,      # default; balance local vs global structure
-        min_dist=0.1,        # default; controls compactness of clusters
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
         metric="euclidean",
     )
     return reducer.fit_transform(all_embeddings)
@@ -315,29 +404,55 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract BYOL embeddings and plot UMAP"
     )
+    # --- Model ---
     parser.add_argument("--checkpoint",  required=True,
                         help="Path to trained BYOL .pt checkpoint")
+    parser.add_argument("--model-type",  dest="model_type",
+                        choices=MODEL_TYPE_CHOICES, default=None,
+                        help="BYOL architecture used during training. "
+                             f"Choices: {MODEL_TYPE_CHOICES}. "
+                             "Default: auto-detect from checkpoint or path.")
+    # --- Data ---
     parser.add_argument("--datasets",    nargs="+",
                         default=list(DATASET_REGISTRY.keys()),
                         help="Dataset names to include. "
                              f"Available: {list(DATASET_REGISTRY.keys())}. "
                              "Default: all.")
-    parser.add_argument("--colour_by",  choices=["dataset", "label"],
+    parser.add_argument("--root",        default=".",
+                        help="Project root directory (default: .)")
+    parser.add_argument("--batch-size",  dest="batch_size", type=int,
+                        default=BATCH_SIZE,
+                        help=f"Batch size for embedding extraction "
+                             f"(default: {BATCH_SIZE})")
+    parser.add_argument("--num-workers", dest="num_workers", type=int,
+                        default=NUM_WORKERS,
+                        help=f"DataLoader worker processes "
+                             f"(default: {NUM_WORKERS})")
+    # --- Output ---
+    parser.add_argument("--colour_by",   choices=["dataset", "label"],
                         default="dataset",
                         help="Colour UMAP points by dataset origin or "
                              "morphology label (default: dataset)")
-    parser.add_argument("--embed_dir",  default="embeddings",
+    parser.add_argument("--embed_dir",   default="embeddings",
                         help="Directory for cached embeddings "
                              "(default: embeddings/)")
-    parser.add_argument("--output_dir", default="outputs/umap",
+    parser.add_argument("--output_dir",  default="outputs/umap",
                         help="Directory for UMAP plot images "
                              "(default: outputs/umap/)")
-    parser.add_argument("--force",      action="store_true",
+    parser.add_argument("--force",       action="store_true",
                         help="Re-extract embeddings even if cached")
-    parser.add_argument("--root",       default=".",
-                        help="Project root directory (default: .)")
-    parser.add_argument("--no_umap",    action="store_true",
+    parser.add_argument("--no_umap",     action="store_true",
                         help="Extract embeddings only, skip UMAP plot")
+    # --- UMAP hyper-parameters ---
+    parser.add_argument("--umap-n-neighbors", dest="umap_n_neighbors",
+                        type=int, default=15,
+                        help="UMAP n_neighbors (default: 15)")
+    parser.add_argument("--umap-min-dist",    dest="umap_min_dist",
+                        type=float, default=0.1,
+                        help="UMAP min_dist (default: 0.1)")
+    parser.add_argument("--umap-seed",        dest="umap_seed",
+                        type=int, default=UMAP_SEED,
+                        help=f"UMAP random seed (default: {UMAP_SEED})")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -350,7 +465,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Load model ---
-    encoder, projector = load_encoder(args.checkpoint, device)
+    encoder, projector = load_encoder(args.checkpoint, device,
+                                      model_type=args.model_type)
 
     # --- Extract / load embeddings ---
     print("\nEmbeddings:")
@@ -364,7 +480,8 @@ def main():
             continue
         embs, lbls = load_or_extract(
             name, encoder, projector, device,
-            embed_dir, args.force, root=args.root
+            embed_dir, args.force, root=args.root,
+            batch_size=args.batch_size, num_workers=args.num_workers,
         )
         dataset_names.append(name)
         embeddings_list.append(embs)
@@ -380,7 +497,10 @@ def main():
 
     # --- UMAP ---
     all_embeddings = np.concatenate(embeddings_list)
-    coords         = run_umap(all_embeddings)
+    coords         = run_umap(all_embeddings,
+                              seed=args.umap_seed,
+                              n_neighbors=args.umap_n_neighbors,
+                              min_dist=args.umap_min_dist)
 
     # --- Plot ---
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
