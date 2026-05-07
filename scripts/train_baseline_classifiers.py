@@ -46,6 +46,7 @@ from torchvision import transforms
 
 # ── Project imports ───────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+from suplat.data.catalogue import Catalogue
 from suplat.models.baseline_models import (
     CNN, ScatterNet, SimpleScatterNet, DualScatterSqueezeNet
 )
@@ -277,7 +278,9 @@ def compute_scattering(images, J=2, L=8, device='cpu'):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_dir',    required=True, type=Path)
-    parser.add_argument('--data_dir',   required=True, type=Path)
+    parser.add_argument('--data_dir',   type=Path, default=None)
+    parser.add_argument('--catalogue',  type=Path, default=None,
+                        help="Path to a catalogue YAML. When provided, overrides --data_dir.")
     parser.add_argument('--model',      required=True,
                         choices=['cnn', 'scatternet', 'simplescatternet',
                                  'vit', 'dualssn', 'enb0'])
@@ -295,6 +298,9 @@ def main():
                         help="Custom run name prefix (default: run_dir basename + timestamp)")
     args = parser.parse_args()
 
+    if not args.catalogue and args.data_dir is None:
+        parser.error("--data_dir is required when --catalogue is not provided")
+
     def set_seed(seed: int) -> None:
         random.seed(seed)
         np.random.seed(seed)
@@ -310,111 +316,149 @@ def main():
     # ── Output directory ──────────────────────────────────────────────────
     _ts = datetime.now().strftime('%Y%m%d_%H%M')
     _prefix = args.run_name if args.run_name else args.run_dir.name
-    out_dir = args.run_dir / 'baselines' / f'{_prefix}_{args.model}_{_ts}'
+    out_dir = args.run_dir / 'supervised_baseline_classifiers' / f'{_prefix}_{args.model}_{_ts}'
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir}")
 
     # ── Load data ─────────────────────────────────────────────────────────
-    images = np.load(args.data_dir / 'images_filtered.npy')
-    labels = np.load(args.data_dir / 'labels_filtered.npy')
-    print(f"Images: {images.shape}, Labels: {labels.shape}")
+    if not args.catalogue:
+        images = np.load(args.data_dir / 'images_filtered.npy')
+        labels = np.load(args.data_dir / 'labels_filtered.npy')
+        print(f"Images: {images.shape}, Labels: {labels.shape}")
 
-    # ── Label subset ──────────────────────────────────────────────────────
-    DERIVED_CLASS_NAMES = [
-        'Pure hybrid',       # col2 & ~col0 & ~col1
-        'FR hybrid',         # col2 & (col0 | col1)
-        'Curved FRI',        # col0 & (col5 | col6)
-        'Curved FRII',       # col1 & (col5 | col6)
-        'Straight+multi-HS', # col10 & col11
-    ]
-
-    def _make_derived(y):
-        c = lambda i: y[:, i].astype(bool)
-        return np.stack([
-            ( c(2) & ~c(0) & ~c(1)).astype(np.int64),
-            ( c(2) &  (c(0) | c(1))).astype(np.int64),
-            ( c(0) &  (c(5) | c(6))).astype(np.int64),
-            ( c(1) &  (c(5) | c(6))).astype(np.int64),
-            (c(10) &   c(11)).astype(np.int64),
-        ], axis=1)
-
-    label_cols  = LABEL_SETS[args.label_set]
-    if args.label_set == "derived":
-        class_names = DERIVED_CLASS_NAMES
-    else:
-        class_names = [ALL_CLASS_NAMES[i] for i in label_cols]
-    n_classes   = len(class_names)
-    print(f"Label set: {args.label_set} ({n_classes} classes: {class_names})")
-
-    # ── 70/15/15 split — same logic as create_embeddings.py ──────────────
-    all_idx = np.arange(len(images))
-    trainval_idx, test_idx = train_test_split(all_idx,      test_size=0.30, random_state=args.seed)
-    train_idx,    val_idx  = train_test_split(trainval_idx, test_size=0.50, random_state=args.seed)
-
-    test_images = images[test_idx]
-    if args.label_set == "derived":
-        test_labels = _make_derived(labels[test_idx])
-    else:
-        test_labels = labels[test_idx][:, label_cols]
-
-    # ── Pure-source filtering (test set only for "full", both splits otherwise)
-    if args.label_set == "pure":
-        test_pure_mask  = labels[test_idx].sum(axis=1) == 1
-        test_images     = test_images[test_pure_mask]
-        test_labels     = test_labels[test_pure_mask]
-        print(f"Pure filter (all 20): {test_pure_mask.sum()} test retained")
-    elif args.label_set in ("classical_pure", "initial_pure"):
-        test_pure_mask  = labels[test_idx][:, 0:5].sum(axis=1) == 1
-        test_images     = test_images[test_pure_mask]
-        test_labels     = test_labels[test_pure_mask]
-        print(f"Initial-pure filter : {test_pure_mask.sum()} test retained")
-    elif args.label_set == "full" and args.eval_fri_frii_pure:
-        _y_te = labels[test_idx]
-        test_pure_mask  = (_y_te[:, 0:5].sum(axis=1) == 1) & (_y_te[:, 0] | _y_te[:, 1]).astype(bool)
-        test_images     = test_images[test_pure_mask]
-        test_labels     = test_labels[test_pure_mask]
-        print(f"FRI/FRII-pure eval filter : {test_pure_mask.sum()} test retained")
-
-    print(f"Test set: {len(test_images)}")
-
-    # ── Fold definitions ──────────────────────────────────────────────────
-    if args.cv_folds == 1:
-        fold_splits = [(train_idx, val_idx)]
-    else:
-        from sklearn.model_selection import KFold
-        kf = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
-        fold_splits = [
-            (trainval_idx[tr], trainval_idx[va])
-            for tr, va in kf.split(trainval_idx)
+    # ── Label subset / split setup ────────────────────────────────────────
+    if not args.catalogue:
+        DERIVED_CLASS_NAMES = [
+            'Pure hybrid',       # col2 & ~col0 & ~col1
+            'FR hybrid',         # col2 & (col0 | col1)
+            'Curved FRI',        # col0 & (col5 | col6)
+            'Curved FRII',       # col1 & (col5 | col6)
+            'Straight+multi-HS', # col10 & col11
         ]
-        print(f"K-fold CV: {args.cv_folds} folds on {len(trainval_idx)} trainval samples")
+
+        def _make_derived(y):
+            c = lambda i: y[:, i].astype(bool)
+            return np.stack([
+                ( c(2) & ~c(0) & ~c(1)).astype(np.int64),
+                ( c(2) &  (c(0) | c(1))).astype(np.int64),
+                ( c(0) &  (c(5) | c(6))).astype(np.int64),
+                ( c(1) &  (c(5) | c(6))).astype(np.int64),
+                (c(10) &   c(11)).astype(np.int64),
+            ], axis=1)
+
+        label_cols  = LABEL_SETS[args.label_set]
+        if args.label_set == "derived":
+            class_names = DERIVED_CLASS_NAMES
+        else:
+            class_names = [ALL_CLASS_NAMES[i] for i in label_cols]
+        n_classes   = len(class_names)
+        print(f"Label set: {args.label_set} ({n_classes} classes: {class_names})")
+
+        # ── 70/15/15 split — same logic as create_embeddings.py ──────────
+        all_idx = np.arange(len(images))
+        trainval_idx, test_idx = train_test_split(all_idx,      test_size=0.30, random_state=args.seed)
+        train_idx,    val_idx  = train_test_split(trainval_idx, test_size=0.50, random_state=args.seed)
+
+        test_images = images[test_idx]
+        if args.label_set == "derived":
+            test_labels = _make_derived(labels[test_idx])
+        else:
+            test_labels = labels[test_idx][:, label_cols]
+
+        # Pure-source filtering (test set only for "full", both splits otherwise)
+        if args.label_set == "pure":
+            test_pure_mask  = labels[test_idx].sum(axis=1) == 1
+            test_images     = test_images[test_pure_mask]
+            test_labels     = test_labels[test_pure_mask]
+            print(f"Pure filter (all 20): {test_pure_mask.sum()} test retained")
+        elif args.label_set in ("classical_pure", "initial_pure"):
+            test_pure_mask  = labels[test_idx][:, 0:5].sum(axis=1) == 1
+            test_images     = test_images[test_pure_mask]
+            test_labels     = test_labels[test_pure_mask]
+            print(f"Initial-pure filter : {test_pure_mask.sum()} test retained")
+        elif args.label_set == "full" and args.eval_fri_frii_pure:
+            _y_te = labels[test_idx]
+            test_pure_mask  = (_y_te[:, 0:5].sum(axis=1) == 1) & (_y_te[:, 0] | _y_te[:, 1]).astype(bool)
+            test_images     = test_images[test_pure_mask]
+            test_labels     = test_labels[test_pure_mask]
+            print(f"FRI/FRII-pure eval filter : {test_pure_mask.sum()} test retained")
+
+        print(f"Test set: {len(test_images)}")
+
+        # ── Fold definitions ──────────────────────────────────────────────
+        if args.cv_folds == 1:
+            fold_splits = [(train_idx, val_idx)]
+        else:
+            from sklearn.model_selection import KFold
+            kf = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
+            fold_splits = [
+                (trainval_idx[tr], trainval_idx[va])
+                for tr, va in kf.split(trainval_idx)
+            ]
+            print(f"K-fold CV: {args.cv_folds} folds on {len(trainval_idx)} trainval samples")
+
+    else:
+        # ── Catalogue path ────────────────────────────────────────────────
+        mat = Catalogue.from_yaml(str(args.catalogue)).materialise(root='.')
+        splits = mat.get_split_datasets()
+
+        def _concat_views(views):
+            imgs = np.concatenate([v.images for v in views])
+            lbls = np.concatenate([v.labels for v in views])
+            return imgs, lbls
+
+        _cat_train_images, _cat_train_labels = _concat_views(splits['train'])
+        _cat_val_images,   _cat_val_labels   = _concat_views(splits['val'])
+        test_images,       test_labels        = _concat_views(splits['test'])
+
+        # Ensure labels are always 2D: (N, n_classes)
+        if _cat_train_labels.ndim == 1:
+            _cat_train_labels = _cat_train_labels.reshape(-1, 1)
+            _cat_val_labels   = _cat_val_labels.reshape(-1, 1)
+            test_labels       = test_labels.reshape(-1, 1)
+
+        class_names = mat.label_names
+        n_classes   = len(class_names)
+        fold_splits = [None]   # single fixed split from catalogue sidecar
+
+        print(f"Catalogue: {args.catalogue}")
+        print(f"  Classes ({n_classes}): {class_names}")
+        print(f"  Train: {len(_cat_train_images)}, Val: {len(_cat_val_images)}, "
+              f"Test: {len(test_images)}")
 
     fold_results_list = []
 
-    for fold_i, (fold_train_idx, fold_val_idx) in enumerate(fold_splits):
+    for fold_i, fold_split in enumerate(fold_splits):
         if args.cv_folds > 1:
             print(f"\n{'='*60}\nFold {fold_i + 1} / {args.cv_folds}\n{'='*60}")
 
-        train_images2 = images[fold_train_idx]
-        val_images    = images[fold_val_idx]
-        if args.label_set == "derived":
-            train_labels2 = _make_derived(labels[fold_train_idx])
-            val_labels    = _make_derived(labels[fold_val_idx])
+        if args.catalogue:
+            train_images2 = _cat_train_images
+            val_images    = _cat_val_images
+            train_labels2 = _cat_train_labels
+            val_labels    = _cat_val_labels
         else:
-            train_labels2 = labels[fold_train_idx][:, label_cols]
-            val_labels    = labels[fold_val_idx][:, label_cols]
+            fold_train_idx, fold_val_idx = fold_split
+            train_images2 = images[fold_train_idx]
+            val_images    = images[fold_val_idx]
+            if args.label_set == "derived":
+                train_labels2 = _make_derived(labels[fold_train_idx])
+                val_labels    = _make_derived(labels[fold_val_idx])
+            else:
+                train_labels2 = labels[fold_train_idx][:, label_cols]
+                val_labels    = labels[fold_val_idx][:, label_cols]
 
-        # Pure-source filtering on training and val splits
-        if args.label_set == "pure":
-            tr_mask = labels[fold_train_idx].sum(axis=1) == 1
-            va_mask = labels[fold_val_idx].sum(axis=1)   == 1
-            train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
-            val_images,    val_labels    = val_images[va_mask],    val_labels[va_mask]
-        elif args.label_set in ("classical_pure", "initial_pure"):
-            tr_mask = labels[fold_train_idx][:, 0:5].sum(axis=1) == 1
-            va_mask = labels[fold_val_idx][:, 0:5].sum(axis=1)   == 1
-            train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
-            val_images,    val_labels    = val_images[va_mask],    val_labels[va_mask]
+            # Pure-source filtering on training and val splits
+            if args.label_set == "pure":
+                tr_mask = labels[fold_train_idx].sum(axis=1) == 1
+                va_mask = labels[fold_val_idx].sum(axis=1)   == 1
+                train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
+                val_images,    val_labels    = val_images[va_mask],    val_labels[va_mask]
+            elif args.label_set in ("classical_pure", "initial_pure"):
+                tr_mask = labels[fold_train_idx][:, 0:5].sum(axis=1) == 1
+                va_mask = labels[fold_val_idx][:, 0:5].sum(axis=1)   == 1
+                train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
+                val_images,    val_labels    = val_images[va_mask],    val_labels[va_mask]
 
         print(f"  Train: {len(train_images2)}, Val: {len(val_images)}")
 

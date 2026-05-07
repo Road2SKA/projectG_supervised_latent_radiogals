@@ -1,18 +1,18 @@
 """
 embed_and_umap.py
 
-Extracts BYOL embeddings for one or more datasets and plots a UMAP.
+Extracts BYOL projections for one or more datasets and plots a UMAP.
 
 The two steps are combined intentionally:
-  - Embeddings are cached to disk so UMAP can be re-plotted without
+  - Projections are cached to disk so UMAP can be re-plotted without
     re-running the encoder.
-  - Use --force to re-extract even if cached embeddings exist.
+  - Use --force to re-extract even if cached projections exist.
 
-What "embedding" means here:
-  We pass each image through the ONLINE encoder + projector:
-      image (1,89,89) → encoder → 512-dim → projector → 256-dim
-  The 256-dim projector output is saved as the embedding.
-  This is the representation that BYOL directly optimises.
+Terminology:
+  encoding   — output of the online encoder (e.g. 512-dim)
+  projection — output of the projector MLP/PCA applied to the encoding
+               (e.g. 256-dim); this is what BYOL directly optimises
+  UMAP coordinates — 2-D layout produced by fitting UMAP on projections
 
 Usage examples:
     # Extract + plot, colour by dataset origin
@@ -30,9 +30,9 @@ Usage examples:
     python embed_and_umap.py --checkpoint runs/byol_best.pt --force
 
 Output files:
-    embeddings/<run_id>/<dataset>_embeddings.npy
-    embeddings/<run_id>/<dataset>_labels.npy
-    embeddings/<run_id>/umap_<colour_by>_<timestamp>.png
+    <checkpoint_dir>/projections/<dataset>_projections.npy
+    <checkpoint_dir>/projections/<dataset>_labels.npy
+    <checkpoint_dir>/figures/umap_<data_tag>_<colour_tag>.png
 """
 
 import os
@@ -53,6 +53,7 @@ from suplat.models.byol_models import (
     create_resnet18_backbone, create_resnet50_backbone, create_convnext_tiny_backbone,
 )
 from suplat.data.eval_dataset import EvalDataset, DATASET_REGISTRY
+from suplat.data.catalogue import Catalogue
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -209,19 +210,19 @@ def load_encoder(checkpoint_path, device, model_type=None):
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Extract embeddings for one dataset
+# Step 2: Extract projections for one dataset
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def extract_embeddings(encoder, projector, dataset, device,
-                       batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
+def extract_projections(encoder, projector, dataset, device,
+                        batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
     """
     Pass all images in dataset through encoder → projector.
 
     Returns
     -------
-    embeddings : np.ndarray, shape (N, embed_dim)
-    labels     : np.ndarray, shape (N,), dtype int  (-1 if unlabelled)
+    projections : np.ndarray, shape (N, proj_dim)
+    labels      : np.ndarray, shape (N,), dtype int  (-1 if unlabelled)
     """
     loader = DataLoader(
         dataset,
@@ -231,78 +232,93 @@ def extract_embeddings(encoder, projector, dataset, device,
         pin_memory=(device.type == "cuda"),
     )
 
-    all_embeddings = []
-    all_labels     = []
+    all_projections = []
+    all_labels      = []
 
     for imgs, labels in loader:
         imgs = imgs.to(device)
-        z    = projector(encoder(imgs))   # (B, embed_dim)
-        all_embeddings.append(z.cpu().numpy())
+        z    = projector(encoder(imgs))   # (B, proj_dim)
+        all_projections.append(z.cpu().numpy())
         all_labels.append(labels.numpy())
 
-    return np.concatenate(all_embeddings), np.concatenate(all_labels)
+    return np.concatenate(all_projections), np.concatenate(all_labels)
+
+
+@torch.no_grad()
+def extract_from_array(encoder, projector, images, device, batch_size=BATCH_SIZE):
+    """
+    Extract projections directly from a numpy array of images (N, H, W).
+
+    Used by the catalogue path where images are already loaded into memory.
+    """
+    imgs_t = torch.from_numpy(images[:, None].astype(np.float32))
+    all_projs = []
+    for i in range(0, len(imgs_t), batch_size):
+        batch = imgs_t[i:i + batch_size].to(device)
+        all_projs.append(projector(encoder(batch)).cpu().numpy())
+    return np.concatenate(all_projs)
 
 
 # ---------------------------------------------------------------------------
 # Step 3: Cache management
 # ---------------------------------------------------------------------------
 
-def embedding_paths(embed_dir, name):
-    """Return (embeddings_path, labels_path) for a dataset."""
+def projection_paths(proj_dir, name):
+    """Return (projections_path, labels_path) for a dataset."""
     return (
-        os.path.join(embed_dir, f"{name}_embeddings.npy"),
-        os.path.join(embed_dir, f"{name}_labels.npy"),
+        os.path.join(proj_dir, f"{name}_projections.npy"),
+        os.path.join(proj_dir, f"{name}_labels.npy"),
     )
 
 
 def load_or_extract(name, encoder, projector, device,
-                    embed_dir, force, root=".",
+                    proj_dir, force, root=".",
                     batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
     """
-    Load embeddings from cache if they exist, otherwise extract and save.
+    Load projections from cache if they exist, otherwise extract and save.
 
     Parameters
     ----------
     name      : str   dataset name
     force     : bool  if True, re-extract even if cache exists
     """
-    emb_path, lbl_path = embedding_paths(embed_dir, name)
-    cached = os.path.exists(emb_path) and os.path.exists(lbl_path)
+    proj_path, lbl_path = projection_paths(proj_dir, name)
+    cached = os.path.exists(proj_path) and os.path.exists(lbl_path)
 
     if cached and not force:
         print(f"  {name}: loading from cache")
-        return np.load(emb_path), np.load(lbl_path)
+        return np.load(proj_path), np.load(lbl_path)
 
     if cached and force:
         print(f"  {name}: --force set, re-extracting")
     else:
-        print(f"  {name}: extracting embeddings")
+        print(f"  {name}: extracting projections")
 
-    dataset    = EvalDataset(name, root=root)
-    embeddings, labels = extract_embeddings(
+    dataset     = EvalDataset(name, root=root)
+    projections, labels = extract_projections(
         encoder, projector, dataset, device,
         batch_size=batch_size, num_workers=num_workers,
     )
 
-    np.save(emb_path, embeddings)
+    np.save(proj_path, projections)
     np.save(lbl_path, labels)
-    print(f"    {len(embeddings)} embeddings saved → {embed_dir}/")
-    return embeddings, labels
+    print(f"    {len(projections)} projections saved → {proj_dir}/")
+    return projections, labels
 
 
 # ---------------------------------------------------------------------------
 # Step 4: UMAP
 # ---------------------------------------------------------------------------
 
-def run_umap(all_embeddings, seed=UMAP_SEED, n_neighbors=15, min_dist=0.1):
+def run_umap(all_projections, seed=UMAP_SEED, n_neighbors=15, min_dist=0.1):
     """
-    Fit UMAP on the concatenated embeddings from all datasets.
+    Fit UMAP on the concatenated projections from all datasets.
 
     All datasets are fitted together so relative positions are meaningful —
     i.e. you can see whether MGCLS and MIGHTEE crops cluster together or
     apart, and where labelled morphologies fall in that space.
     """
-    print(f"\nFitting UMAP on {len(all_embeddings)} points "
+    print(f"\nFitting UMAP on {len(all_projections)} points "
           f"(n_neighbors={n_neighbors}, min_dist={min_dist})...")
     reducer = umap.UMAP(
         n_components=2,
@@ -311,26 +327,26 @@ def run_umap(all_embeddings, seed=UMAP_SEED, n_neighbors=15, min_dist=0.1):
         min_dist=min_dist,
         metric="euclidean",
     )
-    return reducer.fit_transform(all_embeddings)
+    return reducer.fit_transform(all_projections)
 
 
 # ---------------------------------------------------------------------------
 # Step 5: Plot
 # ---------------------------------------------------------------------------
 
-def plot_umap(coords, dataset_names, embeddings_list, labels_list,
+def plot_umap(coords, dataset_names, projections_list, labels_list,
               colour_by, out_path):
     """
     Plot UMAP coordinates coloured by dataset origin or morphology label.
 
     Parameters
     ----------
-    coords          : np.ndarray, shape (N, 2)
-    dataset_names   : list of str
-    embeddings_list : list of np.ndarray  (one per dataset, for size info)
-    labels_list     : list of np.ndarray
-    colour_by       : "dataset" or "label"
-    out_path        : str
+    coords           : np.ndarray, shape (N, 2)
+    dataset_names    : list of str
+    projections_list : list of np.ndarray  (one per dataset, for size info)
+    labels_list      : list of np.ndarray
+    colour_by        : "dataset" or "label"
+    out_path         : str
     """
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.set_aspect("equal")
@@ -343,7 +359,7 @@ def plot_umap(coords, dataset_names, embeddings_list, labels_list,
     offset = 0
 
     if colour_by == "dataset":
-        for i, (name, embs) in enumerate(zip(dataset_names, embeddings_list)):
+        for i, (name, embs) in enumerate(zip(dataset_names, projections_list)):
             n     = len(embs)
             colour = DATASET_COLOURS[i % len(DATASET_COLOURS)]
             point_colours.extend([colour] * n)
@@ -353,7 +369,7 @@ def plot_umap(coords, dataset_names, embeddings_list, labels_list,
             offset += n
 
     elif colour_by == "label":
-        for name, embs, labels in zip(dataset_names, embeddings_list,
+        for name, embs, labels in zip(dataset_names, projections_list,
                                       labels_list):
             for lbl in labels:
                 colour, _ = LABEL_COLOURS.get(int(lbl), ("#CCCCCC", "?"))
@@ -413,9 +429,11 @@ def main():
                              f"Choices: {MODEL_TYPE_CHOICES}. "
                              "Default: auto-detect from checkpoint or path.")
     # --- Data ---
+    parser.add_argument("--catalogue",   default=None,
+                        help="Path to a catalogue YAML. When provided, replaces --datasets.")
     parser.add_argument("--datasets",    nargs="+",
                         default=list(DATASET_REGISTRY.keys()),
-                        help="Dataset names to include. "
+                        help="Dataset names to include (ignored when --catalogue is used). "
                              f"Available: {list(DATASET_REGISTRY.keys())}. "
                              "Default: all.")
     parser.add_argument("--root",        default=".",
@@ -433,14 +451,14 @@ def main():
                         default="dataset",
                         help="Colour UMAP points by dataset origin or "
                              "morphology label (default: dataset)")
-    parser.add_argument("--embed_dir",   default="embeddings",
-                        help="Directory for cached embeddings "
-                             "(default: embeddings/)")
-    parser.add_argument("--output_dir",  default="outputs/umap",
-                        help="Directory for UMAP plot images "
-                             "(default: outputs/umap/)")
+    parser.add_argument("--proj_dir",    default=None,
+                        help="Directory for cached projections. "
+                             "Default: <checkpoint_dir>/projections/")
+    parser.add_argument("--output_dir",  default=None,
+                        help="Directory for UMAP plot images. "
+                             "Default: <checkpoint_dir>/figures/")
     parser.add_argument("--force",       action="store_true",
-                        help="Re-extract embeddings even if cached")
+                        help="Re-extract projections even if cached")
     parser.add_argument("--no_umap",     action="store_true",
                         help="Extract embeddings only, skip UMAP plot")
     # --- UMAP hyper-parameters ---
@@ -458,34 +476,104 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
-    # Derive a run_id from the checkpoint filename for namespacing cache
-    run_id    = os.path.splitext(os.path.basename(args.checkpoint))[0]
-    embed_dir = os.path.join(args.embed_dir, run_id)
-    os.makedirs(embed_dir,      exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Derive proj_dir from checkpoint directory unless overridden
+    checkpoint_dir = os.path.dirname(os.path.abspath(args.checkpoint))
+    proj_dir = args.proj_dir or os.path.join(checkpoint_dir, "projections")
+    os.makedirs(proj_dir, exist_ok=True)
 
     # --- Load model ---
     encoder, projector = load_encoder(args.checkpoint, device,
                                       model_type=args.model_type)
 
-    # --- Extract / load embeddings ---
-    print("\nEmbeddings:")
-    dataset_names   = []
-    embeddings_list = []
-    labels_list     = []
+    # --- Extract / load projections ---
+    print("\nProjections:")
+    dataset_names    = []
+    projections_list = []
+    labels_list      = []
 
-    for name in args.datasets:
-        if name not in DATASET_REGISTRY:
-            print(f"  WARNING: '{name}' not in registry — skipping")
-            continue
-        embs, lbls = load_or_extract(
-            name, encoder, projector, device,
-            embed_dir, args.force, root=args.root,
-            batch_size=args.batch_size, num_workers=args.num_workers,
-        )
-        dataset_names.append(name)
-        embeddings_list.append(embs)
-        labels_list.append(lbls)
+    if args.catalogue:
+        mat    = Catalogue.from_yaml(args.catalogue).materialise(root=args.root)
+        splits = mat.get_split_datasets()
+
+        # Set of dataset names that have labelled splits
+        labelled_names = {sv.dataset for sv_list in splits.values() for sv in sv_list}
+
+        for entry in mat._entries:
+            name = entry.dataset
+
+            if name in labelled_names:
+                # Combine images/labels from all splits; record split membership
+                split_code = {"train": 0, "val": 1, "test": 2}
+                all_imgs, all_lbls_1d, all_split_ids = [], [], []
+                for split_name, code in split_code.items():
+                    for sv in splits[split_name]:
+                        if sv.dataset != name:
+                            continue
+                        all_imgs.append(sv.images)
+                        lbls = sv.labels
+                        # Reduce multi-hot to 1-D for UMAP colouring
+                        if lbls.ndim > 1:
+                            lbls_1d = lbls.argmax(axis=1).astype(np.int64)
+                        else:
+                            lbls_1d = lbls.astype(np.int64)
+                        all_lbls_1d.append(lbls_1d)
+                        all_split_ids.append(
+                            np.full(len(sv.images), code, dtype=np.int64)
+                        )
+
+                images_all = np.concatenate(all_imgs)
+                lbls_all   = np.concatenate(all_lbls_1d)
+                split_all  = np.concatenate(all_split_ids)
+
+                proj_path = os.path.join(proj_dir, f"{name}_projections.npy")
+                lbl_path  = os.path.join(proj_dir, f"{name}_labels.npy")
+                cached = os.path.exists(proj_path) and os.path.exists(lbl_path)
+
+                if cached and not args.force:
+                    print(f"  {name}: loading from cache")
+                    projs    = np.load(proj_path)
+                    lbls_all = np.load(lbl_path)
+                else:
+                    if cached and args.force:
+                        print(f"  {name}: --force set, re-extracting")
+                    else:
+                        print(f"  {name}: extracting projections")
+                    projs = extract_from_array(
+                        encoder, projector, images_all, device, args.batch_size
+                    )
+                    np.save(proj_path, projs)
+                    np.save(lbl_path, lbls_all)
+                    print(f"    {len(projs)} projections saved → {proj_dir}/")
+
+                np.save(os.path.join(proj_dir, f"{name}_splits.npy"), split_all)
+
+            else:
+                # Unlabelled dataset: use existing EvalDataset path
+                projs, lbls_all = load_or_extract(
+                    name, encoder, projector, device,
+                    proj_dir, args.force, root=args.root,
+                    batch_size=args.batch_size, num_workers=args.num_workers,
+                )
+                split_all = np.full(len(projs), -1, dtype=np.int64)
+                np.save(os.path.join(proj_dir, f"{name}_splits.npy"), split_all)
+
+            dataset_names.append(name)
+            projections_list.append(projs)
+            labels_list.append(lbls_all)
+
+    else:
+        for name in args.datasets:
+            if name not in DATASET_REGISTRY:
+                print(f"  WARNING: '{name}' not in registry — skipping")
+                continue
+            projs, lbls = load_or_extract(
+                name, encoder, projector, device,
+                proj_dir, args.force, root=args.root,
+                batch_size=args.batch_size, num_workers=args.num_workers,
+            )
+            dataset_names.append(name)
+            projections_list.append(projs)
+            labels_list.append(lbls)
 
     if not dataset_names:
         print("No valid datasets — exiting.")
@@ -496,19 +584,23 @@ def main():
         return
 
     # --- UMAP ---
-    all_embeddings = np.concatenate(embeddings_list)
-    coords         = run_umap(all_embeddings,
-                              seed=args.umap_seed,
-                              n_neighbors=args.umap_n_neighbors,
-                              min_dist=args.umap_min_dist)
+    all_projections = np.concatenate(projections_list)
+    coords          = run_umap(all_projections,
+                               seed=args.umap_seed,
+                               n_neighbors=args.umap_n_neighbors,
+                               min_dist=args.umap_min_dist)
 
     # --- Plot ---
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plot_name = f"umap_{args.colour_by}_{run_id}_{timestamp}.png"
-    out_path  = os.path.join(args.output_dir, plot_name)
+    output_dir = args.output_dir or os.path.join(checkpoint_dir, "figures")
+    os.makedirs(output_dir, exist_ok=True)
+
+    data_tag   = "multi" if len(dataset_names) > 1 else dataset_names[0]
+    colour_tag = "datasets" if args.colour_by == "dataset" else "labels"
+    plot_name  = f"umap_{data_tag}_{colour_tag}.png"
+    out_path   = os.path.join(output_dir, plot_name)
 
     print(f"\nPlotting ({args.colour_by})...")
-    plot_umap(coords, dataset_names, embeddings_list,
+    plot_umap(coords, dataset_names, projections_list,
               labels_list, args.colour_by, out_path)
 
 

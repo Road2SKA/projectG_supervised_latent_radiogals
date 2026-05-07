@@ -21,11 +21,12 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split, KFold
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from tqdm import tqdm
 
-from suplat.data.data_samplers import BYOLSupDataset, weights_closest, weights_ponderate
+from suplat.data.data_samplers import BYOLSupDataset, UnlabelledBYOLDataset, weights_closest, weights_ponderate
+from suplat.data.catalogue import Catalogue
 from suplat.data.augmentations import get_augmentation
 from suplat.models.byol_models import (
     BYOLEfficient, BYOLEfficientNetB0, BYOLOriginal, BYOLEncoder,
@@ -144,7 +145,7 @@ def parse_args():
     # Output configuration
     ap.add_argument("--output-dir", type=Path,
                     default=Path('./outputs'),
-                    help="Base output directory for checkpoints and embeddings")
+                    help="Base output directory for checkpoints and projections")
     ap.add_argument("--run-name", type=str, default=None,
                     help="Custom run name (default: timestamp)")
     # Visualization
@@ -169,6 +170,11 @@ def parse_args():
     # METRICS
     ap.add_argument("--no-metrics", action="store_true",
                     help="Disable projection clustering metrics (enabled by default)")
+
+    # Catalogue
+    ap.add_argument("--catalogue", type=Path, default=None,
+                    help="Path to a catalogue YAML file. When provided, overrides "
+                         "--data-dir / --label-type / --subsample.")
 
     return ap.parse_args()
 
@@ -264,11 +270,10 @@ OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Create subfolders
-FIGURES_DIR    = OUTPUT_DIR / 'figures'
-EMBEDDINGS_DIR = OUTPUT_DIR / 'embeddings'
-LOGS_DIR       = OUTPUT_DIR / 'logs'
-DATA_DIR       = OUTPUT_DIR / 'data'
-for _d in [FIGURES_DIR, EMBEDDINGS_DIR, LOGS_DIR, DATA_DIR]:
+FIGURES_DIR = OUTPUT_DIR / 'figures'
+LOGS_DIR    = OUTPUT_DIR / 'logs'
+DATA_DIR    = OUTPUT_DIR / 'data'
+for _d in [FIGURES_DIR, LOGS_DIR, DATA_DIR]:
     _d.mkdir(exist_ok=True)
 
 checkpoint_path = OUTPUT_DIR / 'byol_model_best.pt'
@@ -308,8 +313,11 @@ print(f"Feature compression mode: {FEATURE_COMPRESSION_MODE}")
 print(f"Projection dim: {PROJECTION_DIM}")
 print(f"Hidden dim:     {HIDDEN_DIM}")
 print(f"Dataset:        {DATASET_NAME}")
-print(f"Data dir:       {args.data_dir}")
-print(f"Label type:     {args.label_type} ({label_dims} dims)")
+if args.catalogue:
+    print(f"Catalogue:      {args.catalogue}")
+else:
+    print(f"Data dir:       {args.data_dir}")
+    print(f"Label type:     {args.label_type} ({label_dims} dims)")
 print(f"Batch size:     {BATCH_SIZE}")
 print(f"Learning rate:  {LEARNING_RATE}")
 print(f"Epochs:         {NUM_EPOCHS}")
@@ -330,48 +338,49 @@ print(f"{'='*70}\n")
 # DATASET LOADING
 # =============================================================================
 
-# Data paths
-IMAGES_PATH = args.data_dir / 'images_filtered.npy'
-LABELS_PATH = args.data_dir / 'labels_filtered.npy'
+if not args.catalogue:
+    # Data paths
+    IMAGES_PATH = args.data_dir / 'images_filtered.npy'
+    LABELS_PATH = args.data_dir / 'labels_filtered.npy'
 
-print(f"Attempting to load {DATASET_NAME} data...")
-print(f"  Images: {IMAGES_PATH}")
-print(f"  Labels: {LABELS_PATH}")
+    print(f"Attempting to load {DATASET_NAME} data...")
+    print(f"  Images: {IMAGES_PATH}")
+    print(f"  Labels: {LABELS_PATH}")
 
-# Check if files exist
-if not IMAGES_PATH.exists():
-    raise FileNotFoundError(f"Images file not found: {IMAGES_PATH}")
-if not LABELS_PATH.exists():
-    raise FileNotFoundError(f"Labels file not found: {LABELS_PATH}")
+    # Check if files exist
+    if not IMAGES_PATH.exists():
+        raise FileNotFoundError(f"Images file not found: {IMAGES_PATH}")
+    if not LABELS_PATH.exists():
+        raise FileNotFoundError(f"Labels file not found: {LABELS_PATH}")
 
-# Load data
-images = np.load(IMAGES_PATH).astype(np.float32)/255
-labels = np.load(LABELS_PATH)
-labels_full = labels  # preserve all 20 columns before any label-type slicing
+    # Load data
+    images = np.load(IMAGES_PATH).astype(np.float32)/255
+    labels = np.load(LABELS_PATH)
+    labels_full = labels  # preserve all 20 columns before any label-type slicing
 
-label_start, label_end = LABEL_RANGES[args.label_type]
-if args.label_type != 'full':
-    labels = labels[:, label_start:label_end]
-    n_labels = label_end - label_start
-    print(f"\n✓ Using {args.label_type} labels only (indices {label_start}-{label_end-1}, {n_labels} dimensions)")
+    label_start, label_end = LABEL_RANGES[args.label_type]
+    if args.label_type != 'full':
+        labels = labels[:, label_start:label_end]
+        n_labels = label_end - label_start
+        print(f"\n✓ Using {args.label_type} labels only (indices {label_start}-{label_end-1}, {n_labels} dimensions)")
 
-# Validate
-assert len(images) == len(labels), f"Mismatch: {len(images)} images, {len(labels)} labels"
-assert images.ndim == 3, f"Expected 3D images, got {images.ndim}D: {images.shape}"
-assert images.shape[1] == images.shape[2] == 89, f"Expected 89×89, got {images.shape[1:3]}"
+    # Validate
+    assert len(images) == len(labels), f"Mismatch: {len(images)} images, {len(labels)} labels"
+    assert images.ndim == 3, f"Expected 3D images, got {images.ndim}D: {images.shape}"
+    assert images.shape[1] == images.shape[2] == 89, f"Expected 89×89, got {images.shape[1:3]}"
 
-# Subsample if requested
-if SUBSAMPLE_SIZE is not None and len(images) > SUBSAMPLE_SIZE:
-    print(f"\n⚠ Subsampling {SUBSAMPLE_SIZE}/{len(images)} samples")
-    indices = np.random.choice(len(images), SUBSAMPLE_SIZE, replace=False)
-    images = images[indices]
-    labels = labels[indices]
-    labels_full = labels_full[indices]
+    # Subsample if requested
+    if SUBSAMPLE_SIZE is not None and len(images) > SUBSAMPLE_SIZE:
+        print(f"\n⚠ Subsampling {SUBSAMPLE_SIZE}/{len(images)} samples")
+        indices = np.random.choice(len(images), SUBSAMPLE_SIZE, replace=False)
+        images = images[indices]
+        labels = labels[indices]
+        labels_full = labels_full[indices]
 
-print("\n✓ Data loaded")
-print(f"  Images: {images.shape} ({images.dtype})")
-print(f"  Labels: {labels.shape} ({labels.dtype})")
-print(f"  Range: [{images.min():.2f}, {images.max():.2f}]")
+    print("\n✓ Data loaded")
+    print(f"  Images: {images.shape} ({images.dtype})")
+    print(f"  Labels: {labels.shape} ({labels.dtype})")
+    print(f"  Range: [{images.min():.2f}, {images.max():.2f}]")
 
 # =============================================================================
 # LOSS MODE CONSTANTS
@@ -769,7 +778,101 @@ def evaluate_test(eval_model, test_loader_ref):
 # DATA SPLIT, DATASETS, LOADERS, AND TRAINING
 # =============================================================================
 
-if CV_FOLDS == 1:
+if args.catalogue:
+    # -------------------------------------------------------------------------
+    # CATALOGUE-BASED PATH
+    # -------------------------------------------------------------------------
+    mat = Catalogue.from_yaml(str(args.catalogue)).materialise(root='.')
+
+    print(f"\n{'='*70}")
+    print(f"CATALOGUE: {args.catalogue}")
+    print(f"  n_labelled_train: {mat.n_labelled_train}")
+    print(f"  label_names: {mat.label_names}")
+    print(f"{'='*70}\n")
+
+    all_images, labelled_df = mat.get_byol_data()
+    splits = mat.get_split_datasets()
+
+    # Build labelled train dataset
+    lab_idx = labelled_df['image_idx'].values
+    lab_images = all_images[lab_idx]
+    raw_labels = np.stack(labelled_df['label'].values)
+    if raw_labels.ndim == 1:
+        raw_labels = raw_labels.reshape(-1, 1)
+    tags_df = pd.DataFrame(raw_labels).reset_index(drop=True)
+
+    byol_sup_ds = BYOLSupDataset(
+        tags_data=tags_df, img_data=lab_images,
+        transform=byol_strong_aug, friend_transform=byol_strong_aug,
+        weightfunc=WEIGHTING_FUNC, p_pair_from_class=PROB_PAIR_FROM_CLASS,
+    )
+
+    # Build unlabelled dataset (all images not in the labelled train set)
+    unlabelled_mask = np.ones(len(all_images), dtype=bool)
+    unlabelled_mask[lab_idx] = False
+    unlabelled_images = all_images[unlabelled_mask]
+    unlab_ds = UnlabelledBYOLDataset(unlabelled_images, transform=byol_strong_aug)
+
+    # Combined train loader
+    train_ds = ConcatDataset([byol_sup_ds, unlab_ds])
+    _nw = NUM_WORKERS if use_cuda else 0
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=_nw, pin_memory=use_cuda, drop_last=True)
+    # Extract loader for PCA fitting (labelled split only, ordered)
+    train_extract_loader = DataLoader(byol_sup_ds, batch_size=BATCH_SIZE, shuffle=False,
+                                      num_workers=_nw, pin_memory=use_cuda)
+
+    # Val / test loaders from labelled splits
+    def _concat_views(views):
+        imgs = np.concatenate([v.images for v in views])
+        lbls = np.concatenate([v.labels for v in views])
+        return imgs, lbls
+
+    val_images, val_labels = _concat_views(splits['val'])
+    test_images, test_labels = _concat_views(splits['test'])
+    _, val_loader  = _make_dataset_loader(val_images,  val_labels,  shuffle=False, drop_last=USE_COMPILE)
+    _, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=USE_COMPILE)
+
+    train_images = lab_images
+    train_labels = raw_labels
+    labels_full  = None   # full 20-dim LoTSS labels not available in catalogue mode
+    train_idx    = lab_idx
+
+    np.save(DATA_DIR / 'train_idx.npy', train_idx)
+
+    print(f"\n{'='*70}")
+    print("✓ CATALOGUE DATA LOADED")
+    print(f"{'='*70}")
+    print(f"  Labelled train: {len(lab_images)}")
+    print(f"  Unlabelled:     {len(unlabelled_images)}")
+    print(f"  Val:            {len(val_images)}")
+    print(f"  Test:           {len(test_images)}")
+    print(f"  Train batches:  {len(train_loader)}")
+    print(f"{'='*70}\n")
+
+    model, history, best_val_loss, best_epoch = train_fold(
+        train_loader, val_loader, extract_loader=train_extract_loader
+    )
+
+    print("\nEvaluating on TEST set (held-out)...")
+    avg_test_loss = evaluate_test(model, test_loader)
+    print(f"\n{'='*70}")
+    print("TEST SET RESULTS (Best Model)")
+    print(f"{'='*70}")
+    print(f"Test Loss:  {avg_test_loss:.4f}")
+    print(f"Best Val:   {best_val_loss:.4f}")
+    print(f"Difference: {abs(avg_test_loss - best_val_loss):.4f}")
+    print(f"{'='*70}\n")
+
+    _items = [{'fold_idx': None, 'model': model, 'history': history,
+               'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
+               'avg_test_loss': avg_test_loss,
+               'train_extract_loader': train_extract_loader,
+               'val_loader': val_loader, 'train_labels': train_labels,
+               'val_labels': val_labels, 'train_idx': train_idx,
+               'train_images': train_images}]
+
+elif CV_FOLDS == 1:
     # -------------------------------------------------------------------------
     # SINGLE TRAIN/VAL/TEST SPLIT (default, backward compatible)
     # -------------------------------------------------------------------------
@@ -928,23 +1031,24 @@ else:
 # DOWNSTREAM: per-model loop (single model for CV_FOLDS==1, N models for CV_FOLDS>1)
 # =============================================================================
 
-if CV_FOLDS == 1:
-    _items = [{'fold_idx': None, 'model': model, 'history': history,
-               'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
-               'avg_test_loss': avg_test_loss,
-               'train_extract_loader': train_extract_loader,
-               'val_loader': val_loader, 'train_labels': train_labels,
-               'val_labels': val_labels, 'train_idx': train_idx,
-               'train_images': train_images}]
-else:
-    _items = [{'fold_idx': i, 'model': r['model'], 'history': r['history'],
-               'best_val_loss': r['best_val_loss'], 'best_epoch': r['best_epoch'],
-               'avg_test_loss': r['test_loss'],
-               'train_extract_loader': r['train_extract_loader'],
-               'val_loader': r['val_loader'], 'train_labels': r['train_labels'],
-               'val_labels': r['val_labels'], 'train_idx': r['train_idx'],
-               'train_images': r['train_images']}
-              for i, r in enumerate(fold_results)]
+if not args.catalogue:
+    if CV_FOLDS == 1:
+        _items = [{'fold_idx': None, 'model': model, 'history': history,
+                   'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
+                   'avg_test_loss': avg_test_loss,
+                   'train_extract_loader': train_extract_loader,
+                   'val_loader': val_loader, 'train_labels': train_labels,
+                   'val_labels': val_labels, 'train_idx': train_idx,
+                   'train_images': train_images}]
+    else:
+        _items = [{'fold_idx': i, 'model': r['model'], 'history': r['history'],
+                   'best_val_loss': r['best_val_loss'], 'best_epoch': r['best_epoch'],
+                   'avg_test_loss': r['test_loss'],
+                   'train_extract_loader': r['train_extract_loader'],
+                   'val_loader': r['val_loader'], 'train_labels': r['train_labels'],
+                   'val_labels': r['val_labels'], 'train_idx': r['train_idx'],
+                   'train_images': r['train_images']}
+                  for i, r in enumerate(fold_results)]
 
 for _item in _items:
     _fi      = _item['fold_idx']
@@ -997,6 +1101,7 @@ for _item in _items:
             'supervision_weight_schedule': SUPERVISION_WEIGHT_SCHEDULE,
             'dataset': DATASET_NAME,
             'label_type': args.label_type,
+            'catalogue_path': str(args.catalogue) if args.catalogue else None,
         }
     }, _chk_path)
 
@@ -1016,7 +1121,7 @@ for _item in _items:
     # EXTRACT EMBEDDINGS
     # =========================================================================
 
-    print(f"\nExtracting embeddings{_label}...")
+    print(f"\nExtracting projections{_label}...")
 
     # Extract from train loader (no-shuffle for ordered alignment with images)
     print("\n  Train set:")
@@ -1039,20 +1144,18 @@ for _item in _items:
     )
     print(f"    Projections: {test_projections.shape}")
 
-    # Save embeddings
-    np.save(EMBEDDINGS_DIR / f'train_projections{_suffix}.npy', train_projections)
-    np.save(EMBEDDINGS_DIR / f'val_projections{_suffix}.npy', val_projections)
-    np.save(EMBEDDINGS_DIR / f'test_projections{_suffix}.npy', test_projections)
+    # Save projections and labels
+    np.save(DATA_DIR / f'train_projections{_suffix}.npy', train_projections)
+    np.save(DATA_DIR / f'val_projections{_suffix}.npy', val_projections)
+    np.save(DATA_DIR / f'test_projections{_suffix}.npy', test_projections)
+    np.save(DATA_DIR / f'train_labels{_suffix}.npy', train_labels[:len(train_projections)])
+    np.save(DATA_DIR / f'val_labels{_suffix}.npy', val_labels[:len(val_projections)])
+    np.save(DATA_DIR / f'test_labels{_suffix}.npy', test_labels[:len(test_projections)])
 
-    # Save corresponding labels
-    np.save(EMBEDDINGS_DIR / f'train_labels{_suffix}.npy', train_labels[:len(train_projections)])
-    np.save(EMBEDDINGS_DIR / f'val_labels{_suffix}.npy', val_labels[:len(val_projections)])
-    np.save(EMBEDDINGS_DIR / f'test_labels{_suffix}.npy', test_labels[:len(test_projections)])
+    print(f"\n✓ Projections saved to {DATA_DIR}/")
 
-    print(f"\n✓ Embeddings saved to {EMBEDDINGS_DIR}/")
-
-    # Generate UMAP plots (default behavior unless disabled)
-    if not args.no_plot_umap:
+    # Generate UMAP plots (default behavior unless disabled; skipped in catalogue mode)
+    if not args.no_plot_umap and labels_full is not None:
         print(f"\nGenerating UMAP visualizations{_label}...")
 
         # Define class names for each label type
@@ -1151,9 +1254,9 @@ for _item in _items:
             #the labels are in the format of a one-hot encoding, so we need to convert them to a single label for each class
             labels_hot = np.argmax(split_labels[combined_fri_frii][:, :2], axis=1)
             metrics[split]['fri_vs_frii'] = {
-                'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot).item(),
-                'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot).item(),
-                'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot).item()
+                'silhouette': silhouette_score(projections[combined_fri_frii], labels_hot),
+                'davies_bouldin': davies_bouldin_score(projections[combined_fri_frii], labels_hot),
+                'calinski_harabasz': calinski_harabasz_score(projections[combined_fri_frii], labels_hot)
             }
             fri_only = (split_labels[:, 0] == 1) & (split_labels[:, :5].sum(axis=1) == 1)
             frii_only = (split_labels[:, 1] == 1) & (split_labels[:, :5].sum(axis=1) == 1)
@@ -1165,9 +1268,9 @@ for _item in _items:
             labels_hot = np.argmax(split_labels[combined][:, :5], axis=1)
             labels_hot[all_hybrids[combined]] = 2  # assign hybrid label (index 2) to all hybrids, even if they also have spiral or relaxed double labels
             metrics[split]['base_classes'] = {
-                'silhouette': silhouette_score(projections[combined], labels_hot).item(),
-                'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot).item(),
-                'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot).item()
+                'silhouette': silhouette_score(projections[combined], labels_hot),
+                'davies_bouldin': davies_bouldin_score(projections[combined], labels_hot),
+                'calinski_harabasz': calinski_harabasz_score(projections[combined], labels_hot)
             }
 
         # and save to a json file

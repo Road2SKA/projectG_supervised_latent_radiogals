@@ -1,0 +1,8 @@
+# All datasets: LoTSS + FIRST + MiraBest (labelled) + MGCLS + MIGHTEE (unlabelled)
+# Unlabelled datasets contribute images to BYOL but no supervised signal
+name: multi_all
+datasets:   [lotss,  radio_galaxy_dataset,  mirabest,  mgcls_20k,  mightee]
+labels:     [full,   native,                native,    none,       none]
+f_labels:   [1.0,    1.0,                   1.0,       0.0,        0.0]
+dataset_seed: 42
+cval: false
