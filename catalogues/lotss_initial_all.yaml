@@ -1,0 +1,8 @@
+# LoTSS only, all initial labels (FRI/FRII/Hybrid/Spiral/RelaxedDouble)
+# All train labels exposed to BYOL supervised signal
+name: lotss_initial_all
+datasets:   [lotss]
+labels:     [initial]
+f_labels:   [1.0]
+dataset_seed: 42
+cval: false

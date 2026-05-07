@@ -68,5 +68,24 @@ class BYOLSupDataset(Dataset):
         return img, img_transformed, img_friend, mdist
 
 
+class UnlabelledBYOLDataset(Dataset):
+    """
+    Dataset for unlabelled images in BYOL training.
+    Returns two independently augmented views of each image with a placeholder label of -1.
+    """
+    def __init__(self, images, transform=None):
+        self.images = images
+        self.transform = transform
 
-        
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img = torch.from_numpy(self.images[idx]).unsqueeze(0).float()
+        if self.transform:
+            aug1 = self.transform(img)
+            aug2 = self.transform(img)
+        else:
+            aug1 = img
+            aug2 = img
+        return img, aug1, aug2, -1

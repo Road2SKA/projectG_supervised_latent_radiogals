@@ -1,0 +1,7 @@
+# LoTSS only, pure FRI/FRII (unambiguous sources only, integer labels)
+name: lotss_classical_pure
+datasets:   [lotss]
+labels:     [classical_pure]
+f_labels:   [1.0]
+dataset_seed: 42
+cval: false

@@ -1,0 +1,8 @@
+# LoTSS only, initial labels, subsample to ~3000 labelled training samples
+# f_labels controls fraction — set to match ~3000 from your train split
+name: lotss_initial_3k
+datasets:   [lotss]
+labels:     [initial]
+f_labels:   [0.5]        # adjust based on your train split size
+dataset_seed: 42
+cval: false
