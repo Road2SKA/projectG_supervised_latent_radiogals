@@ -765,6 +765,18 @@ train_idx    = lab_idx
 
 np.save(DATA_DIR / 'train_idx.npy', train_idx)
 
+# Save val/test split indices so train_generative.py can pair images with projections.
+# Indices are into the per-dataset image array (== images_filtered.npy for LoTSS-only).
+# For multi-dataset catalogues these become global offsets into the concatenated all_images.
+_img_off = 0
+_val_parts, _test_parts = [], []
+for _ds_name, _ds_data in mat._labelled.items():
+    _val_parts.append(mat._splits[_ds_name]['val']  + _img_off)
+    _test_parts.append(mat._splits[_ds_name]['test'] + _img_off)
+    _img_off += len(_ds_data['images'])
+np.save(DATA_DIR / 'val_idx.npy',  np.concatenate(_val_parts)  if _val_parts  else np.array([], dtype=np.int64))
+np.save(DATA_DIR / 'test_idx.npy', np.concatenate(_test_parts) if _test_parts else np.array([], dtype=np.int64))
+
 print(f"\n{'='*70}")
 print("✓ CATALOGUE DATA LOADED")
 print(f"{'='*70}")

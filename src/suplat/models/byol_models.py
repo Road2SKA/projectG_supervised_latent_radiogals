@@ -296,7 +296,12 @@ class PCAProjection(nn.Module):
     def forward(self, x):
         if self.components_ is None:
             raise RuntimeError("PCAProjection must be fitted before use; call fit_pca() first")
-        return (x.float() - self.mean_)[:, self.active_mask_] @ self.components_.T
+        # Flatten x to (B, D) and ensure mean_/active_mask_ are 1-D regardless
+        # of how they were serialised in older checkpoints (e.g. (D,1) shapes).
+        x = x.float().reshape(x.shape[0], -1)
+        mean = self.mean_.flatten()
+        mask = self.active_mask_.flatten()
+        return (x - mean)[:, mask] @ self.components_.T
 
 
 class BYOLEfficientNetB0(nn.Module):
