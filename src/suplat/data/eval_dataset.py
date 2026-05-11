@@ -27,12 +27,12 @@ from torch.utils.data import Dataset
 
 # Registry: dataset_name -> (processed_dir_relative, labels_csv_relative or None)
 DATASET_REGISTRY = {
-    "mgcls_20k":            ("data/processed/mgcls_20k",            "data/metadata/mgcls_crops.csv"),
-    "mgcls_5k":             ("data/processed/mgcls_5k",             "data/metadata/mgcls_5k_crops.csv"),
-    "mightee":              ("data/processed/mightee",              None),
-    "mightee_fr":           ("data/processed/mightee_fr",           "data/metadata/mightee_fr_labels.csv"),
-    "mirabest":             ("data/processed/mirabest",             "data/metadata/mirabest_labels.csv"),
-    "radio_galaxy_dataset": ("data/processed/first",                "data/metadata/radio_galaxy_dataset_labels.csv"),
+    "mgcls_20k":            ("data/preprocessed/mgcls_20k",            "data/metadata/mgcls_crops.csv"),
+    "mgcls_5k":             ("data/preprocessed/mgcls_5k",             "data/metadata/mgcls_5k_crops.csv"),
+    "mightee":              ("data/preprocessed/mightee",              None),
+    "mightee_fr":           ("data/preprocessed/mightee_fr",           "data/metadata/mightee_fr_labels.csv"),
+    "mirabest":             ("data/preprocessed/mirabest",             "data/metadata/mirabest_labels.csv"),
+    "radio_galaxy_dataset": ("data/preprocessed/first",                "data/metadata/radio_galaxy_dataset_labels.csv"),
 }
 
 

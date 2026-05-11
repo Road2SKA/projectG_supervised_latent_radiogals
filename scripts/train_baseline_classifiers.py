@@ -67,7 +67,7 @@ LABEL_SETS = {
     "initial_pure":   list(range(0, 5)),
     "environment":    list(range(16, 20)),
     "derived":        None,          # computed from label combinations
-    "morphology":     list(range(5, 15)),
+    "morphology":     list(range(5, 16)),
     "all":            list(range(0, 20)),
     "pure":           list(range(0, 20)),
     "full":           list(range(0, 20)),

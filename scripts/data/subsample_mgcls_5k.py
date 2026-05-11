@@ -5,8 +5,8 @@ subsample_mgcls_5k.py
 Creates a random 5,000-sample subset of the MGCLS-20k processed dataset:
   1. Samples 5,000 rows at random from mgcls_crops.csv
   2. Writes the subset to mgcls_5k_crops.csv
-  3. Creates data/processed/mgcls_5k/ and populates it with symlinks
-     pointing to the corresponding files in data/processed/mgcls_20k/
+  3. Creates data/preprocessed/mgcls_5k/ and populates it with symlinks
+     pointing to the corresponding files in data/preprocessed/mgcls_20k/
 
 Safe to re-run: existing symlinks and the output CSV are skipped/overwritten.
 
@@ -62,9 +62,9 @@ if __name__ == "__main__":
                         help="Source metadata CSV (default: data/metadata/mgcls_crops.csv)")
     parser.add_argument("--output_csv", default="data/metadata/mgcls_5k_crops.csv",
                         help="Output subset CSV (default: data/metadata/mgcls_5k_crops.csv)")
-    parser.add_argument("--source_dir", default="data/processed/mgcls_20k",
+    parser.add_argument("--source_dir", default="data/preprocessed/mgcls_20k",
                         help="Directory with full MGCLS-20k .npy files")
-    parser.add_argument("--output_dir", default="data/processed/mgcls_5k",
+    parser.add_argument("--output_dir", default="data/preprocessed/mgcls_5k",
                         help="Directory where symlinks are created")
     parser.add_argument("--n",    type=int, default=5000,
                         help="Number of samples to draw (default: 5000)")

@@ -148,7 +148,7 @@ def create_convnext_tiny_backbone(num_channels=1, dropout_rate=0.2):
         if orig.bias is not None:
             new_conv.bias.copy_(orig.bias)
     model.features[0][0] = new_conv
-    model.classifier = nn.Dropout(p=dropout_rate)
+    model.classifier = nn.Sequential(nn.Flatten(1), nn.Dropout(p=dropout_rate))
     return model, 768
 
 # Shared encoder architecture

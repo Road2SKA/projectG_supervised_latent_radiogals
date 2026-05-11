@@ -29,7 +29,7 @@ Usage:
     python preprocess_mirabest.py                      # use all defaults
     python preprocess_mirabest.py \
         --root       data/raw/mirabest \
-        --output_dir data/processed/mirabest \
+        --output_dir data/preprocessed/mirabest \
         --labels_csv data/metadata/mirabest_labels.csv
 """
 
@@ -192,9 +192,9 @@ if __name__ == "__main__":
                         help="Root dir containing batches/ subdir "
                              "(default: data/raw/mirabest)")
     parser.add_argument("--output_dir",
-                        default="data/processed/mirabest",
+                        default="data/preprocessed/mirabest",
                         help="Where to save .npy crops "
-                             "(default: data/processed/mirabest)")
+                             "(default: data/preprocessed/mirabest)")
     parser.add_argument("--labels_csv",
                         default="data/metadata/mirabest_labels.csv",
                         help="Path for output labels CSV "

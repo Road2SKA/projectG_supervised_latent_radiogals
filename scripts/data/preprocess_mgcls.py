@@ -17,12 +17,12 @@ Pipeline per field:
 
 Usage:
   python mgcls_prep.py --fits_dir data/raw/mgcls_fits/5pln_cubes \
-                       --output_dir data/processed/mgcls_20k \
+                       --output_dir data/preprocessed/mgcls_20k \
                        --meta_csv data/metadata/mgcls_crops.csv
 
   # Dry-run a single field to test:
   python mgcls_prep.py --fits_dir data/raw/mgcls_fits/5pln_cubes \
-                       --output_dir data/processed/mgcls_test \
+                       --output_dir data/preprocessed/mgcls_test \
                        --meta_csv /tmp/test_meta.csv \
                        --limit 1
 """
@@ -399,9 +399,9 @@ if __name__ == "__main__":
                         help="Dir with .fits.gz files "
                              "(default: data/raw/mgcls_fits/5pln_cubes)")
     parser.add_argument("--output_dir",
-                        default="data/processed/mgcls_20k",
+                        default="data/preprocessed/mgcls_20k",
                         help="Where to save .npy crops "
-                             "(default: data/processed/mgcls_20k)")
+                             "(default: data/preprocessed/mgcls_20k)")
     parser.add_argument("--meta_csv",
                         default="data/metadata/mgcls_crops.csv",
                         help="Path for crop metadata CSV "
