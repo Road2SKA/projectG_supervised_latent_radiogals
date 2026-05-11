@@ -10,7 +10,7 @@ Supports:
   - mightee              : unlabelled MIGHTEE DR1 crops (label = -1)
   - mightee_fr           : labelled MIGHTEE FRI/FRII crops
   - mirabest             : labelled MiraBest FRI/FRII crops
-  - radio_galaxy_dataset : labelled RadioGalaxyDataset (FIRST) crops
+  - first : labelled RadioGalaxyDataset (FIRST) crops
 
 Usage:
     from suplat.data.eval_dataset import EvalDataset
@@ -32,7 +32,7 @@ DATASET_REGISTRY = {
     "mightee":              ("data/preprocessed/mightee",              None),
     "mightee_fr":           ("data/preprocessed/mightee_fr",           "data/metadata/mightee_fr_labels.csv"),
     "mirabest":             ("data/preprocessed/mirabest",             "data/metadata/mirabest_labels.csv"),
-    "radio_galaxy_dataset": ("data/preprocessed/first",                "data/metadata/radio_galaxy_dataset_labels.csv"),
+    "first": ("data/preprocessed/first",                "data/metadata/first_labels.csv"),
 }
 
 

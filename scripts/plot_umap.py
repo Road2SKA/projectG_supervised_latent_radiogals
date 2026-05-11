@@ -13,7 +13,7 @@ UMAP 2D coordinates are also saved as umap_coords.npy for later reuse.
 
 Usage:
     python scripts/plot_umap.py \\
-        --datasets mgcls_5k mirabest radio_galaxy_dataset \\
+        --datasets mgcls_5k mirabest first \\
         --embeddings_dir outputs/embeddings/run_id \\
         --output outputs/figures/run_id
 """

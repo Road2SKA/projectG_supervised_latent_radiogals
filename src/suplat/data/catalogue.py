@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -77,7 +77,7 @@ LOTSS_LABEL_NAMES = {
 UNLABELLED_DATASETS = {"mgcls_20k", "mgcls_5k", "mightee", "mightee_fr"}
 
 # CSV-based datasets (use EvalDataset / labels.csv)
-CSV_DATASETS = {"mirabest", "radio_galaxy_dataset", "mightee_fr"}
+CSV_DATASETS = {"mirabest", "first", "mightee_fr"}
 
 # Split ratios
 TRAIN_RATIO = 0.64
@@ -272,9 +272,9 @@ def _apply_label_type_csv(
     dataset: str,
 ) -> pd.DataFrame:
     """
-    Apply label alias to a CSV-based dataset (mirabest, radio_galaxy_dataset).
+    Apply label alias to a CSV-based dataset (mirabest, first).
 
-    For "classical" alias on radio_galaxy_dataset: filters to FRI/FRII only.
+    For "classical" alias on first: filters to FRI/FRII only.
     For mirabest "classical" is a no-op (already FRI/FRII).
 
     Returns filtered df with "label" column containing final integer labels.
@@ -283,7 +283,7 @@ def _apply_label_type_csv(
         # All aliases map to the existing integer label column
         return df
 
-    if label_type == "classical" and dataset == "radio_galaxy_dataset":
+    if label_type == "classical" and dataset == "first":
         # Keep only FRI (0) and FRII (1)
         df = df[df["label"].isin([0, 1])].copy()
         return df
@@ -324,7 +324,7 @@ def _load_csv_dataset(
     label_type: str,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """
-    Load a CSV-based dataset (mirabest, radio_galaxy_dataset).
+    Load a CSV-based dataset (mirabest, first).
 
     Returns images, labels, df (for split column access).
     """
@@ -612,12 +612,12 @@ class Catalogue:
                 print(f"    {len(images)} images, "
                       f"{labels.shape[-1] if labels.ndim > 1 else 1}-dim labels")
 
-            elif name in CSV_DATASETS or name == "radio_galaxy_dataset":
+            elif name in CSV_DATASETS or name == "first":
                 print(f"  [{name}] loading with labels='{entry.labels}'...")
                 images, labels, df = _load_csv_dataset(root, name, entry.labels)
                 label_names = ["FRI", "FRII"] if "classical" in entry.labels \
                               else ["FRI", "FRII", "Compact", "Bent"] \
-                              if name == "radio_galaxy_dataset" else ["FRI", "FRII"]
+                              if name == "first" else ["FRI", "FRII"]
 
                 mat._labelled[name] = {
                     "images":      images,
