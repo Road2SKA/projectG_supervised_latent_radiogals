@@ -33,7 +33,7 @@ Usage:
     python preprocess_radio_galaxy_dataset.py              # use defaults
     python preprocess_radio_galaxy_dataset.py \
         --h5_path    data/raw/radio_galaxy_dataset/galaxy_data_h5.h5 \
-        --output_dir data/processed/radio_galaxy_dataset \
+        --output_dir data/preprocessed/radio_galaxy_dataset \
         --labels_csv data/metadata/radio_galaxy_dataset_labels.csv
 """
 
@@ -154,9 +154,9 @@ if __name__ == "__main__":
                         help="Path to galaxy_data_h5.h5 "
                              "(default: data/raw/radio_galaxy_dataset/galaxy_data_h5.h5)")
     parser.add_argument("--output_dir",
-                        default="data/processed/radio_galaxy_dataset",
+                        default="data/preprocessed/radio_galaxy_dataset",
                         help="Where to save .npy crops "
-                             "(default: data/processed/radio_galaxy_dataset)")
+                             "(default: data/preprocessed/radio_galaxy_dataset)")
     parser.add_argument("--labels_csv",
                         default="data/metadata/radio_galaxy_dataset_labels.csv",
                         help="Path for output labels CSV "

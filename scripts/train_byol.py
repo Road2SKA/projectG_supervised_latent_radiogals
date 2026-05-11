@@ -20,13 +20,12 @@ import random
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import train_test_split, KFold
 from torch.utils.data import DataLoader, ConcatDataset
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from tqdm import tqdm
 
 from suplat.data.data_samplers import BYOLSupDataset, UnlabelledBYOLDataset, weights_closest, weights_ponderate
-from suplat.data.catalogue import Catalogue
+from suplat.data.catalogue import Catalogue, LOTSS_LABEL_NAMES
 from suplat.data.augmentations import get_augmentation
 from suplat.models.byol_models import (
     BYOLEfficient, BYOLEfficientNetB0, BYOLOriginal, BYOLEncoder,
@@ -54,26 +53,13 @@ def parse_args():
     # Random seed
     ap.add_argument("--seed", type=int, default=42,
                     help="Random seed for reproducibility (default: 42)")
-    ap.add_argument("--data-seed", type=int, default=None,
-                    help="Random seed for data split (if default (None), uses --seed)")
-    
-    # Data configuration
-    ap.add_argument("--data-dir", type=Path,
-                    default=Path('data/processed/lotss'),
-                    help="Root directory containing images.npy and labels.npy")
-    ap.add_argument("--dataset", type=str, default="LOTSS",
-                    choices=["LOTSS", "MOCK"],
-                    help="Dataset to use: LOTSS (real data) or MOCK (synthetic data)")
-    
-    # Label configuration
-    ap.add_argument("--label-type", type=str, default="full",
-                    choices=["full", "all", "classical", "initial", "morphology", "environment", "derived"],
-                    help="Label subset to use: 'full'/'all' (all 20), 'classical' (0-1: FRI, FRII), "
-                        "'initial' (0-4: FRI, FRII, Hybrids, Spirals, Relaxed doubles), "
-                        "'morphology' (5-14: C-curve, S-curve, Misalignment, Wings, X-shaped, Straight jets, Multiple hotspots, "
-                        "Continuous jets, Banding, One-sided, Restarted), 'environment' (15-18: Cluster, Merger, Diffuse emission, Unknown), "
-                        "'derived' (19-23: Compact+hybrids, Hybrid FRI/FRII, Curved FRIs, Curved FRIIs, Straight+multi hotspots)")
-    
+
+    # Note: --data-dir, --dataset, --label-type, --subsample, --data-seed, and
+    # --cv-folds have been removed. All of this is now encoded in the catalogue
+    # YAML: which datasets to load, which label alias to expose, what fraction
+    # of train labels to use (f_labels), and the split seed (dataset_seed).
+    # Pass a catalogue YAML via --catalogue to configure data loading.
+
     # Dataset pairing strategy
     ap.add_argument("--weighting", type=str, default="closest",
                     choices=["closest", "ponderate"],
@@ -99,9 +85,6 @@ def parse_args():
     ap.add_argument("--supervision-weight-end", type=float, default=1.0,
                     help="Ending supervision weight for scheduled curriculum (default: 1.0)")
     
-    # Data subsampling
-    ap.add_argument("--subsample", type=int, default=None,
-                    help="Subsample dataset to N samples (for quick testing)")
 
     # Augmentation
     ap.add_argument("--augmentation", type=str, default="standard",
@@ -155,6 +138,9 @@ def parse_args():
     # UMAP visualization
     ap.add_argument("--no-plot-umap", action="store_true",
                     help="Disable UMAP plots (enabled by default)")
+    ap.add_argument("--simple-multilabel", action="store_true",
+                    help="Draw multi-label sources as open white circles instead of "
+                         "pie-sector wedges (faster, less cluttered)")
     ap.add_argument("--umap-n-neighbors", type=int, default=30,
                     help="UMAP n_neighbors parameter (default: 30)")
     ap.add_argument("--umap-min-dist", type=float, default=0.1,
@@ -163,18 +149,14 @@ def parse_args():
     ap.add_argument("--num-workers", type=int, default=min(4, os.cpu_count() or 1),
                     help="Number of DataLoader worker processes (default: min(4, cpu_count))")
 
-    # Cross-validation
-    ap.add_argument("--cv-folds", type=int, default=1,
-                    help="Number of cross-validation folds (default: 1 = single train/val/test split)")
 
     # METRICS
     ap.add_argument("--no-metrics", action="store_true",
                     help="Disable projection clustering metrics (enabled by default)")
 
     # Catalogue
-    ap.add_argument("--catalogue", type=Path, default=None,
-                    help="Path to a catalogue YAML file. When provided, overrides "
-                         "--data-dir / --label-type / --subsample.")
+    ap.add_argument("--catalogue", type=Path, required=True,
+                    help="Path to a catalogue YAML file.")
 
     return ap.parse_args()
 
@@ -199,19 +181,12 @@ DROPOUT = args.dropout
 LR_SCHEDULE = args.lr_schedule
 WARMUP_EPOCHS = args.warmup_epochs
 NUM_WORKERS = args.num_workers
-CV_FOLDS = args.cv_folds
 FEATURE_COMPRESSION_MODE = args.feature_compression_mode
 USE_COMPILE = args.compile
-# Dataset configuration
-DATASET_NAME = args.dataset
 PROB_PAIR_FROM_CLASS = args.prob
-
-# Data subsampling
-SUBSAMPLE_SIZE = args.subsample
 
 # Random seed
 SEED = args.seed
-DATA_SEED = args.data_seed if args.data_seed is not None else SEED
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -250,21 +225,8 @@ _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     RUN_ID = f"{args.run_name}_{_timestamp}"
 else:
-    RUN_ID = _timestamp
-    if DATASET_NAME != "LOTSS":
-        RUN_ID += f"_{DATASET_NAME}"
-    RUN_ID += f"_{MODEL_TYPE}_w{args.weighting}_p{PROB_PAIR_FROM_CLASS}"
+    RUN_ID = f"{_timestamp}_{MODEL_TYPE}_w{args.weighting}_p{PROB_PAIR_FROM_CLASS}"
     
-# Truncate labels based on label type
-LABEL_RANGES = {
-    'full':        (0, 20),   # All labels
-    'all':         (0, 20),   # Alias for full
-    'classical':   (0, 2),    # FRI, FRII only
-    'initial':     (0, 5),    # FRI, FRII, Hybrids, Spirals, Relaxed doubles
-    'morphology':  (5, 15),   # C-curve through Restarted
-    'environment': (15, 19),  # Cluster, Merger, Diffuse emission, Unknown
-    'derived':     (19, 24),  # Compact+hybrids through Straight+multi hotspots
-}
 
 OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -293,13 +255,12 @@ _log_file = open(LOGS_DIR / 'run.log', 'w')
 _sys.stdout = _Tee(_sys.__stdout__, _log_file)
 
 # Write configuration log
-with open(LOGS_DIR / 'configuration_log.txt', 'w') as _cfg:
+with open(LOGS_DIR / 'train_byol_configuration_log.txt', 'w') as _cfg:
     _cfg.write(f"Run: {RUN_ID}\n")
     _cfg.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     _cfg.write("=" * 50 + "\n")
     for key, val in sorted(vars(args).items()):
         _cfg.write(f"{key}: {val}\n")
-label_dims = LABEL_RANGES[args.label_type][1] - LABEL_RANGES[args.label_type][0]
 
 print(f"\n{'='*70}")
 print("CONFIGURATION")
@@ -312,12 +273,7 @@ print(f"Model type:     {MODEL_TYPE}")
 print(f"Feature compression mode: {FEATURE_COMPRESSION_MODE}")
 print(f"Projection dim: {PROJECTION_DIM}")
 print(f"Hidden dim:     {HIDDEN_DIM}")
-print(f"Dataset:        {DATASET_NAME}")
-if args.catalogue:
-    print(f"Catalogue:      {args.catalogue}")
-else:
-    print(f"Data dir:       {args.data_dir}")
-    print(f"Label type:     {args.label_type} ({label_dims} dims)")
+print(f"Catalogue:      {args.catalogue}")
 print(f"Batch size:     {BATCH_SIZE}")
 print(f"Learning rate:  {LEARNING_RATE}")
 print(f"Epochs:         {NUM_EPOCHS}")
@@ -327,60 +283,10 @@ print(f"EMA decay:      {EMA_DECAY}")
 print(f"Weighting:      {args.weighting}")
 print(f"Pair prob:      {PROB_PAIR_FROM_CLASS}")
 print(f"Num workers:    {NUM_WORKERS}")
-print(f"CV folds:       {CV_FOLDS}")
 print(f"Compile:        {'enabled' if USE_COMPILE else 'disabled'}")
 print(f"Device:         {device}")
-if SUBSAMPLE_SIZE:
-    print(f"Subsampling:    {SUBSAMPLE_SIZE} samples")
 print(f"{'='*70}\n")
 
-# =============================================================================
-# DATASET LOADING
-# =============================================================================
-
-if not args.catalogue:
-    # Data paths
-    IMAGES_PATH = args.data_dir / 'images_filtered.npy'
-    LABELS_PATH = args.data_dir / 'labels_filtered.npy'
-
-    print(f"Attempting to load {DATASET_NAME} data...")
-    print(f"  Images: {IMAGES_PATH}")
-    print(f"  Labels: {LABELS_PATH}")
-
-    # Check if files exist
-    if not IMAGES_PATH.exists():
-        raise FileNotFoundError(f"Images file not found: {IMAGES_PATH}")
-    if not LABELS_PATH.exists():
-        raise FileNotFoundError(f"Labels file not found: {LABELS_PATH}")
-
-    # Load data
-    images = np.load(IMAGES_PATH).astype(np.float32)/255
-    labels = np.load(LABELS_PATH)
-    labels_full = labels  # preserve all 20 columns before any label-type slicing
-
-    label_start, label_end = LABEL_RANGES[args.label_type]
-    if args.label_type != 'full':
-        labels = labels[:, label_start:label_end]
-        n_labels = label_end - label_start
-        print(f"\n✓ Using {args.label_type} labels only (indices {label_start}-{label_end-1}, {n_labels} dimensions)")
-
-    # Validate
-    assert len(images) == len(labels), f"Mismatch: {len(images)} images, {len(labels)} labels"
-    assert images.ndim == 3, f"Expected 3D images, got {images.ndim}D: {images.shape}"
-    assert images.shape[1] == images.shape[2] == 89, f"Expected 89×89, got {images.shape[1:3]}"
-
-    # Subsample if requested
-    if SUBSAMPLE_SIZE is not None and len(images) > SUBSAMPLE_SIZE:
-        print(f"\n⚠ Subsampling {SUBSAMPLE_SIZE}/{len(images)} samples")
-        indices = np.random.choice(len(images), SUBSAMPLE_SIZE, replace=False)
-        images = images[indices]
-        labels = labels[indices]
-        labels_full = labels_full[indices]
-
-    print("\n✓ Data loaded")
-    print(f"  Images: {images.shape} ({images.dtype})")
-    print(f"  Labels: {labels.shape} ({labels.dtype})")
-    print(f"  Range: [{images.min():.2f}, {images.max():.2f}]")
 
 # =============================================================================
 # LOSS MODE CONSTANTS
@@ -778,282 +684,128 @@ def evaluate_test(eval_model, test_loader_ref):
 # DATA SPLIT, DATASETS, LOADERS, AND TRAINING
 # =============================================================================
 
-if args.catalogue:
-    # -------------------------------------------------------------------------
-    # CATALOGUE-BASED PATH
-    # -------------------------------------------------------------------------
-    mat = Catalogue.from_yaml(str(args.catalogue)).materialise(root='.')
+# -------------------------------------------------------------------------
+# CATALOGUE-BASED DATA LOADING
+# -------------------------------------------------------------------------
+mat = Catalogue.from_yaml(str(args.catalogue)).materialise(root='.')
 
-    print(f"\n{'='*70}")
-    print(f"CATALOGUE: {args.catalogue}")
-    print(f"  n_labelled_train: {mat.n_labelled_train}")
-    print(f"  label_names: {mat.label_names}")
-    print(f"{'='*70}\n")
+print(f"\n{'='*70}")
+print(f"CATALOGUE: {args.catalogue}")
+print(f"  n_labelled_train: {mat.n_labelled_train}")
+print(f"  label_names: {mat.label_names}")
+print(f"{'='*70}\n")
 
-    all_images, labelled_df = mat.get_byol_data()
-    splits = mat.get_split_datasets()
+all_images, labelled_df = mat.get_byol_data()
+splits = mat.get_split_datasets()
 
-    # Build labelled train dataset
-    lab_idx = labelled_df['image_idx'].values
-    lab_images = all_images[lab_idx]
-    raw_labels = np.stack(labelled_df['label'].values)
-    if raw_labels.ndim == 1:
-        raw_labels = raw_labels.reshape(-1, 1)
-    tags_df = pd.DataFrame(raw_labels).reset_index(drop=True)
+# Build labelled train dataset
+lab_idx = labelled_df['image_idx'].values
+lab_images = all_images[lab_idx]
+# Normalise labels to uniform 2-D shape before building tags_df.
+# Multi-dataset catalogues can mix scalar integer labels (e.g. MiraBest native)
+# with multi-hot arrays (e.g. LoTSS morphology); np.stack would fail on the
+# shape mismatch.  Convert each label to a 1-D float array then zero-pad all
+# to the same length so cdist inside BYOLSupDataset always gets a 2-D matrix.
+label_arrs = [np.atleast_1d(np.asarray(l, dtype=np.float32))
+              for l in labelled_df['label'].values]
+max_len = max(a.shape[0] for a in label_arrs)
+if max_len > 1:
+    label_arrs = [np.pad(a, (0, max_len - len(a))) for a in label_arrs]
+raw_labels = np.stack(label_arrs)
+tags_df = pd.DataFrame(raw_labels).reset_index(drop=True)
 
-    byol_sup_ds = BYOLSupDataset(
-        tags_data=tags_df, img_data=lab_images,
-        transform=byol_strong_aug, friend_transform=byol_strong_aug,
-        weightfunc=WEIGHTING_FUNC, p_pair_from_class=PROB_PAIR_FROM_CLASS,
-    )
+byol_sup_ds = BYOLSupDataset(
+    tags_data=tags_df, img_data=lab_images,
+    transform=byol_strong_aug, friend_transform=byol_strong_aug,
+    weightfunc=WEIGHTING_FUNC, p_pair_from_class=PROB_PAIR_FROM_CLASS,
+)
 
-    # Build unlabelled dataset (all images not in the labelled train set)
-    unlabelled_mask = np.ones(len(all_images), dtype=bool)
-    unlabelled_mask[lab_idx] = False
-    unlabelled_images = all_images[unlabelled_mask]
-    unlab_ds = UnlabelledBYOLDataset(unlabelled_images, transform=byol_strong_aug)
+# Build unlabelled dataset (all images not in the labelled train set)
+unlabelled_mask = np.ones(len(all_images), dtype=bool)
+unlabelled_mask[lab_idx] = False
+unlabelled_images = all_images[unlabelled_mask]
+unlab_ds = UnlabelledBYOLDataset(unlabelled_images, transform=byol_strong_aug)
 
-    # Combined train loader
-    train_ds = ConcatDataset([byol_sup_ds, unlab_ds])
-    _nw = NUM_WORKERS if use_cuda else 0
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=_nw, pin_memory=use_cuda, drop_last=True)
-    # Extract loader for PCA fitting (labelled split only, ordered)
-    train_extract_loader = DataLoader(byol_sup_ds, batch_size=BATCH_SIZE, shuffle=False,
-                                      num_workers=_nw, pin_memory=use_cuda)
+# Combined train loader
+train_ds = ConcatDataset([byol_sup_ds, unlab_ds])
+_nw = NUM_WORKERS if use_cuda else 0
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                            num_workers=_nw, pin_memory=use_cuda, drop_last=True)
+# Extract loader for PCA fitting (labelled split only, ordered)
+train_extract_loader = DataLoader(byol_sup_ds, batch_size=BATCH_SIZE, shuffle=False,
+                                    num_workers=_nw, pin_memory=use_cuda)
 
-    # Val / test loaders from labelled splits
-    def _concat_views(views):
-        imgs = np.concatenate([v.images for v in views])
-        lbls = np.concatenate([v.labels for v in views])
-        return imgs, lbls
+# Val / test loaders from labelled splits
+def _concat_views(views):
+    imgs = np.concatenate([v.images for v in views])
+    # Normalise label arrays to uniform shape (same issue as for labelled_df
+    # above: multi-dataset catalogues can mix 2-D multi-hot with 1-D scalars).
+    label_blocks = []
+    for v in views:
+        lbl = v.labels
+        if lbl.ndim == 1:
+            lbl = lbl.reshape(-1, 1)
+        label_blocks.append(lbl)
+    max_cols = max(b.shape[1] for b in label_blocks)
+    label_blocks = [np.pad(b, ((0, 0), (0, max_cols - b.shape[1])))
+                    if b.shape[1] < max_cols else b
+                    for b in label_blocks]
+    lbls = np.concatenate(label_blocks)
+    return imgs, lbls
 
-    val_images, val_labels = _concat_views(splits['val'])
-    test_images, test_labels = _concat_views(splits['test'])
-    _, val_loader  = _make_dataset_loader(val_images,  val_labels,  shuffle=False, drop_last=USE_COMPILE)
-    _, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=USE_COMPILE)
+val_images, val_labels = _concat_views(splits['val'])
+test_images, test_labels = _concat_views(splits['test'])
+_, val_loader  = _make_dataset_loader(val_images,  val_labels,  shuffle=False, drop_last=USE_COMPILE)
+_, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=USE_COMPILE)
 
-    train_images = lab_images
-    train_labels = raw_labels
-    labels_full  = None   # full 20-dim LoTSS labels not available in catalogue mode
-    train_idx    = lab_idx
+train_images = lab_images
+train_labels = raw_labels
+labels_full  = None   # full 20-dim LoTSS labels not available in catalogue mode
+train_idx    = lab_idx
 
-    np.save(DATA_DIR / 'train_idx.npy', train_idx)
+np.save(DATA_DIR / 'train_idx.npy', train_idx)
 
-    print(f"\n{'='*70}")
-    print("✓ CATALOGUE DATA LOADED")
-    print(f"{'='*70}")
-    print(f"  Labelled train: {len(lab_images)}")
-    print(f"  Unlabelled:     {len(unlabelled_images)}")
-    print(f"  Val:            {len(val_images)}")
-    print(f"  Test:           {len(test_images)}")
-    print(f"  Train batches:  {len(train_loader)}")
-    print(f"{'='*70}\n")
+print(f"\n{'='*70}")
+print("✓ CATALOGUE DATA LOADED")
+print(f"{'='*70}")
+print(f"  Labelled train: {len(lab_images)}")
+print(f"  Unlabelled:     {len(unlabelled_images)}")
+print(f"  Val:            {len(val_images)}")
+print(f"  Test:           {len(test_images)}")
+print(f"  Train batches:  {len(train_loader)}")
+print(f"{'='*70}\n")
 
-    model, history, best_val_loss, best_epoch = train_fold(
-        train_loader, val_loader, extract_loader=train_extract_loader
-    )
+model, history, best_val_loss, best_epoch = train_fold(
+    train_loader, val_loader, extract_loader=train_extract_loader
+)
 
-    print("\nEvaluating on TEST set (held-out)...")
-    avg_test_loss = evaluate_test(model, test_loader)
-    print(f"\n{'='*70}")
-    print("TEST SET RESULTS (Best Model)")
-    print(f"{'='*70}")
-    print(f"Test Loss:  {avg_test_loss:.4f}")
-    print(f"Best Val:   {best_val_loss:.4f}")
-    print(f"Difference: {abs(avg_test_loss - best_val_loss):.4f}")
-    print(f"{'='*70}\n")
+print("\nEvaluating on TEST set (held-out)...")
+avg_test_loss = evaluate_test(model, test_loader)
+print(f"\n{'='*70}")
+print("TEST SET RESULTS (Best Model)")
+print(f"{'='*70}")
+print(f"Test Loss:  {avg_test_loss:.4f}")
+print(f"Best Val:   {best_val_loss:.4f}")
+print(f"Difference: {abs(avg_test_loss - best_val_loss):.4f}")
+print(f"{'='*70}\n")
 
-    _items = [{'fold_idx': None, 'model': model, 'history': history,
-               'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
-               'avg_test_loss': avg_test_loss,
-               'train_extract_loader': train_extract_loader,
-               'val_loader': val_loader, 'train_labels': train_labels,
-               'val_labels': val_labels, 'train_idx': train_idx,
-               'train_images': train_images}]
+_items = [{'fold_idx': None, 'model': model, 'history': history,
+            'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
+            'avg_test_loss': avg_test_loss,
+            'train_extract_loader': train_extract_loader,
+            'val_loader': val_loader, 'train_labels': train_labels,
+            'val_labels': val_labels, 'train_idx': train_idx,
+            'train_images': train_images}]
 
-elif CV_FOLDS == 1:
-    # -------------------------------------------------------------------------
-    # SINGLE TRAIN/VAL/TEST SPLIT (default, backward compatible)
-    # -------------------------------------------------------------------------
-    TRAIN_RATIO = 0.7
-    VAL_RATIO = 0.15
-    TEST_RATIO = 0.15
-
-    print(f"\nSplitting data ({TRAIN_RATIO:.0%}/{VAL_RATIO:.0%}/{TEST_RATIO:.0%})...")
-    all_idx = np.arange(len(images))
-    train_idx, temp_idx = train_test_split(all_idx, test_size=(VAL_RATIO + TEST_RATIO), random_state=DATA_SEED)
-    val_idx, test_idx   = train_test_split(temp_idx, test_size=TEST_RATIO/(VAL_RATIO+TEST_RATIO), random_state=DATA_SEED)
-
-    train_images = images[train_idx]
-    train_labels = labels[train_idx]
-    val_images   = images[val_idx]
-    val_labels   = labels[val_idx]
-    test_images  = images[test_idx]
-    test_labels  = labels[test_idx]
-
-    np.save(DATA_DIR / 'train_idx.npy', train_idx)
-    np.save(DATA_DIR / 'val_idx.npy',   val_idx)
-    np.save(DATA_DIR / 'test_idx.npy',  test_idx)
-
-    print(f"  Train: {len(train_images)}")
-    print(f"  Val:   {len(val_images)}")
-    print(f"  Test:  {len(test_images)}")
-
-    print("\nCreating datasets...")
-    print("  Converted labels to DataFrames")
-    print(f"  Augmentation: {args.augmentation}")
-
-    _, train_loader         = _make_dataset_loader(train_images, train_labels, shuffle=True,  drop_last=True)
-    _, train_extract_loader = _make_dataset_loader(train_images, train_labels, shuffle=False)
-    _, val_loader           = _make_dataset_loader(val_images,   val_labels,   shuffle=False, drop_last=USE_COMPILE)
-    _, test_loader          = _make_dataset_loader(test_images,  test_labels,  shuffle=False, drop_last=USE_COMPILE)
-
-    print(f"\n{'='*70}")
-    print("✓ DATA LOADED")
-    print(f"{'='*70}")
-    print(f"Train: {len(train_loader)} batches × {BATCH_SIZE}")
-    print(f"Val:   {len(val_loader)} batches × {BATCH_SIZE}")
-    print(f"Test:  {len(test_loader)} batches × {BATCH_SIZE}")
-    print(f"{'='*70}\n")
-
-    x1, x1_trans, x2_friend, _ = next(iter(train_loader))
-    print(f"✓ Test batch: {x1.shape}, {x1_trans.shape}, {x2_friend.shape}")
-    print(f"  Different: {not torch.allclose(x1, x1_trans)}")
-
-    model, history, best_val_loss, best_epoch = train_fold(train_loader, val_loader, extract_loader=train_extract_loader)
-
-    print("\nEvaluating on TEST set (held-out)...")
-    avg_test_loss = evaluate_test(model, test_loader)
-    print(f"\n{'='*70}")
-    print("TEST SET RESULTS (Best Model)")
-    print(f"{'='*70}")
-    print(f"Test Loss:  {avg_test_loss:.4f}")
-    print(f"Best Val:   {best_val_loss:.4f}")
-    print(f"Difference: {abs(avg_test_loss - best_val_loss):.4f}")
-    print(f"{'='*70}\n")
-
-else:
-    # -------------------------------------------------------------------------
-    # K-FOLD CROSS-VALIDATION
-    # -------------------------------------------------------------------------
-    print(f"\n{CV_FOLDS}-fold cross-validation")
-    all_idx = np.arange(len(images))
-    trainval_idx, test_idx = train_test_split(all_idx, test_size=0.15, random_state=DATA_SEED)
-
-    test_images = images[test_idx]
-    test_labels = labels[test_idx]
-
-    np.save(DATA_DIR / 'test_idx.npy',      test_idx)
-    np.save(DATA_DIR / 'trainval_idx.npy',  trainval_idx)
-
-    print(f"  Test set: {len(test_images)} samples (constant across all folds)")
-    print(f"  TrainVal: {len(trainval_idx)} samples (split {CV_FOLDS} ways)")
-    print(f"  Augmentation: {args.augmentation}")
-
-    _, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False)
-
-    kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=DATA_SEED) #unsure of data_seed vs seed here
-    fold_results = []
-
-    for fold_idx, (rel_train, rel_val) in enumerate(kf.split(trainval_idx)):
-        actual_train_idx = trainval_idx[rel_train]
-        actual_val_idx   = trainval_idx[rel_val]
-
-        fold_train_images = images[actual_train_idx]
-        fold_train_labels = labels[actual_train_idx]
-        fold_val_images   = images[actual_val_idx]
-        fold_val_labels   = labels[actual_val_idx]
-
-        _, fold_train_loader         = _make_dataset_loader(fold_train_images, fold_train_labels, shuffle=True,  drop_last=True)
-        _, fold_train_extract_loader = _make_dataset_loader(fold_train_images, fold_train_labels, shuffle=False)
-        _, fold_val_loader           = _make_dataset_loader(fold_val_images,   fold_val_labels,   shuffle=False, drop_last=USE_COMPILE)
-
-        print(f"\n{'='*70}")
-        print(f"FOLD {fold_idx+1}/{CV_FOLDS}  |  train={len(fold_train_images)}, val={len(fold_val_images)}")
-        print(f"{'='*70}")
-        print(f"Train: {len(fold_train_loader)} batches × {BATCH_SIZE}")
-        print(f"Val:   {len(fold_val_loader)} batches × {BATCH_SIZE}\n")
-
-        set_seed(SEED + fold_idx)
-        fold_model, fold_history, fold_best_val, fold_best_epoch = train_fold(
-            fold_train_loader, fold_val_loader, extract_loader=fold_train_extract_loader
-        )
-
-        print(f"\nEvaluating fold {fold_idx+1} on test set...")
-        fold_test_loss = evaluate_test(fold_model, test_loader)
-        print(f"  Fold {fold_idx+1} test loss: {fold_test_loss:.4f}")
-
-        fold_results.append({
-            'model':                fold_model,
-            'history':              fold_history,
-            'best_val_loss':        fold_best_val,
-            'test_loss':            fold_test_loss,
-            'best_epoch':           fold_best_epoch,
-            'train_idx':            actual_train_idx,
-            'val_idx':              actual_val_idx,
-            'train_extract_loader': fold_train_extract_loader,
-            'val_loader':           fold_val_loader,
-            'train_labels':         fold_train_labels,
-            'val_labels':           fold_val_labels,
-            'train_images':         fold_train_images,
-        })
-
-    print(f"\n{'='*70}")
-    print("CROSS-VALIDATION SUMMARY")
-    print(f"{'='*70}")
-    print(f"{'Fold':>6} | {'Best Mon Loss':>13} | {'Test Loss':>9}")
-    print("-" * 37)
-    for i, r in enumerate(fold_results):
-        print(f"{i+1:>6} | {r['best_val_loss']:>13.4f} | {r['test_loss']:>9.4f}")
-    _cv_val_losses  = [r['best_val_loss'] for r in fold_results]
-    _cv_test_losses = [r['test_loss']     for r in fold_results]
-    print("-" * 37)
-    print(f"{'Mean':>6} | {np.mean(_cv_val_losses):>13.4f} | {np.mean(_cv_test_losses):>9.4f}")
-    print(f"{'Std':>6} | {np.std(_cv_val_losses):>13.4f} | {np.std(_cv_test_losses):>9.4f}")
-    print(f"{'='*70}\n")
-
-    _fold_results_meta = [
-        {
-            'fold_idx':      i,
-            'best_val_loss': r['best_val_loss'],
-            'test_loss':     r['test_loss'],
-            'best_epoch':    r['best_epoch'],
-            'train_idx':     r['train_idx'],
-            'val_idx':       r['val_idx'],
-        }
-        for i, r in enumerate(fold_results)
-    ]
-    np.save(DATA_DIR / 'fold_results.npy', _fold_results_meta, allow_pickle=True)
-    print(f"✓ Fold metadata saved to {DATA_DIR / 'fold_results.npy'}")
 
 # =============================================================================
-# DOWNSTREAM: per-model loop (single model for CV_FOLDS==1, N models for CV_FOLDS>1)
+# DOWNSTREAM: save, plot, extract embeddings
 # =============================================================================
-
-if not args.catalogue:
-    if CV_FOLDS == 1:
-        _items = [{'fold_idx': None, 'model': model, 'history': history,
-                   'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
-                   'avg_test_loss': avg_test_loss,
-                   'train_extract_loader': train_extract_loader,
-                   'val_loader': val_loader, 'train_labels': train_labels,
-                   'val_labels': val_labels, 'train_idx': train_idx,
-                   'train_images': train_images}]
-    else:
-        _items = [{'fold_idx': i, 'model': r['model'], 'history': r['history'],
-                   'best_val_loss': r['best_val_loss'], 'best_epoch': r['best_epoch'],
-                   'avg_test_loss': r['test_loss'],
-                   'train_extract_loader': r['train_extract_loader'],
-                   'val_loader': r['val_loader'], 'train_labels': r['train_labels'],
-                   'val_labels': r['val_labels'], 'train_idx': r['train_idx'],
-                   'train_images': r['train_images']}
-                  for i, r in enumerate(fold_results)]
 
 for _item in _items:
     _fi      = _item['fold_idx']
     _suffix  = "" if _fi is None else f"_fold{_fi + 1}"
-    _label   = "" if _fi is None else f" [Fold {_fi + 1}/{CV_FOLDS}]"
+    _label   = ""
     model                = _item['model']
     history              = _item['history']
     best_val_loss        = _item['best_val_loss']
@@ -1099,9 +851,7 @@ for _item in _items:
             'prob_schedule': PROB_SCHEDULE,
             'supervision_weight': SUPERVISION_WEIGHT,
             'supervision_weight_schedule': SUPERVISION_WEIGHT_SCHEDULE,
-            'dataset': DATASET_NAME,
-            'label_type': args.label_type,
-            'catalogue_path': str(args.catalogue) if args.catalogue else None,
+            'catalogue': str(args.catalogue),
         }
     }, _chk_path)
 
@@ -1154,82 +904,142 @@ for _item in _items:
 
     print(f"\n✓ Projections saved to {DATA_DIR}/")
 
-    # Generate UMAP plots (default behavior unless disabled; skipped in catalogue mode)
-    if not args.no_plot_umap and labels_full is not None:
+    # =========================================================================
+    # UMAP VISUALISATION
+    # =========================================================================
+    # The catalogue carries the label alias (e.g. 'initial', 'morphology',
+    # 'full'). We build a LABEL_RANGES dict so that only the panel matching
+    # the catalogue's label type has a non-zero column range; the other three
+    # panels get (0, 0) and are hidden automatically by plot_umap_pure_classes.
+    # For 'pure' aliases the catalogue returns 1-D integer class indices, so
+    # we convert them to one-hot before calling the plotting function.
+    if not args.no_plot_umap:
+        import types as _types
+
         print(f"\nGenerating UMAP visualizations{_label}...")
 
-        # Define class names for each label type
-        CLASS_NAMES = {
-            'initial': ['FRI', 'FRII', 'Hybrids', 'Spirals', 'Relaxed doubles'],
-            'morphology': ['C-curvature', 'S-curvature', 'Misalignment', 'Wings', 'X-shaped',
-                          'Straight jets', 'Multiple hotspots', 'Continuous jets', 'Banding',
-                          'One-sided', 'Restarted'],
-            'environment': ['Cluster', 'Merger', 'Diffuse emission', 'Unknown'],
-            'derived': ['Compact+hybrids', 'Hybrid FRI/FRII', 'Curved FRIs',
-                       'Curved FRIIs', 'Straight+multi hotspots']
-        }
+        _cat_label_type = mat._entries[0].labels
 
-        train_labels_full = labels_full[train_idx]
-        test_labels_full = labels_full[test_idx]
+        # Map each catalogue label alias to per-panel column ranges
+        # Column ranges within the catalogue's label array per UMAP panel.
+        # initial: cols 0-4 (5), morphology: cols 5-15 (11), environment: cols 16-19 (4).
+        # Derived labels are computed from combinations of other labels and are not
+        # stored as columns, so the derived panel is always hidden (0, 0).
+        # For partial-label catalogues only the matching panel is non-zero; the rest
+        # return shape (N, 0) which plot_umap_pure_classes hides automatically.
+        _UMAP_RANGES_MAP = {
+            'full':             {'initial': (0, 5),  'morphology': (5, 16), 'environment': (16, 20), 'derived': (0, 0)},
+            'native':           {'initial': (0, 5),  'morphology': (5, 16), 'environment': (16, 20), 'derived': (0, 0)},
+            'initial':          {'initial': (0, 5),  'morphology': (0, 0),  'environment': (0, 0),   'derived': (0, 0)},
+            'initial_pure':     {'initial': (0, 5),  'morphology': (0, 0),  'environment': (0, 0),   'derived': (0, 0)},
+            'classical':        {'initial': (0, 2),  'morphology': (0, 0),  'environment': (0, 0),   'derived': (0, 0)},
+            'classical_pure':   {'initial': (0, 2),  'morphology': (0, 0),  'environment': (0, 0),   'derived': (0, 0)},
+            'morphology':       {'initial': (0, 0),  'morphology': (0, 11), 'environment': (0, 0),   'derived': (0, 0)},
+            'morphology_pure':  {'initial': (0, 0),  'morphology': (0, 11), 'environment': (0, 0),   'derived': (0, 0)},
+            'environment':      {'initial': (0, 0),  'morphology': (0, 0),  'environment': (0, 4),   'derived': (0, 0)},
+            'environment_pure': {'initial': (0, 0),  'morphology': (0, 0),  'environment': (0, 4),   'derived': (0, 0)},
+        }
+        _empty = {'initial': (0, 0), 'morphology': (0, 0), 'environment': (0, 0), 'derived': (0, 0)}
+        umap_label_ranges = _UMAP_RANGES_MAP.get(_cat_label_type, _empty)
+
+        # Convert 1-D integer labels (pure aliases) to one-hot (N, n_classes)
+        def _to_onehot(lbl, n_cls):
+            if lbl.ndim == 1:
+                oh = np.zeros((len(lbl), n_cls), dtype=np.int64)
+                oh[np.arange(len(lbl)), lbl] = 1
+                return oh
+            return lbl
+
+        _n_cls = len(mat.label_names)
+
+        # In multi-dataset catalogues, non-primary datasets have scalar class
+        # indices stored in column 0 (e.g. [2, 0, ..., 0]) rather than proper
+        # multi-hot binary labels.  The plotting code misreads value 2.0 as
+        # "2 active labels" and crashes.  Zero out non-primary-dataset rows so
+        # they appear as unlabelled in the UMAP instead.
+        _primary_ds = mat._entries[0].dataset
+        _tr_labels_umap = train_labels[:len(train_projections)].copy()
+        if len(mat._labelled) > 1:
+            _non_primary_train = labelled_df['dataset'].values[:len(train_projections)] != _primary_ds
+            _tr_labels_umap[_non_primary_train] = 0
+            # Build the same mask for test: views are ordered by mat._labelled insertion order
+            _test_ds_tags = []
+            for v in splits['test']:
+                _test_ds_tags.extend([v.dataset] * len(v.images))
+            _test_ds_tags = np.array(_test_ds_tags)
+            _te_labels_umap = test_labels[:len(test_projections)].copy()
+            _te_labels_umap[_test_ds_tags[:len(test_projections)] != _primary_ds] = 0
+        else:
+            _te_labels_umap = test_labels[:len(test_projections)]
+
+        _tr_lbl = _to_onehot(_tr_labels_umap, _n_cls)
+        _te_lbl = _to_onehot(_te_labels_umap, _n_cls)
+
+        # CLASS_NAMES keyed by panel name.  Each panel's list must have exactly
+        # as many entries as the columns it receives from LABEL_RANGES (otherwise
+        # the enumerate loop in _plot_umap_ax goes out of bounds).
+        # For 'full'/'native', each panel gets its own subset of label names.
+        # For single-alias catalogues only one panel is active and mat.label_names
+        # has exactly the right length for that panel.
+        if _cat_label_type in ('full', 'native', 'none'):
+            CLASS_NAMES = {
+                'initial':     LOTSS_LABEL_NAMES['initial'],
+                'morphology':  LOTSS_LABEL_NAMES['morphology'],
+                'environment': LOTSS_LABEL_NAMES['environment'],
+                'derived':     [],
+            }
+        else:
+            CLASS_NAMES = {k: mat.label_names for k in ('initial', 'morphology', 'environment', 'derived')}
+
+        # plot_umap_pure_classes checks args.label_type; pass 'full' so it
+        # reads labels directly from the array rather than looking up a fallback
+        _umap_args = _types.SimpleNamespace(
+            label_type='full',
+            umap_n_neighbors=args.umap_n_neighbors,
+            umap_min_dist=args.umap_min_dist,
+        )
+
+        _emb_dim = train_projections.shape[1]
+
+        _simple_ml = args.simple_multilabel
 
         # Train UMAP: fit and save
         train_reducer, train_2d = plot_umap_pure_classes(
-            train_projections,
-            train_labels[:len(train_projections)],
-            "Train (256-dim)",
-            f"umap_train{_suffix}",
-            "train",
-            args=args,
-            SEED=SEED,
-            LABEL_RANGES=LABEL_RANGES,
-            CLASS_NAMES=CLASS_NAMES,
-            OUTPUT_DIR=FIGURES_DIR,
-            train_labels_full=train_labels_full,
-            test_labels_full=test_labels_full,
+            train_projections, _tr_lbl,
+            f"Train ({_emb_dim}-dim)", f"umap_train{_suffix}", "train",
+            args=_umap_args, SEED=SEED,
+            LABEL_RANGES=umap_label_ranges, CLASS_NAMES=CLASS_NAMES,
+            OUTPUT_DIR=FIGURES_DIR, simple_multilabel=_simple_ml,
         )
         np.save(DATA_DIR / f'umap_train_coords{_suffix}.npy', train_2d)
 
         # Test UMAP: independent fit
         _, _test_2d = plot_umap_pure_classes(
-            test_projections,
-            test_labels[:len(test_projections)],
-            "Test (256-dim)",
-            f"umap_test{_suffix}",
-            "test",
-            args=args,
-            SEED=SEED,
-            LABEL_RANGES=LABEL_RANGES,
-            CLASS_NAMES=CLASS_NAMES,
-            OUTPUT_DIR=FIGURES_DIR,
-            train_labels_full=train_labels_full,
-            test_labels_full=test_labels_full,
+            test_projections, _te_lbl,
+            f"Test ({_emb_dim}-dim)", f"umap_test{_suffix}", "test",
+            args=_umap_args, SEED=SEED,
+            LABEL_RANGES=umap_label_ranges, CLASS_NAMES=CLASS_NAMES,
+            OUTPUT_DIR=FIGURES_DIR, simple_multilabel=_simple_ml,
         )
         np.save(DATA_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
 
-        # Test UMAP: transformed into train space (fair comparison)
+        # Test UMAP: transformed into train UMAP space
         _, _test_transformed_2d = plot_umap_pure_classes(
-            test_projections,
-            test_labels[:len(test_projections)],
-            "Test in Train UMAP Space (256-dim)",
-            f"umap_test_transformed{_suffix}",
-            "test",
-            args=args,
-            SEED=SEED,
-            LABEL_RANGES=LABEL_RANGES,
-            CLASS_NAMES=CLASS_NAMES,
-            OUTPUT_DIR=FIGURES_DIR,
-            train_labels_full=train_labels_full,
-            test_labels_full=test_labels_full,
-            reducer=train_reducer,
+            test_projections, _te_lbl,
+            f"Test in Train UMAP Space ({_emb_dim}-dim)",
+            f"umap_test_transformed{_suffix}", "test",
+            args=_umap_args, SEED=SEED,
+            LABEL_RANGES=umap_label_ranges, CLASS_NAMES=CLASS_NAMES,
+            OUTPUT_DIR=FIGURES_DIR, reducer=train_reducer,
+            simple_multilabel=_simple_ml,
         )
         np.save(DATA_DIR / f'umap_test_transformed_coords{_suffix}.npy', _test_transformed_2d)
 
         # Outlier plot: 4 most extreme points in train UMAP space
         plot_umap_outliers(
-            train_2d,
-            train_images[:len(train_2d)],
+            train_2d, train_images[:len(train_2d)],
             OUTPUT_DIR=FIGURES_DIR,
-            labels=train_labels[:len(train_2d)],
+            labels=_tr_lbl,
             save_prefix=f"umap_outliers{_suffix}",
         )
 

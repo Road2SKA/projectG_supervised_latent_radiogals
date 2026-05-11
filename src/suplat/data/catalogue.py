@@ -47,11 +47,13 @@ LOTSS_ALIAS = {
     "none":           slice(0, 20),
     "initial":        slice(0, 5),
     "classical":      slice(0, 2),
-    "classical_pure": "classical_pure",   # special: filter rows
-    "initial_pure":   "initial_pure",     # special: filter rows
-    "morphology":     slice(5, 15),
-    "environment":    slice(15, 19),
-    "derived":        slice(19, 24),
+    "classical_pure":    "classical_pure",    # special: filter rows
+    "initial_pure":      "initial_pure",      # special: filter rows
+    "morphology":        slice(5, 16),
+    "morphology_pure":   "morphology_pure",   # special: filter rows
+    "environment":       slice(16, 20),
+    "environment_pure":  "environment_pure",  # special: filter rows
+    "derived":           "derived",           # special: computed from label combinations
 }
 
 LOTSS_LABEL_NAMES = {
@@ -60,11 +62,15 @@ LOTSS_LABEL_NAMES = {
     "none":        [f"col_{i}" for i in range(20)],
     "initial":     ["FRI", "FRII", "Hybrid", "Spiral", "RelaxedDouble"],
     "classical":   ["FRI", "FRII"],
-    "classical_pure": ["FRI", "FRII"],
-    "initial_pure":   ["FRI", "FRII", "Hybrid", "Spiral", "RelaxedDouble"],
-    "morphology":  [f"morph_{i}" for i in range(10)],
-    "environment": ["Cluster", "Merger", "Diffuse", "Unknown"],
-    "derived":     [f"derived_{i}" for i in range(5)],
+    "classical_pure":   ["FRI", "FRII"],
+    "initial_pure":     ["FRI", "FRII", "Hybrid", "Spiral", "RelaxedDouble"],
+    "morphology":       ['C-curv', 'S-curv', 'Misalign', 'Wings', 'X-shaped',
+                         'StraightJets', 'MultiHS', 'ContJets', 'Banding', 'OneSided', 'Restarted'],
+    "morphology_pure":  ['C-curv', 'S-curv', 'Misalign', 'Wings', 'X-shaped',
+                         'StraightJets', 'MultiHS', 'ContJets', 'Banding', 'OneSided', 'Restarted'],
+    "environment":      ["Cluster", "Merger", "Diffuse", "Unknown"],
+    "environment_pure": ["Cluster", "Merger", "Diffuse", "Unknown"],
+    "derived":          [f"derived_{i}" for i in range(5)],
 }
 
 # Datasets that are always unlabelled — never contribute supervised signal
@@ -235,6 +241,27 @@ def _apply_label_type_lotss(
         labels_out = initial[mask].argmax(axis=1).astype(np.int64)
         return images[mask], labels_out
 
+    if label_type == "morphology_pure":
+        # Keep rows where exactly one of the 11 morphology cols (5-15) is set
+        morph = raw_labels[:, 5:16]
+        mask  = (morph.sum(axis=1) == 1)
+        labels_out = morph[mask].argmax(axis=1).astype(np.int64)
+        return images[mask], labels_out
+
+    if label_type == "environment_pure":
+        # Keep rows where exactly one of the 4 environment cols (16-19) is set
+        env  = raw_labels[:, 16:20]
+        mask = (env.sum(axis=1) == 1)
+        labels_out = env[mask].argmax(axis=1).astype(np.int64)
+        return images[mask], labels_out
+
+    if label_type == "derived":
+        raise NotImplementedError(
+            "The 'derived' label type is computed from combinations of other labels "
+            "and is not stored as columns in the raw array. "
+            "Use 'full' labels and compute derived labels in your training code."
+        )
+
     # Slice alias — no row filtering
     return images, raw_labels[:, alias]
 
@@ -274,13 +301,13 @@ def _load_lotss(root: str, label_type: str) -> Tuple[np.ndarray, np.ndarray]:
     Load LoTSS images and labels from monolithic .npy files.
 
     Expected files:
-        <root>/data/processed/lotss/images_filtered.npy   (N, 89, 89)
-        <root>/data/processed/lotss/labels_filtered.npy   (N, 20)
+        <root>/data/preprocessed/lotss/images_filtered.npy   (N, 89, 89)
+        <root>/data/preprocessed/lotss/labels_filtered.npy   (N, 20)
 
     Returns images, labels (filtered/sliced by label_type).
     """
-    img_path = os.path.join(root, "data", "processed", "lotss", "images_filtered.npy")
-    lbl_path = os.path.join(root, "data", "processed", "lotss", "labels_filtered.npy")
+    img_path = os.path.join(root, "data", "preprocessed", "lotss", "images_filtered.npy")
+    lbl_path = os.path.join(root, "data", "preprocessed", "lotss", "labels_filtered.npy")
 
     images     = np.load(img_path, mmap_mode="r")
     raw_labels = np.load(lbl_path, mmap_mode="r")

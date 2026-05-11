@@ -1,7 +1,16 @@
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.path as mpath
 import umap
+
+
+def _sector_marker(theta1_deg: float, theta2_deg: float, n: int = 30) -> mpath.Path:
+    """Return a unit pie-sector Path from theta1 to theta2 (degrees)."""
+    angles = np.linspace(np.radians(theta1_deg), np.radians(theta2_deg), n)
+    verts = [(0.0, 0.0)] + list(zip(np.cos(angles), np.sin(angles))) + [(0.0, 0.0)]
+    codes = [mpath.Path.MOVETO] + [mpath.Path.LINETO] * n + [mpath.Path.CLOSEPOLY]
+    return mpath.Path(verts, codes)
 
 
 # Fixed colour palette — consistent across runs and class types
@@ -53,43 +62,134 @@ def _plot_umap_ax(
     colors: np.ndarray,
     class_names: list,
     class_type: str,
+    type_labels: np.ndarray | None = None,
+    simple_multilabel: bool = False,
 ) -> None:
+    """
+    simple_multilabel : if True, multi-label sources are drawn as open white
+                        circles instead of pie-sector wedges.
+    """
+
+
     n_pure = np.sum(colors >= 0)
     n_nonpure = np.sum(colors == -1)
 
-    # Non-pure samples (background)
-    mask_nonpure = colors == -1
-    if np.any(mask_nonpure):
-        ax.scatter(
-            embedding_2d[mask_nonpure, 0], embedding_2d[mask_nonpure, 1],
-            c='lightgrey', s=8, alpha=0.3,
-        )
+    if type_labels is not None:
+        n_classes = type_labels.shape[1]
+        active_counts = type_labels.sum(axis=1)  # (N,)
 
-    # Pure class samples with fixed colours + in-figure centroid labels
-    for class_idx, class_name in enumerate(class_names):
-        mask_class = colors == class_idx
-        n_class = np.sum(mask_class)
-        if n_class > 0:
-            color = FIXED_COLORS[class_idx]
+        # Sources with no active label → light grey, same size as labelled points
+        mask_unlabelled = active_counts == 0
+        if np.any(mask_unlabelled):
             ax.scatter(
-                embedding_2d[mask_class, 0], embedding_2d[mask_class, 1],
-                c=[color], s=12, alpha=0.7,
-            )
-            cx = embedding_2d[mask_class, 0].mean()
-            cy = embedding_2d[mask_class, 1].mean()
-            ax.annotate(
-                f'{class_name} ({n_class})', (cx, cy),
-                fontsize=10.5, fontweight='bold',
-                ha='center', va='center',
-                color='black',
-                bbox=dict(boxstyle='round,pad=0.35', facecolor=color,
-                          alpha=0.6, edgecolor='none'),
+                embedding_2d[mask_unlabelled, 0], embedding_2d[mask_unlabelled, 1],
+                c='lightgrey', s=15, alpha=0.2, zorder=1,
             )
 
-    ax.set_xlabel('UMAP 1')
-    ax.set_ylabel('UMAP 2')
-    ax.set_title(f'{class_type.capitalize()} | {n_pure} pure, {n_nonpure} non-pure')
+        # Single-label (pure) sources: regular scatter per class
+        for class_idx in range(n_classes):
+            mask = (type_labels[:, class_idx] == 1) & (active_counts == 1)
+            if np.any(mask):
+                ax.scatter(
+                    embedding_2d[mask, 0], embedding_2d[mask, 1],
+                    c=[FIXED_COLORS[class_idx]], s=15, alpha=0.85, zorder=3,
+                )
+
+        # Multi-label sources
+        multi_mask = active_counts > 1
+        if simple_multilabel:
+            # Draw as open white circles — fast and uncluttered
+            if np.any(multi_mask):
+                ax.scatter(
+                    embedding_2d[multi_mask, 0], embedding_2d[multi_mask, 1],
+                    facecolors='white', edgecolors='grey', linewidths=0.5,
+                    s=15, alpha=0.7, zorder=3,
+                )
+        else:
+            # Pie-sector wedges coloured by each active label
+            multi_idx = np.where(multi_mask)[0]
+            for i in multi_idx:
+                x, y = embedding_2d[i]
+                active = [ci for ci in range(n_classes) if type_labels[i, ci] == 1]
+                n_active = len(active)
+                angle_per = 360.0 / n_active
+                for j, ci in enumerate(active):
+                    theta1 = j * angle_per - 90
+                    theta2 = (j + 1) * angle_per - 90
+                    ax.scatter(x, y,
+                               marker=_sector_marker(theta1, theta2),
+                               c=[FIXED_COLORS[ci]], s=15, alpha=0.85, zorder=3)
+
+        # Centroid labels: all sources with that label active, total count
+        for class_idx, class_name in enumerate(class_names):
+            active_mask = type_labels[:, class_idx] == 1
+            n_total = np.sum(active_mask)
+            if n_total > 0:
+                color = FIXED_COLORS[class_idx]
+                cx = embedding_2d[active_mask, 0].mean()
+                cy = embedding_2d[active_mask, 1].mean()
+                ax.annotate(
+                    f'{class_name} ({n_total})', (cx, cy),
+                    fontsize=13, fontweight='bold',
+                    ha='center', va='center',
+                    color='black',
+                    bbox=dict(boxstyle='round,pad=0.35', facecolor=color,
+                              alpha=0.6, edgecolor='none'),
+                )
+
+    else:
+        # Fallback: original pure-only behaviour
+        mask_nonpure = colors == -1
+        if np.any(mask_nonpure):
+            ax.scatter(
+                embedding_2d[mask_nonpure, 0], embedding_2d[mask_nonpure, 1],
+                c='lightgrey', s=8, alpha=0.3,
+            )
+
+        for class_idx, class_name in enumerate(class_names):
+            mask_class = colors == class_idx
+            n_class = np.sum(mask_class)
+            if n_class > 0:
+                color = FIXED_COLORS[class_idx]
+                ax.scatter(
+                    embedding_2d[mask_class, 0], embedding_2d[mask_class, 1],
+                    c=[color], s=12, alpha=0.7,
+                )
+                cx = embedding_2d[mask_class, 0].mean()
+                cy = embedding_2d[mask_class, 1].mean()
+                ax.annotate(
+                    f'{class_name} ({n_class})', (cx, cy),
+                    fontsize=13, fontweight='bold',
+                    ha='center', va='center',
+                    color='black',
+                    bbox=dict(boxstyle='round,pad=0.35', facecolor=color,
+                              alpha=0.6, edgecolor='none'),
+                )
+
+    ax.set_xlabel('UMAP 1', fontsize=13)
+    ax.set_ylabel('UMAP 2', fontsize=13)
+    ax.tick_params(labelsize=11)
     ax.grid(True, alpha=0.3)
+
+    # Place title in the emptiest corner
+    xmin, xmax = embedding_2d[:, 0].min(), embedding_2d[:, 0].max()
+    ymin, ymax = embedding_2d[:, 1].min(), embedding_2d[:, 1].max()
+    xmid = (xmin + xmax) / 2
+    ymid = (ymin + ymax) / 2
+    corner_counts = {
+        'BL': np.sum((embedding_2d[:, 0] < xmid) & (embedding_2d[:, 1] < ymid)),
+        'BR': np.sum((embedding_2d[:, 0] >= xmid) & (embedding_2d[:, 1] < ymid)),
+        'TL': np.sum((embedding_2d[:, 0] < xmid) & (embedding_2d[:, 1] >= ymid)),
+        'TR': np.sum((embedding_2d[:, 0] >= xmid) & (embedding_2d[:, 1] >= ymid)),
+    }
+    emptiest = min(corner_counts, key=corner_counts.get)
+    tx = xmin + 0.02 * (xmax - xmin) if emptiest in ('BL', 'TL') else xmax - 0.02 * (xmax - xmin)
+    ty = ymin + 0.03 * (ymax - ymin) if emptiest in ('BL', 'BR') else ymax - 0.03 * (ymax - ymin)
+    ha = 'left' if emptiest in ('BL', 'TL') else 'right'
+    va = 'bottom' if emptiest in ('BL', 'BR') else 'top'
+    ax.text(tx, ty, f'{class_type.capitalize()} | {n_pure} pure, {n_nonpure} non-pure',
+            fontsize=13, fontweight='bold', ha=ha, va=va,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none'))
 
 
 # =============================================================================
@@ -110,6 +210,7 @@ def plot_umap_pure_classes(
     train_labels_full: np.ndarray | None = None,
     test_labels_full: np.ndarray | None = None,
     reducer=None,
+    simple_multilabel: bool = False,
 ) -> tuple:
     """
     Generate a 2×2 UMAP grid for all classification types with pure class colouring.
@@ -149,7 +250,7 @@ def plot_umap_pure_classes(
 
     # 2×2 grid
     fig, axes = plt.subplots(2, 2, figsize=(20, 16))
-    fig.suptitle(f'UMAP - {title_suffix}', fontsize=16)
+    fig.suptitle(f'UMAP - {title_suffix}', fontsize=20)
 
     for idx, class_type in enumerate(['initial', 'morphology', 'environment', 'derived']):
         ax = axes[idx // 2, idx % 2]
@@ -173,8 +274,13 @@ def plot_umap_pure_classes(
                 continue
             type_labels = full_labels[:, label_start:label_end]
 
+        if type_labels.shape[1] == 0:
+            ax.set_visible(False)
+            continue
+
         colors, class_names = get_pure_class_colors(type_labels, class_type, CLASS_NAMES)
-        _plot_umap_ax(ax, embedding_2d, colors, class_names, class_type)
+        _plot_umap_ax(ax, embedding_2d, colors, class_names, class_type,
+                      type_labels=type_labels, simple_multilabel=simple_multilabel)
 
     plt.tight_layout()
     save_path = OUTPUT_DIR / f'{save_prefix}.png'

@@ -1,0 +1,9 @@
+# Smoke-test catalogue: exercises multi-dataset labelled setup,
+# the corrected 11-column morphology range, partial label exposure,
+# and CSV-based dataset loading (mirabest) in one run.
+name: smoke_test_mixed
+datasets:   [lotss,      mirabest]
+labels:     [morphology, native]
+f_labels:   [0.6,        1.0]
+dataset_seed: 123
+cval: false

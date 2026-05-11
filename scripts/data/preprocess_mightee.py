@@ -314,9 +314,9 @@ if __name__ == "__main__":
                         help="Dir containing MIGHTEE .fits files "
                              "(default: data/raw/mightee)")
     parser.add_argument("--output_dir",
-                        default="data/processed/mightee",
+                        default="data/preprocessed/mightee",
                         help="Output dir for unlabelled crops "
-                             "(default: data/processed/mightee)")
+                             "(default: data/preprocessed/mightee)")
     parser.add_argument("--meta_csv",
                         default="data/metadata/mightee_crops.csv",
                         help="Metadata CSV for unlabelled crops "
@@ -328,9 +328,9 @@ if __name__ == "__main__":
                              "(Scaife 2023). If omitted, mightee_fr "
                              "is skipped.")
     parser.add_argument("--fr_output_dir",
-                        default="data/processed/mightee_fr",
+                        default="data/preprocessed/mightee_fr",
                         help="Output dir for labelled FR crops "
-                             "(default: data/processed/mightee_fr)")
+                             "(default: data/preprocessed/mightee_fr)")
     parser.add_argument("--fr_labels_out",
                         default="data/metadata/mightee_fr_labels.csv",
                         help="Labels CSV for FR crops "
