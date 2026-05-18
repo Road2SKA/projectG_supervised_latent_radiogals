@@ -113,3 +113,15 @@ def extract_embeddings_from_loader(model, dataloader, model_type, device, max_ba
             all_projections.append(projection.cpu().numpy())
 
     return np.vstack(all_projections)
+
+
+def extract_raw_embeddings_from_loader(model, dataloader, device, max_batches=None):
+    """Extract raw encoder representations (before projector) for all samples."""
+    model.eval()
+    all_repr = []
+    with torch.no_grad():
+        for batch_idx, (x1, *_) in enumerate(tqdm(dataloader, desc="Extracting raw")):
+            if max_batches and batch_idx >= max_batches:
+                break
+            all_repr.append(model.online_encoder(x1.to(device)).cpu().numpy())
+    return np.vstack(all_repr)

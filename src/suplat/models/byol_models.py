@@ -148,7 +148,7 @@ def create_convnext_tiny_backbone(num_channels=1, dropout_rate=0.2):
         if orig.bias is not None:
             new_conv.bias.copy_(orig.bias)
     model.features[0][0] = new_conv
-    model.classifier = nn.Sequential(nn.Flatten(1), nn.Dropout(p=dropout_rate))
+    model.classifier = nn.Dropout(p=dropout_rate)
     return model, 768
 
 # Shared encoder architecture
@@ -249,10 +249,7 @@ class PCAProjection(nn.Module):
     def __init__(self, variance_threshold=0.95):
         super().__init__()
         self.variance_threshold = variance_threshold
-        # Pre-register as None so load_state_dict can populate them from a checkpoint
-        self.register_buffer('mean_', None)
-        self.register_buffer('active_mask_', None)
-        self.register_buffer('components_', None)
+        self._fitted = False
 
     def fit(self, X: torch.Tensor):
         """
@@ -273,35 +270,18 @@ class PCAProjection(nn.Module):
         cumvar = (S ** 2).cumsum(0) / (S ** 2).sum()
         n_components = int((cumvar < self.variance_threshold).sum().item()) + 1
         self.register_buffer('components_', Vh[:n_components])  # (n_components, n_active)
+        self._fitted = True
 
     @property
     def out_dim(self) -> int:
-        if self.components_ is None:
+        if not self._fitted:
             raise RuntimeError("PCAProjection has not been fitted yet")
         return self.components_.shape[0]
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
-        # PyTorch cannot copy_() into None-registered buffers, so assign them
-        # directly before the normal load path runs.
-        for name in ('mean_', 'active_mask_', 'components_'):
-            key = prefix + name
-            if key in state_dict and state_dict[key] is not None:
-                self._buffers[name] = state_dict[key]
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs,
-        )
-
     def forward(self, x):
-        if self.components_ is None:
+        if not self._fitted:
             raise RuntimeError("PCAProjection must be fitted before use; call fit_pca() first")
-        # Flatten x to (B, D) and ensure mean_/active_mask_ are 1-D regardless
-        # of how they were serialised in older checkpoints (e.g. (D,1) shapes).
-        x = x.float().reshape(x.shape[0], -1)
-        mean = self.mean_.flatten()
-        mask = self.active_mask_.flatten()
-        return (x - mean)[:, mask] @ self.components_.T
+        return (x.float() - self.mean_)[:, self.active_mask_] @ self.components_.T
 
 
 class BYOLEfficientNetB0(nn.Module):
