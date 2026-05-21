@@ -39,8 +39,28 @@ def get_pure_class_colors(
         if np.sum(label_vec == 1) == 1:
             colors[i] = np.where(label_vec == 1)[0][0]
 
-    class_names = CLASS_NAMES.get(label_type, [f"Class {i}" for i in range(n_classes)])
+    class_names = CLASS_NAMES.get(label_type, [f"Class {i}" for i in range(n_classes)])[:n_classes]
     return colors, class_names
+
+
+# =============================================================================
+# HELPER: PIE-DOT FOR NON-PURE SAMPLES
+# =============================================================================
+
+def _draw_pie_dot(ax, x, y, active_colors, radius, zorder=3):
+    """Equal-wedge pie of active_colors; faded grey if no active classes."""
+    from matplotlib.patches import Circle, Wedge
+    n = len(active_colors)
+    if n == 0:
+        ax.add_patch(Circle((x, y), radius, facecolor='grey',
+                             edgecolor='none', alpha=0.4, zorder=zorder))
+        return
+    step = 360.0 / n
+    for k, color in enumerate(active_colors):
+        ax.add_patch(Wedge((x, y), radius,
+                           k * step, (k + 1) * step,
+                           facecolor=color, edgecolor='none',
+                           alpha=0.7, zorder=zorder))
 
 
 # =============================================================================
@@ -53,30 +73,54 @@ def _plot_umap_ax(
     colors: np.ndarray,
     class_names: list,
     class_type: str,
+    type_labels: np.ndarray | None = None,
+    title: str | None = None,
 ) -> None:
-    n_pure = np.sum(colors >= 0)
-    n_nonpure = np.sum(colors == -1)
+    from matplotlib.lines import Line2D
 
-    # Non-pure samples (background)
+    # Non-pure samples: grey scatter
     mask_nonpure = colors == -1
-    if np.any(mask_nonpure):
-        ax.scatter(
-            embedding_2d[mask_nonpure, 0], embedding_2d[mask_nonpure, 1],
-            c='lightgrey', s=8, alpha=0.3,
-        )
+    ax.scatter(embedding_2d[mask_nonpure, 0], embedding_2d[mask_nonpure, 1],
+               c='grey', s=10, alpha=0.4, zorder=1)
 
-    # Pure class samples with fixed colours + in-figure centroid labels
+    # Pure class samples: per-class scatter
+    for class_idx in range(len(class_names)):
+        mask = colors == class_idx
+        if not np.any(mask):
+            continue
+        ax.scatter(embedding_2d[mask, 0], embedding_2d[mask, 1],
+                   c=[FIXED_COLORS[class_idx]], s=10, alpha=0.7, zorder=2)
+
+    # Legend: single-class / multi-class / unclassified counts
+    n_pure = int(np.sum(colors >= 0))
+    if type_labels is not None and np.any(mask_nonpure):
+        n_active = type_labels[mask_nonpure].sum(axis=1)
+        n_multi = int(np.sum(n_active > 1))
+        n_unclassified = int(np.sum(n_active == 0))
+    else:
+        n_multi = 0
+        n_unclassified = int(np.sum(mask_nonpure))
+    legend_handles = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='steelblue',
+               markersize=6, alpha=0.7, label=f'Single-class ({n_pure})'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',
+               markersize=6, alpha=0.7, label=f'Multi-class ({n_multi})'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgrey',
+               markersize=6, alpha=0.7, label=f'Unclassified ({n_unclassified})'),
+    ]
+    ax.legend(handles=legend_handles, loc='best', fontsize=12, framealpha=0.7)
+
+    # Centroid labels over ALL samples with that class active (pure + non-pure)
     for class_idx, class_name in enumerate(class_names):
-        mask_class = colors == class_idx
-        n_class = np.sum(mask_class)
+        if type_labels is not None:
+            mask_all = type_labels[:, class_idx] == 1
+        else:
+            mask_all = colors == class_idx
+        n_class = int(np.sum(mask_all))
         if n_class > 0:
             color = FIXED_COLORS[class_idx]
-            ax.scatter(
-                embedding_2d[mask_class, 0], embedding_2d[mask_class, 1],
-                c=[color], s=12, alpha=0.7,
-            )
-            cx = embedding_2d[mask_class, 0].mean()
-            cy = embedding_2d[mask_class, 1].mean()
+            cx = embedding_2d[mask_all, 0].mean()
+            cy = embedding_2d[mask_all, 1].mean()
             ax.annotate(
                 f'{class_name} ({n_class})', (cx, cy),
                 fontsize=10.5, fontweight='bold',
@@ -88,8 +132,14 @@ def _plot_umap_ax(
 
     ax.set_xlabel('UMAP 1')
     ax.set_ylabel('UMAP 2')
-    ax.set_title(f'{class_type.capitalize()} | {n_pure} pure, {n_nonpure} non-pure')
+    ax.set_aspect('equal', adjustable='datalim')
     ax.grid(True, alpha=0.3)
+
+    _title = title if title is not None else class_type.capitalize()
+    ax.text(0.5, 0.97, _title, transform=ax.transAxes,
+            ha='center', va='top', fontsize=11, fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                      alpha=0.7, edgecolor='none'))
 
 
 # =============================================================================
@@ -140,29 +190,42 @@ def plot_umap_single(
         save_path:     full path for the saved PNG
         split_masks:   dict {split_name: bool_array} — used for 'train_labelled' colouring
     """
+    n_total = len(embedding_2d)
+    title_with_n = f'{title} ({n_total})'
+
     fig, ax = plt.subplots(figsize=(10, 8))
 
     if colouring in ('initial', 'morphology'):
         label_start, label_end = LABEL_RANGES[colouring]
         type_labels = labels_full[:, label_start:label_end]
         colors, class_names = get_pure_class_colors(type_labels, colouring, CLASS_NAMES)
-        _plot_umap_ax(ax, embedding_2d, colors, class_names, colouring)
-        ax.set_title(title)
+        _plot_umap_ax(ax, embedding_2d, colors, class_names, colouring,
+                      type_labels=type_labels, title=title_with_n)
 
     elif colouring == 'train_labelled':
         _split_colors = ['#2196F3', '#FF9800', '#9C27B0', '#4CAF50']
+        _color_idx = 0
         if split_masks:
-            for i, (split_name, mask) in enumerate(split_masks.items()):
+            for split_name, mask in split_masks.items():
                 n = int(mask.sum())
+                if 'unlabelled' in split_name.lower():
+                    color = 'grey'
+                    alpha = 0.4
+                else:
+                    color = _split_colors[_color_idx % len(_split_colors)]
+                    alpha = 0.7
+                    _color_idx += 1
                 ax.scatter(
                     embedding_2d[mask, 0], embedding_2d[mask, 1],
-                    c=_split_colors[i % len(_split_colors)],
-                    s=10, alpha=0.7, label=f'{split_name} ({n})',
+                    c=color, s=10, alpha=alpha, label=f'{split_name} ({n})',
                 )
         ax.set_xlabel('UMAP 1')
         ax.set_ylabel('UMAP 2')
-        ax.set_title(title)
-        ax.legend(fontsize=10)
+        ax.text(0.5, 0.97, title_with_n, transform=ax.transAxes,
+                ha='center', va='top', fontsize=11, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                          alpha=0.7, edgecolor='none'))
+        ax.legend(fontsize=13)
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -253,7 +316,8 @@ def plot_umap_pure_classes(
             type_labels = full_labels[:, label_start:label_end]
 
         colors, class_names = get_pure_class_colors(type_labels, class_type, CLASS_NAMES)
-        _plot_umap_ax(ax, embedding_2d, colors, class_names, class_type)
+        _plot_umap_ax(ax, embedding_2d, colors, class_names, class_type,
+                      type_labels=type_labels)
 
     plt.tight_layout()
     save_path = OUTPUT_DIR / f'{save_prefix}.png'
@@ -339,7 +403,7 @@ def plot_umap_overlay(
         ax.set_xlabel('UMAP 1')
         ax.set_ylabel('UMAP 2')
         ax.set_title(f'{class_type.capitalize()} | test in train space')
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=7)
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11)
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -421,14 +485,23 @@ def plot_umap_outliers(
     mosaic = [[f'img{r}{c}' for c in range(n_per_region)] + ['umap']
               for r in range(n_regions)]
 
+    img_col_width = 3.5
+    fig_height = img_col_width * n_regions
+    # subplots_adjust margins — used both here and at the bottom
+    _L, _R, _T, _B = 0.02, 0.99, 0.95, 0.04
+    # umap_ratio derived so the UMAP panel is 1.5× as wide as it is tall after margins
+    umap_ratio = (_T - _B) * n_regions / (_R - _L) * 1.0
+    fig_width = img_col_width * (n_per_region + umap_ratio)
+
     fig, axd = plt.subplot_mosaic(
         mosaic,
-        figsize=(3.5 * (n_per_region + 1.4), 3.5 * n_regions),
-        gridspec_kw={'width_ratios': [1] * n_per_region + [1.5]},
+        figsize=(fig_width, fig_height),
+        gridspec_kw={'width_ratios': [1] * n_per_region + [umap_ratio]},
     )
-    fig.suptitle('UMAP Region Samples', fontsize=14)
+    fig.suptitle('UMAP Region Samples', fontsize=16)
 
     ax_umap = axd['umap']
+    ax_umap.set_aspect('equal', adjustable='box')
     ax_umap.scatter(train_2d[:, 0], train_2d[:, 1],
                     c='lightgrey', s=5, alpha=0.4, zorder=1)
 
@@ -443,7 +516,11 @@ def plot_umap_outliers(
                 class_str = ', '.join(active) if active else '—'
             else:
                 class_str = '—'
-            ax_img.set_title(class_str, fontsize=7)
+            ax_img.text(0.03, 0.97, class_str, transform=ax_img.transAxes,
+                        fontsize=11, va='top', ha='left', color='white',
+                        clip_on=True,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='grey',
+                                  alpha=0.6, edgecolor='none'))
             for spine in ax_img.spines.values():
                 spine.set_edgecolor(color)
                 spine.set_linewidth(3)
@@ -456,13 +533,14 @@ def plot_umap_outliers(
         label = region_labels[r] if r < len(region_labels) else f'Region {r + 1}'
         ax_umap.scatter([], [], c=color, s=90, marker='*', label=label)
 
-    ax_umap.set_xlabel('UMAP 1')
-    ax_umap.set_ylabel('UMAP 2')
-    ax_umap.set_title('UMAP Regions')
-    ax_umap.legend(fontsize=9)
+    ax_umap.set_xlabel('UMAP 1', fontsize=13)
+    ax_umap.set_ylabel('UMAP 2', fontsize=13)
+    ax_umap.set_title('UMAP Regions', fontsize=14)
+    ax_umap.tick_params(labelsize=12)
+    ax_umap.legend(fontsize=12)
     ax_umap.grid(True, alpha=0.3)
 
-    plt.tight_layout()
+    plt.subplots_adjust(left=_L, right=_R, top=_T, bottom=_B, hspace=0.02, wspace=0.0)
     save_path = OUTPUT_DIR / f'{save_prefix}.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"    ✓ Saved outlier plot to {save_path}")
@@ -494,18 +572,22 @@ def plot_training_curves(
         output_dir:    directory where PNGs are saved
         loss_mode:     'both' or 'either' (determines supervision schedule label)
     """
-    FS = 13   # base font size for axis labels / legend
-    FS_T = 14 # subplot title font size
-    FS_S = 18 # suptitle font size
+    from matplotlib.lines import Line2D
+    import matplotlib.gridspec as gridspec
 
-    epochs = range(1, len(history['train_loss']) + 1)
+    FS   = 13
+    FS_T = 14
+    FS_S = 18
 
-    monitor_raw = history.get('monitor_val_loss')
+    n_epochs = len(history['train_loss'])
+    epochs   = range(1, n_epochs + 1)
+
+    monitor_raw   = history.get('monitor_val_loss')
     monitor_valid = (monitor_raw is not None
                      and any(v is not None for v in monitor_raw))
     monitor = monitor_raw if monitor_valid else None
 
-    sched = history.get('supervision_schedule')
+    sched       = history.get('supervision_schedule')
     sched_label = 'Supervision Weight' if loss_mode == 'both' else 'Pairing Probability'
 
     val_aug = history.get('val_aug_loss')
@@ -513,113 +595,186 @@ def plot_training_curves(
     tr_aug  = history.get('train_aug_loss')
     tr_fri  = history.get('train_friend_loss')
 
-    def _add_best(ax):
+    has_zoom = n_epochs > 10
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+    def _add_best(ax, fs):
         ax.axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
+        ax.text(best_epoch, 1.0, f' ep {best_epoch}',
+                transform=ax.get_xaxis_transform(),
+                va='top', ha='left', fontsize=fs - 2, color='green', alpha=0.85)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    def _draw_loss_ax(ax, ep, tr_l, va_l, tr_a, va_a, tr_f, va_f, mon,
+                      title, best_in_view=True, fs=FS, fs_t=FS_T):
+        ax.plot(ep, tr_l, 'b-',  linewidth=2)
+        ax.plot(ep, va_l, 'r-',  linewidth=2)
+        if tr_a:
+            ax.plot(ep, tr_a, color='blue', linestyle=':', linewidth=1.5, alpha=0.8)
+        if va_a:
+            ax.plot(ep, va_a, color='red',  linestyle=':', linewidth=1.5, alpha=0.8)
+        if tr_f:
+            ax.plot(ep, tr_f, 'b--', linewidth=1.5, alpha=0.8)
+        if va_f:
+            ax.plot(ep, va_f, 'r--', linewidth=1.5, alpha=0.8)
+        if mon:
+            ax.plot(ep, mon, color='orange', linestyle='--', linewidth=2, alpha=0.85,
+                    label='Val Monitor')
+        ax.axhline(y=best_val_loss, color='g', linestyle='--', alpha=0.7)
+        if best_in_view:
+            _add_best(ax, fs)
+        ax.set_xlabel('Epoch', fontsize=fs)
+        ax.set_ylabel('Loss', fontsize=fs)
+        ax.set_title(f'{title} (best val: {best_val_loss:.4f})', fontsize=fs_t)
+        ax.tick_params(labelsize=fs)
+        ax.grid(True, alpha=0.3)
+        # Split legend: colours (upper right) + linestyles (lower left)
+        color_handles = [
+            Line2D([0], [0], color='blue', linewidth=2, label='Train'),
+            Line2D([0], [0], color='red',  linewidth=2, label='Val'),
+        ]
+        style_handles = [
+            Line2D([0], [0], color='grey', linestyle='-',  linewidth=2,   label='Total'),
+        ]
+        if tr_a or va_a:
+            style_handles.append(
+                Line2D([0], [0], color='grey', linestyle=':', linewidth=1.5, label='L_aug'))
+        if tr_f or va_f:
+            style_handles.append(
+                Line2D([0], [0], color='grey', linestyle='--', linewidth=1.5, label='L_friend'))
+        leg1 = ax.legend(handles=color_handles, loc='upper right', fontsize=fs)
+        ax.add_artist(leg1)
+        ax.legend(handles=style_handles, loc='lower left', fontsize=fs)
+
+    def _draw_overfit_ax(ax, ep, tr_l, va_l, tr_f, va_f, tr_a, va_a,
+                         title, best_in_view=True, fs=FS, fs_t=FS_T):
+        _tr = np.array(tr_l, dtype=float)
+        _va = np.array(va_l, dtype=float)
+        ax.plot(ep, np.where(_tr != 0, _va / _tr, np.nan),
+                color='#1f77b4', label='Val/Train total', linewidth=2)
+        if tr_f and va_f:
+            _tf = np.array(tr_f, dtype=float)
+            _vf = np.array(va_f, dtype=float)
+            ax.plot(ep, np.where(_tf != 0, _vf / _tf, np.nan),
+                    color='#d62728', linestyle='--', label='Val/Train L_friend',
+                    linewidth=1.5, alpha=0.85)
+        if tr_a and va_a:
+            _ta  = np.array(tr_a, dtype=float)
+            _va2 = np.array(va_a, dtype=float)
+            ax.plot(ep, np.where(_ta != 0, _va2 / _ta, np.nan),
+                    color='#2ca02c', linestyle=':', label='Val/Train L_aug',
+                    linewidth=1.5, alpha=0.85)
+        ax.axhline(y=1.0, color='grey', linestyle='--', linewidth=1.2, alpha=0.6,
+                   label='Ratio = 1')
+        if best_in_view:
+            _add_best(ax, fs)
+        ax.set_xlabel('Epoch', fontsize=fs)
+        ax.set_ylabel('Val / Train loss ratio', fontsize=fs)
+        ax.set_title(title, fontsize=fs_t)
+        ax.legend(fontsize=fs)
+        ax.tick_params(labelsize=fs)
+        ax.grid(True, alpha=0.3)
+
+    # ------------------------------------------------------------------
+    # Main 2×2 figure
+    # ------------------------------------------------------------------
+    fig = plt.figure(figsize=(14, 10))
     fig.suptitle(f'Training History - {model_type.upper()} Model', fontsize=FS_S)
+    outer_gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
 
-    # Top-left: combined losses overview
-    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train (total)', linewidth=2)
-    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val (total)', linewidth=2)
-    if val_aug:
-        axes[0, 0].plot(epochs, val_aug, 'r--', label='Val aug (★)', linewidth=1.5, alpha=0.8)
-    if monitor:
-        axes[0, 0].plot(epochs, monitor, color='orange', linestyle='--',
-                        label='Val Monitor', linewidth=2, alpha=0.85)
-    axes[0, 0].axhline(y=best_val_loss, color='g', linestyle='--',
-                       label=f'Best ({best_val_loss:.4f})', alpha=0.7)
-    axes[0, 0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2,
-                       label=f'Best epoch ({best_epoch})', alpha=0.7)
-    axes[0, 0].set_xlabel('Epoch', fontsize=FS)
-    axes[0, 0].set_ylabel('Loss', fontsize=FS)
-    axes[0, 0].set_title('Combined Losses', fontsize=FS_T)
-    axes[0, 0].legend(fontsize=FS)
-    axes[0, 0].tick_params(labelsize=FS)
-    axes[0, 0].grid(True, alpha=0.3)
+    ax00 = fig.add_subplot(outer_gs[0, 0])
+    ax01 = fig.add_subplot(outer_gs[0, 1])
+    ax10 = fig.add_subplot(outer_gs[1, 0])
 
-    # Top-right: L_aug and L_friend components for train and val
-    if tr_aug:
-        axes[0, 1].plot(epochs, tr_aug, 'b-', label='Train L_aug', linewidth=2)
-    if tr_fri:
-        axes[0, 1].plot(epochs, tr_fri, 'b--', label='Train L_friend', linewidth=1.5, alpha=0.8)
-    if val_aug:
-        axes[0, 1].plot(epochs, val_aug, 'r-', label='Val L_aug (★)', linewidth=2)
-    if val_fri:
-        axes[0, 1].plot(epochs, val_fri, 'r--', label='Val L_friend', linewidth=1.5, alpha=0.8)
-    _add_best(axes[0, 1])
-    axes[0, 1].set_xlabel('Epoch', fontsize=FS)
-    axes[0, 1].set_ylabel('Loss', fontsize=FS)
-    axes[0, 1].set_title('L_aug and L_friend Components', fontsize=FS_T)
-    axes[0, 1].legend(fontsize=FS)
-    axes[0, 1].tick_params(labelsize=FS)
-    axes[0, 1].grid(True, alpha=0.3)
+    # [0,0] all loss components
+    _draw_loss_ax(ax00, epochs,
+                  history['train_loss'], history['val_loss'],
+                  tr_aug, val_aug, tr_fri, val_fri, monitor,
+                  'All Loss Components')
 
-    # Bottom-left: learning rate
-    axes[1, 0].plot(epochs, history['lr'], 'orange', linewidth=2)
-    _add_best(axes[1, 0])
-    axes[1, 0].set_xlabel('Epoch', fontsize=FS)
-    axes[1, 0].set_ylabel('Learning Rate', fontsize=FS)
-    axes[1, 0].set_title('Learning Rate Schedule', fontsize=FS_T)
-    axes[1, 0].tick_params(labelsize=FS)
-    axes[1, 0].grid(True, alpha=0.3)
-    axes[1, 0].set_yscale('log')
+    # [0,1] overfitting indicator
+    _draw_overfit_ax(ax01, epochs,
+                     history['train_loss'], history['val_loss'],
+                     tr_fri, val_fri, tr_aug, val_aug,
+                     'Overfitting Indicator')
 
-    # Bottom-right: supervision / prob schedule
-    axes[1, 1].plot(epochs, sched if sched else [0] * len(list(epochs)), 'green', linewidth=2)
-    axes[1, 1].set_ylabel(sched_label, fontsize=FS)
-    axes[1, 1].set_title(f'{sched_label} Schedule', fontsize=FS_T)
-    _add_best(axes[1, 1])
-    axes[1, 1].set_xlabel('Epoch', fontsize=FS)
-    axes[1, 1].tick_params(labelsize=FS)
-    axes[1, 1].grid(True, alpha=0.3)
+    # [1,0] learning rate + supervision schedule on dual y-axes
+    _lr_color = 'darkorange'
+    _sw_color = 'green'
+    ax10.plot(epochs, history['lr'], color=_lr_color, linewidth=2, label='Learning Rate')
+    ax10.set_yscale('log')
+    ax10.set_xlabel('Epoch', fontsize=FS)
+    ax10.set_ylabel('Learning Rate', fontsize=FS, color=_lr_color)
+    ax10.tick_params(axis='y', labelcolor=_lr_color, labelsize=FS)
+    ax10.tick_params(axis='x', labelsize=FS)
+    ax10.set_title('LR & Supervision Schedule', fontsize=FS_T)
+    ax10.grid(True, alpha=0.3)
+    _add_best(ax10, FS)
+    ax10r = ax10.twinx()
+    ax10r.plot(epochs, sched if sched else [0] * n_epochs,
+               color=_sw_color, linewidth=2, label=sched_label)
+    ax10r.set_ylabel(sched_label, fontsize=FS, color=_sw_color)
+    ax10r.tick_params(axis='y', labelcolor=_sw_color, labelsize=FS)
+    _l1, _lb1 = ax10.get_legend_handles_labels()
+    _l2, _lb2 = ax10r.get_legend_handles_labels()
+    ax10.legend(_l1 + _l2, _lb1 + _lb2, fontsize=FS)
 
-    plt.tight_layout()
+    # [1,1] zoomed panels embedded as nested gridspec
+    if has_zoom:
+        start_idx   = int(n_epochs * 0.8)
+        epochs_zoom = list(epochs)[start_idx:]
+        best_in_z   = best_epoch > start_idx
+
+        def _sl(seq):
+            return seq[start_idx:] if seq else None
+
+        inner_gs = gridspec.GridSpecFromSubplotSpec(
+            2, 1, subplot_spec=outer_gs[1, 1], hspace=0.65)
+        ax_z0 = fig.add_subplot(inner_gs[0])
+        ax_z1 = fig.add_subplot(inner_gs[1])
+
+        _FZ   = FS - 2
+        _FZ_T = FS_T - 2
+        _draw_loss_ax(ax_z0, epochs_zoom,
+                      _sl(history['train_loss']), _sl(history['val_loss']),
+                      _sl(tr_aug), _sl(val_aug), _sl(tr_fri), _sl(val_fri),
+                      _sl(monitor), 'Loss (Zoomed)',
+                      best_in_view=best_in_z, fs=_FZ, fs_t=_FZ_T)
+        _draw_overfit_ax(ax_z1, epochs_zoom,
+                         _sl(history['train_loss']), _sl(history['val_loss']),
+                         _sl(tr_fri), _sl(val_fri), _sl(tr_aug), _sl(val_aug),
+                         'Overfitting (Zoomed)',
+                         best_in_view=best_in_z, fs=_FZ, fs_t=_FZ_T)
+
     plt.savefig(output_dir / f'training_curves{suffix}.png', dpi=150, bbox_inches='tight')
     print(f"✓ Training curves saved to {output_dir / f'training_curves{suffix}.png'}")
+    plt.close(fig)
 
-    # Zoomed view of final 20%
-    if len(history['train_loss']) > 10:
-        start_idx = int(len(epochs) * 0.8)
-        epochs_zoom = list(epochs)[start_idx:]
-
+    # ------------------------------------------------------------------
+    # Standalone zoomed figure — changes 1, 2, 3 applied
+    # ------------------------------------------------------------------
+    if has_zoom:
         fig2, axes2 = plt.subplots(1, 2, figsize=(12, 4))
-        fig2.suptitle(f'Training History (Final 20%) - {model_type.upper()} Model', fontsize=FS_S)
+        fig2.suptitle(
+            f'Training History (Final 20%) - {model_type.upper()} Model', fontsize=FS_S)
 
-        axes2[0].plot(epochs_zoom, history['train_loss'][start_idx:], 'b-', label='Train (total)', linewidth=2)
-        axes2[0].plot(epochs_zoom, history['val_loss'][start_idx:], 'r-', label='Val (total)', linewidth=2)
-        if val_aug:
-            axes2[0].plot(epochs_zoom, val_aug[start_idx:], 'r--', label='Val aug (★)', linewidth=1.5, alpha=0.8)
-        if monitor:
-            axes2[0].plot(epochs_zoom, monitor[start_idx:], color='orange', linestyle='--',
-                          label='Val Monitor', linewidth=2, alpha=0.85)
-        axes2[0].axhline(y=best_val_loss, color='g', linestyle='--',
-                         label=f'Best ({best_val_loss:.4f})', alpha=0.7)
-        if best_epoch >= start_idx:
-            axes2[0].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2,
-                             label=f'Best epoch ({best_epoch})', alpha=0.7)
-        axes2[0].set_xlabel('Epoch', fontsize=FS)
-        axes2[0].set_ylabel('Loss', fontsize=FS)
-        axes2[0].set_title('Loss (Zoomed)', fontsize=FS_T)
-        axes2[0].legend(fontsize=FS)
-        axes2[0].tick_params(labelsize=FS)
-        axes2[0].grid(True, alpha=0.3)
-
-        axes2[1].plot(epochs_zoom, tr_aug[start_idx:] if tr_aug else [], 'b-', label='Train L_aug', linewidth=2)
-        axes2[1].plot(epochs_zoom, tr_fri[start_idx:] if tr_fri else [], 'b--', label='Train L_friend', linewidth=1.5, alpha=0.8)
-        axes2[1].plot(epochs_zoom, val_aug[start_idx:] if val_aug else [], 'r-', label='Val L_aug (★)', linewidth=2)
-        axes2[1].plot(epochs_zoom, val_fri[start_idx:] if val_fri else [], 'r--', label='Val L_friend', linewidth=1.5, alpha=0.8)
-        if best_epoch >= start_idx:
-            axes2[1].axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
-        axes2[1].set_xlabel('Epoch', fontsize=FS)
-        axes2[1].set_ylabel('Loss', fontsize=FS)
-        axes2[1].set_title('L_aug / L_friend Components (Zoomed)', fontsize=FS_T)
-        axes2[1].legend(fontsize=FS)
-        axes2[1].tick_params(labelsize=FS)
-        axes2[1].grid(True, alpha=0.3)
+        _draw_loss_ax(axes2[0], epochs_zoom,
+                      _sl(history['train_loss']), _sl(history['val_loss']),
+                      _sl(tr_aug), _sl(val_aug), _sl(tr_fri), _sl(val_fri),
+                      _sl(monitor), 'All Loss Components (Zoomed)',
+                      best_in_view=best_in_z)
+        _draw_overfit_ax(axes2[1], epochs_zoom,
+                         _sl(history['train_loss']), _sl(history['val_loss']),
+                         _sl(tr_fri), _sl(val_fri), _sl(tr_aug), _sl(val_aug),
+                         'Overfitting Indicator (Zoomed)',
+                         best_in_view=best_in_z)
 
         plt.tight_layout()
-        plt.savefig(output_dir / f'training_curves_zoomed{suffix}.png', dpi=150, bbox_inches='tight')
-        print(f"✓ Zoomed training curves saved to {output_dir / f'training_curves_zoomed{suffix}.png'}")
+        plt.savefig(output_dir / f'training_curves_zoomed{suffix}.png',
+                    dpi=150, bbox_inches='tight')
+        print(f"✓ Zoomed training curves saved to "
+              f"{output_dir / f'training_curves_zoomed{suffix}.png'}")
+        plt.close(fig2)
 
     plt.close('all')

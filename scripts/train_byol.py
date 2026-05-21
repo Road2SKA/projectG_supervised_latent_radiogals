@@ -233,8 +233,8 @@ LABEL_RANGES = {
     'all':         (0, 20),   # Alias for full
     'classical':   (0, 2),    # FRI, FRII only
     'initial':     (0, 5),    # FRI, FRII, Hybrids, Spirals, Relaxed doubles
-    'morphology':  (5, 15),   # C-curve through Restarted
-    'environment': (15, 19),  # Cluster, Merger, Diffuse emission, Unknown
+    'morphology':  (5, 16),   # C-curve through Restarted
+    'environment': (16, 20),  # Cluster, Merger, Diffuse emission, Unknown
     'derived':     (19, 24),  # Compact+hybrids through Straight+multi hotspots
 }
 
@@ -577,9 +577,15 @@ def train_fold(train_loader, val_loader, extract_loader=None):
         train_friend_batches = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        for x1, x1_aug, x2_friend, is_labelled in pbar:
+        if epoch == 0:
+            _e0_islabelled_fracs = []
+            _e0_lab_sub_sizes = []
+        for batch_idx, (x1, x1_aug, x2_friend, is_labelled) in enumerate(pbar):
             x1, x1_aug = x1.to(device), x1_aug.to(device)
             # is_labelled stays on CPU for x2_friend indexing
+
+            if epoch == 0:
+                _e0_islabelled_fracs.append(is_labelled.float().mean().item())
 
             # L_aug: ALL samples
             pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_aug)
@@ -587,7 +593,7 @@ def train_fold(train_loader, val_loader, extract_loader=None):
             loss = loss_trans
 
             # L_friend: labelled samples only
-            if x2_friend is not None and is_labelled.sum() > 1:
+            if x2_friend is not None and is_labelled.sum() >= 8:
                 x1_lab = x1[is_labelled.to(device)]
                 x2_lab = x2_friend[is_labelled].to(device)
                 pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1_lab, x2_lab)
@@ -595,6 +601,10 @@ def train_fold(train_loader, val_loader, extract_loader=None):
                 loss = loss + current_supervision_weight * TRAIN_RATIO * F_LABEL * loss_friend
                 train_friend_loss += loss_friend.item()
                 train_friend_batches += 1
+                if epoch == 0:
+                    _e0_lab_sub_sizes.append(int(is_labelled.sum()))
+
+            loss = loss / (1 + current_supervision_weight * TRAIN_RATIO * F_LABEL)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -607,6 +617,17 @@ def train_fold(train_loader, val_loader, extract_loader=None):
             train_loss += loss.item()
             train_aug_loss += loss_trans.item()
             pbar.set_postfix({'aug': f'{loss_trans.item():.4f}'})
+
+        if epoch == 0:
+            _mean_frac = sum(_e0_islabelled_fracs) / len(_e0_islabelled_fracs)
+            print(f"[DIAG epoch 1] mean is_labelled fraction: {_mean_frac:.4f} "
+                  f"(expected ~{F_LABEL:.4f})")
+            if _e0_lab_sub_sizes:
+                print(f"[DIAG epoch 1] labelled sub-batch sizes: "
+                      f"min={min(_e0_lab_sub_sizes)}, "
+                      f"mean={sum(_e0_lab_sub_sizes)/len(_e0_lab_sub_sizes):.1f}")
+            else:
+                print("[DIAG epoch 1] no batches triggered L_friend (is_labelled.sum() always < 8)")
 
         avg_train_loss = train_loss / len(train_loader)
         avg_train_aug_loss = train_aug_loss / len(train_loader)
@@ -632,7 +653,7 @@ def train_fold(train_loader, val_loader, extract_loader=None):
 
                 val_aug_loss += loss_trans.item()
                 val_friend_loss += loss_friend.item()
-                val_loss += (loss_trans + current_supervision_weight * TRAIN_RATIO * F_LABEL * loss_friend).item()
+                val_loss += ((loss_trans + current_supervision_weight * TRAIN_RATIO * F_LABEL * loss_friend) / (1 + current_supervision_weight * TRAIN_RATIO * F_LABEL)).item()
 
                 if USE_CURRICULUM:
                     monitor_loss += _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend)
@@ -730,7 +751,9 @@ test_images  = images[test_idx]
 test_labels  = labels[test_idx]
 
 # Labelled subset via stratified sampling
-if F_LABEL >= 1.0:
+if F_LABEL == 0.0:
+    labelled_mask = np.zeros(len(train_idx), dtype=bool)
+elif F_LABEL >= 1.0:
     labelled_mask = np.ones(len(train_idx), dtype=bool)
 else:
     strat_key = np.argmax(train_labels[:, :min(5, train_labels.shape[1])], axis=1)
@@ -756,20 +779,32 @@ print(f"  Test:  {len(test_images)}")
 # Datasets
 print("\nCreating datasets...")
 print(f"  Augmentation: {args.augmentation}")
-lab_df = pd.DataFrame(labelled_labels)
-lab_ds = BYOLSupDataset(tags_data=lab_df, img_data=labelled_images,
-                         transform=byol_strong_aug, friend_transform=byol_strong_aug,
-                         weightfunc=WEIGHTING_FUNC, p_pair_from_class=0.5)
 unlab_ds = UnlabelledBYOLDataset(unlabelled_images, transform=byol_strong_aug)
 
 _nw = NUM_WORKERS if use_cuda else 0
-train_loader = DataLoader(ConcatDataset([lab_ds, unlab_ds]),
-                          batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
+
+if len(labelled_images) > 0:
+    lab_df = pd.DataFrame(labelled_labels)
+    lab_ds = BYOLSupDataset(tags_data=lab_df, img_data=labelled_images,
+                             transform=byol_strong_aug, friend_transform=byol_strong_aug,
+                             weightfunc=WEIGHTING_FUNC, p_pair_from_class=0.5)
+    _train_combined = ConcatDataset([lab_ds, unlab_ds])
+    train_extract_loader = DataLoader(lab_ds, batch_size=BATCH_SIZE, shuffle=False,
+                                       num_workers=_nw, pin_memory=use_cuda)
+else:
+    lab_ds = None
+    _train_combined = unlab_ds
+    train_extract_loader = DataLoader(unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
+                                       num_workers=_nw, pin_memory=use_cuda,
+                                       collate_fn=byol_collate_fn)
+
+train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
                           num_workers=_nw, pin_memory=use_cuda,
                           collate_fn=byol_collate_fn)
-train_extract_loader = DataLoader(lab_ds, batch_size=BATCH_SIZE, shuffle=False,
-                                   num_workers=_nw, pin_memory=use_cuda)
-pca_fit_loader = DataLoader(ConcatDataset([lab_ds, unlab_ds]), batch_size=BATCH_SIZE,
+unlab_extract_loader = DataLoader(unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
+                                   num_workers=_nw, pin_memory=use_cuda,
+                                   collate_fn=byol_collate_fn)
+pca_fit_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE,
                              shuffle=False, num_workers=_nw, pin_memory=use_cuda,
                              collate_fn=byol_collate_fn)
 
@@ -780,11 +815,15 @@ np.save(DATA_DIR / 'train_idx.npy',          train_idx)
 np.save(DATA_DIR / 'labelled_train_idx.npy', labelled_train_idx)
 np.save(DATA_DIR / 'val_idx.npy',  val_idx)
 np.save(DATA_DIR / 'test_idx.npy', test_idx)
+unlabelled_train_idx = train_idx[~labelled_mask]
+np.save(DATA_DIR / 'unlabelled_train_idx.npy', unlabelled_train_idx)
 
 # Set train_labels / train_images for downstream to labelled-only
-train_labels = labelled_labels
-train_images = labelled_images
-train_idx    = labelled_train_idx
+# When f_label=0, keep the full training set so downstream plots don't crash
+if len(labelled_images) > 0:
+    train_labels = labelled_labels
+    train_images = labelled_images
+    train_idx    = labelled_train_idx
 
 print(f"\n{'='*70}")
 print("✓ DATA LOADED")
@@ -888,32 +927,41 @@ for _item in _items:
                              suffix=_suffix, loss_mode="both")
 
     # =========================================================================
-    # EXTRACT EMBEDDINGS
+    # EXTRACT PROJECTIONS
     # =========================================================================
 
-    print(f"\nExtracting embeddings{_label}...")
-    print("\n  Train set:")
+    print(f"\nExtracting projections{_label}...")
     train_projections = extract_embeddings_from_loader(
         model, train_extract_loader, MODEL_TYPE, device, max_batches=None
     )
-    print(f"    Projections: {train_projections.shape}")
-    print("\n  Val set:")
+    print(f"   Train set projections: {train_projections.shape}")
     val_projections = extract_embeddings_from_loader(
         model, val_loader, MODEL_TYPE, device, max_batches=None
     )
-    print("\n  Test set:")
+    print(f"   Val set projections: {val_projections.shape}")
     test_projections = extract_embeddings_from_loader(
         model, test_loader, MODEL_TYPE, device, max_batches=None
     )
+    print(f"   Test set projections: {test_projections.shape}")
 
-    # Save embeddings (same filenames regardless of PCA mode)
+    # Save projections (same filenames regardless of PCA mode)
     np.save(DATA_DIR / f'train_projections{_suffix}.npy', train_projections)
     np.save(DATA_DIR / f'val_projections{_suffix}.npy',   val_projections)
     np.save(DATA_DIR / f'test_projections{_suffix}.npy',  test_projections)
     np.save(DATA_DIR / f'train_labels{_suffix}.npy', train_labels[:len(train_projections)])
     np.save(DATA_DIR / f'val_labels{_suffix}.npy',   val_labels[:len(val_projections)])
     np.save(DATA_DIR / f'test_labels{_suffix}.npy',  test_labels[:len(test_projections)])
-    print(f"\n✓ Embeddings saved to {DATA_DIR}/")
+
+    if len(unlabelled_images) > 0 and len(labelled_images) > 0:
+        unlab_projections = extract_embeddings_from_loader(
+            model, unlab_extract_loader, MODEL_TYPE, device, max_batches=None
+        )
+        print(f"   Unlabelled train set projections: {unlab_projections.shape}")
+        np.save(DATA_DIR / f'unlabelled_train_projections{_suffix}.npy', unlab_projections)
+    else:
+        unlab_projections = None
+
+    print(f"\n✓ Projections saved to {DATA_DIR}/")
 
     # Generate UMAP plots (default behavior unless disabled)
     if not args.no_plot_umap:
@@ -937,19 +985,31 @@ for _item in _items:
         _lf_val   = labels_full[val_idx][:_n_va]
         _lf_test  = labels_full[test_idx][:_n_te]
 
-        # ── "all" UMAP: labelled train + val + test ───────────────────────────
-        _all_proj = np.concatenate([train_projections, val_projections, test_projections])
-        _all_lf   = np.concatenate([_lf_train, _lf_val, _lf_test])
+        # ── "all" UMAP: unlabelled train (if any) + labelled train + val + test
+        if unlab_projections is not None:
+            _n_ul = len(unlab_projections)
+            _lf_unlab = np.zeros((_n_ul, _lf_train.shape[1]), dtype=_lf_train.dtype)
+            _all_proj = np.concatenate([unlab_projections, train_projections, val_projections, test_projections])
+            _all_lf   = np.concatenate([_lf_unlab, _lf_train, _lf_val, _lf_test])
+        else:
+            _n_ul = 0
+            _all_proj = np.concatenate([train_projections, val_projections, test_projections])
+            _all_lf   = np.concatenate([_lf_train, _lf_val, _lf_test])
 
-        _n_all = _n_tr + _n_va + _n_te
-        _mask_tr = np.zeros(_n_all, dtype=bool); _mask_tr[:_n_tr] = True
-        _mask_va = np.zeros(_n_all, dtype=bool); _mask_va[_n_tr:_n_tr+_n_va] = True
-        _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_tr+_n_va:] = True
+        _n_all = _n_ul + _n_tr + _n_va + _n_te
+        _mask_ul = np.zeros(_n_all, dtype=bool); _mask_ul[:_n_ul] = True
+        _mask_tr = np.zeros(_n_all, dtype=bool); _mask_tr[_n_ul:_n_ul+_n_tr] = True
+        _mask_va = np.zeros(_n_all, dtype=bool); _mask_va[_n_ul+_n_tr:_n_ul+_n_tr+_n_va] = True
+        _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul+_n_tr+_n_va:] = True
 
         _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
         np.save(DATA_DIR / f'umap_all_coords{_suffix}.npy', _all_2d)
 
-        _split_masks_all = {'Labelled train': _mask_tr, 'Val': _mask_va, 'Test': _mask_te}
+        _split_masks_all = {}
+        if _n_ul > 0:
+            _split_masks_all['Unlabelled train'] = _mask_ul
+        _tr_key = 'Labelled train' if len(labelled_images) > 0 else 'Unlabelled train'
+        _split_masks_all.update({_tr_key: _mask_tr, 'Val': _mask_va, 'Test': _mask_te})
         for _col in ('initial', 'morphology', 'train_labelled'):
             plot_umap_single(
                 _all_2d, _all_lf, _col, CLASS_NAMES, LABEL_RANGES,
