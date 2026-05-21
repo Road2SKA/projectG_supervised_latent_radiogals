@@ -155,6 +155,9 @@ def parse_args():
     ap.add_argument("--no-metrics", action="store_true",
                     help="Disable projection clustering metrics (enabled by default)")
 
+    ap.add_argument("--full-dataset", action="store_true", default=False,
+                    help="Use all images for training; no test set, no model selection.")
+
     return ap.parse_args()
 
 # =============================================================================
@@ -402,7 +405,7 @@ def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
     return (loss_trans + loss_friend).item()
 
 
-def train_fold(train_loader, val_loader, extract_loader=None):
+def train_fold(train_loader, test_loader, extract_loader=None):
     """
     Train one model fold from scratch.
     When curriculum scheduling is active, model selection uses the monitoring val loss
@@ -598,13 +601,13 @@ def train_fold(train_loader, val_loader, extract_loader=None):
                 x2_lab = x2_friend[is_labelled].to(device)
                 pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1_lab, x2_lab)
                 loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
-                loss = loss + current_supervision_weight * TRAIN_RATIO * F_LABEL * loss_friend
+                loss = loss + current_supervision_weight * loss_friend
                 train_friend_loss += loss_friend.item()
                 train_friend_batches += 1
                 if epoch == 0:
                     _e0_lab_sub_sizes.append(int(is_labelled.sum()))
 
-            loss = loss / (1 + current_supervision_weight * TRAIN_RATIO * F_LABEL)
+            loss = loss / (1 + current_supervision_weight)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -636,32 +639,50 @@ def train_fold(train_loader, val_loader, extract_loader=None):
         # -------------------------------------------------------------------
         # VALIDATION: scheduled loss + (if curriculum) monitoring loss
         # -------------------------------------------------------------------
-        fold_model.eval()
-        val_aug_loss = 0.0
-        val_friend_loss = 0.0
-        val_loss = 0.0
-        monitor_loss = 0.0
+        if test_loader is not None:
+            fold_model.eval()
+            val_aug_loss = 0.0
+            val_friend_loss = 0.0
+            val_loss = 0.0
+            monitor_loss = 0.0
 
-        with torch.no_grad():
-            for x1, x1_trans, x2_friend, _ in val_loader:
-                x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
+            with torch.no_grad():
+                for x1, x1_trans, x2_friend, _ in test_loader:
+                    x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
 
-                pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
-                loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
-                pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
-                loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
+                    pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
+                    loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
+                    pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
+                    loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
 
-                val_aug_loss += loss_trans.item()
-                val_friend_loss += loss_friend.item()
-                val_loss += ((loss_trans + current_supervision_weight * TRAIN_RATIO * F_LABEL * loss_friend) / (1 + current_supervision_weight * TRAIN_RATIO * F_LABEL)).item()
+                    val_aug_loss += loss_trans.item()
+                    val_friend_loss += loss_friend.item()
+                    val_loss += ((loss_trans + current_supervision_weight * loss_friend)
+                                 / (1 + current_supervision_weight)).item()
 
-                if USE_CURRICULUM:
-                    monitor_loss += _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend)
+                    if USE_CURRICULUM:
+                        monitor_loss += _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend)
 
-        avg_val_aug_loss = val_aug_loss / len(val_loader)
-        avg_val_friend_loss = val_friend_loss / len(val_loader)
-        avg_val_loss = val_loss / len(val_loader)
-        avg_monitor_loss = monitor_loss / len(val_loader) if USE_CURRICULUM else None
+            avg_val_aug_loss = val_aug_loss / len(test_loader)
+            avg_val_friend_loss = val_friend_loss / len(test_loader)
+            avg_val_loss = val_loss / len(test_loader)
+            avg_monitor_loss = monitor_loss / len(test_loader) if USE_CURRICULUM else None
+
+            # Model selection: use monitor loss when curriculum is active, otherwise val aug loss
+            selection_loss = avg_monitor_loss if USE_CURRICULUM else avg_val_aug_loss
+            is_best = selection_loss < best_val_loss
+            if is_best:
+                best_val_loss = selection_loss
+                best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
+                best_epoch = epoch + 1
+        else:
+            # --full-dataset: always keep latest epoch as best
+            avg_val_loss = avg_val_aug_loss = avg_val_friend_loss = avg_train_loss
+            avg_monitor_loss = None
+            best_val_loss = avg_train_loss
+            best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
+            best_epoch = epoch + 1
+            is_best = True
 
         # -------------------------------------------------------------------
         # LOGGING
@@ -676,14 +697,6 @@ def train_fold(train_loader, val_loader, extract_loader=None):
         history['monitor_val_loss'].append(avg_monitor_loss)
         history['lr'].append(current_lr)
         history['supervision_schedule'].append(current_supervision_weight)
-
-        # Model selection: use monitor loss when curriculum is active, otherwise val aug loss
-        selection_loss = avg_monitor_loss if USE_CURRICULUM else avg_val_aug_loss
-        is_best = selection_loss < best_val_loss
-        if is_best:
-            best_val_loss = selection_loss
-            best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
-            best_epoch = epoch + 1
 
         best_marker = ' ★' if is_best else ''
         sup_str = f" | sup: {current_supervision_weight:.3f}"
@@ -726,7 +739,8 @@ def evaluate_test(eval_model, test_loader_ref):
             loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
             pred1_t, pred2_t, proj1_t, proj2_t = eval_model(x1, x1_trans)
             loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
-            test_loss_total += (loss_trans + final_sup_weight * loss_friend).item()
+            test_loss_total += ((loss_trans + final_sup_weight * loss_friend)
+                                / (1 + final_sup_weight)).item()
     return test_loss_total / len(test_loader_ref)
 
 
@@ -734,21 +748,23 @@ def evaluate_test(eval_model, test_loader_ref):
 # DATA SPLIT, DATASETS, LOADERS, AND TRAINING
 # =============================================================================
 
-TRAIN_RATIO, VAL_RATIO, TEST_RATIO = 0.64, 0.16, 0.20
+TRAIN_RATIO, TEST_RATIO = 0.70, 0.30
 
 np.random.seed(DATA_SEED)
 
 all_idx = np.arange(len(images))
-print(f"\nSplitting data ({TRAIN_RATIO:.0%}/{VAL_RATIO:.0%}/{TEST_RATIO:.0%})...")
-train_idx, temp_idx = train_test_split(all_idx, test_size=0.36, random_state=DATA_SEED)
-val_idx,  test_idx  = train_test_split(temp_idx, test_size=TEST_RATIO/(VAL_RATIO+TEST_RATIO),
-                                        random_state=DATA_SEED)
-
-train_images, train_labels = images[train_idx], labels[train_idx]
-val_images   = images[val_idx]
-val_labels   = labels[val_idx]
-test_images  = images[test_idx]
-test_labels  = labels[test_idx]
+if args.full_dataset:
+    print(f"\nUsing full dataset for training (no test set)...")
+    train_idx  = all_idx
+    test_idx   = None
+    train_images, train_labels = images[train_idx], labels[train_idx]
+    test_images = test_labels = None
+else:
+    print(f"\nSplitting data ({TRAIN_RATIO:.0%}/{TEST_RATIO:.0%})...")
+    train_idx, test_idx = train_test_split(all_idx, test_size=TEST_RATIO, random_state=DATA_SEED)
+    train_images, train_labels = images[train_idx], labels[train_idx]
+    test_images  = images[test_idx]
+    test_labels  = labels[test_idx]
 
 # Labelled subset via stratified sampling
 if F_LABEL == 0.0:
@@ -773,8 +789,8 @@ unlabelled_images = train_images[~labelled_mask]
 labelled_train_idx = train_idx[labelled_mask]
 
 print(f"  Train total: {len(train_idx)} ({len(labelled_images)} labelled, {len(unlabelled_images)} unlabelled)")
-print(f"  Val:   {len(val_images)}")
-print(f"  Test:  {len(test_images)}")
+if test_images is not None:
+    print(f"  Test:  {len(test_images)}")
 
 # Datasets
 print("\nCreating datasets...")
@@ -808,13 +824,15 @@ pca_fit_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE,
                              shuffle=False, num_workers=_nw, pin_memory=use_cuda,
                              collate_fn=byol_collate_fn)
 
-_, val_loader  = _make_dataset_loader(val_images,  val_labels,  shuffle=False, drop_last=USE_COMPILE)
-_, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=USE_COMPILE)
+if args.full_dataset:
+    test_loader = None
+else:
+    _, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=USE_COMPILE)
 
 np.save(DATA_DIR / 'train_idx.npy',          train_idx)
 np.save(DATA_DIR / 'labelled_train_idx.npy', labelled_train_idx)
-np.save(DATA_DIR / 'val_idx.npy',  val_idx)
-np.save(DATA_DIR / 'test_idx.npy', test_idx)
+if test_idx is not None:
+    np.save(DATA_DIR / 'test_idx.npy', test_idx)
 unlabelled_train_idx = train_idx[~labelled_mask]
 np.save(DATA_DIR / 'unlabelled_train_idx.npy', unlabelled_train_idx)
 
@@ -828,26 +846,26 @@ if len(labelled_images) > 0:
 print(f"\n{'='*70}")
 print("✓ DATA LOADED")
 print(f"{'='*70}")
-print(f"Train: {len(train_loader)} batches × {BATCH_SIZE}")
-print(f"Val:   {len(val_loader)} batches × {BATCH_SIZE}")
-print(f"Test:  {len(test_loader)} batches × {BATCH_SIZE}")
+if args.full_dataset:
+    print(f"Train: {len(train_loader)} batches × {BATCH_SIZE} (full dataset, no test set)")
+else:
+    print(f"Train: {len(train_loader)} batches × {BATCH_SIZE}")
+    print(f"Test:  {len(test_loader)} batches × {BATCH_SIZE}")
 print(f"{'='*70}\n")
 
 x1, x1_aug, x2_friend, is_labelled = next(iter(train_loader))
 print(f"✓ Test batch: {x1.shape}, {x1_aug.shape}")
 print(f"  Labelled fraction: {is_labelled.float().mean():.2f}")
 
-model, history, best_val_loss, best_epoch = train_fold(train_loader, val_loader, extract_loader=pca_fit_loader)
+model, history, best_val_loss, best_epoch = train_fold(
+    train_loader, test_loader, extract_loader=pca_fit_loader)
 
-print("\nEvaluating on TEST set (held-out)...")
-avg_test_loss = evaluate_test(model, test_loader)
-print(f"\n{'='*70}")
-print("TEST SET RESULTS (Best Model)")
-print(f"{'='*70}")
-print(f"Test Loss:  {avg_test_loss:.4f}")
-print(f"Best Val:   {best_val_loss:.4f}")
-print(f"Difference: {abs(avg_test_loss - best_val_loss):.4f}")
-print(f"{'='*70}\n")
+if args.full_dataset:
+    avg_test_loss = None
+else:
+    print("\nEvaluating on TEST set...")
+    avg_test_loss = evaluate_test(model, test_loader)
+    print(f"Test Loss: {avg_test_loss:.4f}  Best Val: {best_val_loss:.4f}")
 
 # =============================================================================
 # DOWNSTREAM: per-model loop
@@ -857,8 +875,7 @@ _items = [{'fold_idx': None, 'model': model, 'history': history,
            'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
            'avg_test_loss': avg_test_loss,
            'train_extract_loader': train_extract_loader,
-           'val_loader': val_loader, 'train_labels': train_labels,
-           'val_labels': val_labels, 'train_idx': train_idx,
+           'train_labels': train_labels, 'train_idx': train_idx,
            'train_images': train_images}]
 
 for _item in _items:
@@ -871,9 +888,7 @@ for _item in _items:
     best_epoch           = _item['best_epoch']
     avg_test_loss        = _item['avg_test_loss']
     train_extract_loader = _item['train_extract_loader']
-    val_loader           = _item['val_loader']
     train_labels         = _item['train_labels']
-    val_labels           = _item['val_labels']
     train_idx            = _item['train_idx']
     train_images         = _item['train_images']
 
@@ -935,22 +950,20 @@ for _item in _items:
         model, train_extract_loader, MODEL_TYPE, device, max_batches=None
     )
     print(f"   Train set projections: {train_projections.shape}")
-    val_projections = extract_embeddings_from_loader(
-        model, val_loader, MODEL_TYPE, device, max_batches=None
-    )
-    print(f"   Val set projections: {val_projections.shape}")
-    test_projections = extract_embeddings_from_loader(
-        model, test_loader, MODEL_TYPE, device, max_batches=None
-    )
-    print(f"   Test set projections: {test_projections.shape}")
+    if test_loader is not None:
+        test_projections = extract_embeddings_from_loader(
+            model, test_loader, MODEL_TYPE, device, max_batches=None
+        )
+        print(f"   Test set projections: {test_projections.shape}")
+    else:
+        test_projections = None
 
     # Save projections (same filenames regardless of PCA mode)
     np.save(DATA_DIR / f'train_projections{_suffix}.npy', train_projections)
-    np.save(DATA_DIR / f'val_projections{_suffix}.npy',   val_projections)
-    np.save(DATA_DIR / f'test_projections{_suffix}.npy',  test_projections)
     np.save(DATA_DIR / f'train_labels{_suffix}.npy', train_labels[:len(train_projections)])
-    np.save(DATA_DIR / f'val_labels{_suffix}.npy',   val_labels[:len(val_projections)])
-    np.save(DATA_DIR / f'test_labels{_suffix}.npy',  test_labels[:len(test_projections)])
+    if test_projections is not None:
+        np.save(DATA_DIR / f'test_projections{_suffix}.npy', test_projections)
+        np.save(DATA_DIR / f'test_labels{_suffix}.npy', test_labels[:len(test_projections)])
 
     if len(unlabelled_images) > 0 and len(labelled_images) > 0:
         unlab_projections = extract_embeddings_from_loader(
@@ -978,29 +991,31 @@ for _item in _items:
         }
 
         _n_tr = len(train_projections)
-        _n_va = len(val_projections)
-        _n_te = len(test_projections)
+        _n_te = len(test_projections) if test_projections is not None else 0
 
         _lf_train = labels_full[train_idx][:_n_tr]
-        _lf_val   = labels_full[val_idx][:_n_va]
-        _lf_test  = labels_full[test_idx][:_n_te]
+        _lf_test  = labels_full[test_idx][:_n_te] if test_idx is not None else np.zeros((0, _lf_train.shape[1]), dtype=_lf_train.dtype)
 
-        # ── "all" UMAP: unlabelled train (if any) + labelled train + val + test
+        # ── "all" UMAP: unlabelled train (if any) + labelled train + test
         if unlab_projections is not None:
             _n_ul = len(unlab_projections)
             _lf_unlab = np.zeros((_n_ul, _lf_train.shape[1]), dtype=_lf_train.dtype)
-            _all_proj = np.concatenate([unlab_projections, train_projections, val_projections, test_projections])
-            _all_lf   = np.concatenate([_lf_unlab, _lf_train, _lf_val, _lf_test])
+            _parts = [unlab_projections, train_projections]
+            _lf_parts = [_lf_unlab, _lf_train]
         else:
             _n_ul = 0
-            _all_proj = np.concatenate([train_projections, val_projections, test_projections])
-            _all_lf   = np.concatenate([_lf_train, _lf_val, _lf_test])
+            _parts = [train_projections]
+            _lf_parts = [_lf_train]
+        if test_projections is not None:
+            _parts.append(test_projections)
+            _lf_parts.append(_lf_test)
+        _all_proj = np.concatenate(_parts)
+        _all_lf   = np.concatenate(_lf_parts)
 
-        _n_all = _n_ul + _n_tr + _n_va + _n_te
+        _n_all = _n_ul + _n_tr + _n_te
         _mask_ul = np.zeros(_n_all, dtype=bool); _mask_ul[:_n_ul] = True
         _mask_tr = np.zeros(_n_all, dtype=bool); _mask_tr[_n_ul:_n_ul+_n_tr] = True
-        _mask_va = np.zeros(_n_all, dtype=bool); _mask_va[_n_ul+_n_tr:_n_ul+_n_tr+_n_va] = True
-        _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul+_n_tr+_n_va:] = True
+        _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul+_n_tr:] = True
 
         _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
         np.save(DATA_DIR / f'umap_all_coords{_suffix}.npy', _all_2d)
@@ -1009,7 +1024,9 @@ for _item in _items:
         if _n_ul > 0:
             _split_masks_all['Unlabelled train'] = _mask_ul
         _tr_key = 'Labelled train' if len(labelled_images) > 0 else 'Unlabelled train'
-        _split_masks_all.update({_tr_key: _mask_tr, 'Val': _mask_va, 'Test': _mask_te})
+        _split_masks_all[_tr_key] = _mask_tr
+        if test_projections is not None:
+            _split_masks_all['Test'] = _mask_te
         for _col in ('initial', 'morphology', 'train_labelled'):
             plot_umap_single(
                 _all_2d, _all_lf, _col, CLASS_NAMES, LABEL_RANGES,
@@ -1019,17 +1036,18 @@ for _item in _items:
             )
 
         # ── "test" UMAP: test only ────────────────────────────────────────────
-        _, _test_2d = fit_umap(test_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
-        np.save(DATA_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
+        if test_projections is not None:
+            _, _test_2d = fit_umap(test_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
+            np.save(DATA_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
 
-        _split_masks_test = {'Test': np.ones(_n_te, dtype=bool)}
-        for _col in ('initial', 'morphology'):
-            plot_umap_single(
-                _test_2d, _lf_test, _col, CLASS_NAMES, LABEL_RANGES,
-                title=f'Test — {_col}',
-                save_path=UMAP_DIR / f'umap_test_{_col}{_suffix}.png',
-                split_masks=_split_masks_test,
-            )
+            _split_masks_test = {'Test': np.ones(_n_te, dtype=bool)}
+            for _col in ('initial', 'morphology'):
+                plot_umap_single(
+                    _test_2d, _lf_test, _col, CLASS_NAMES, LABEL_RANGES,
+                    title=f'Test — {_col}',
+                    save_path=UMAP_DIR / f'umap_test_{_col}{_suffix}.png',
+                    split_masks=_split_masks_test,
+                )
 
         # ── Outlier plot: extremes from the train portion of the all-UMAP ─────
         plot_umap_outliers(
@@ -1049,11 +1067,10 @@ for _item in _items:
         # - all the base classes (FRI only, FRII only, all Hybrids, Spirals only, Relaxed doubles only) together
 
         metrics = {}
-        for split, projections, split_labels in zip(
-            ['train', 'test'],
-            [train_projections, test_projections],
-            [train_labels[:len(train_projections)], test_labels[:len(test_projections)]]
-        ):
+        _metric_splits = [('train', train_projections, train_labels[:len(train_projections)])]
+        if test_projections is not None:
+            _metric_splits.append(('test', test_projections, test_labels[:len(test_projections)]))
+        for split, projections, split_labels in _metric_splits:
             metrics[split] = {'fri_vs_frii': {}, 'base_classes': {}}
             fri_only = (split_labels[:, 0] == 1) & (split_labels[:, 1] == 0)
             frii_only = (split_labels[:, 1] == 1) & (split_labels[:, 0] == 0)

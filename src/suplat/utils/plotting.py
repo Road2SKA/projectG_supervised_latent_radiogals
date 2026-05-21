@@ -602,12 +602,9 @@ def plot_training_curves(
     # ------------------------------------------------------------------
     def _add_best(ax, fs):
         ax.axvline(x=best_epoch, color='g', linestyle=':', linewidth=2, alpha=0.7)
-        ax.text(best_epoch, 1.0, f' ep {best_epoch}',
-                transform=ax.get_xaxis_transform(),
-                va='top', ha='left', fontsize=fs - 2, color='green', alpha=0.85)
 
     def _draw_loss_ax(ax, ep, tr_l, va_l, tr_a, va_a, tr_f, va_f, mon,
-                      title, best_in_view=True, fs=FS, fs_t=FS_T):
+                      title, best_in_view=True, show_legend=True, fs=FS, fs_t=FS_T):
         ax.plot(ep, tr_l, 'b-',  linewidth=2)
         ax.plot(ep, va_l, 'r-',  linewidth=2)
         if tr_a:
@@ -626,29 +623,30 @@ def plot_training_curves(
             _add_best(ax, fs)
         ax.set_xlabel('Epoch', fontsize=fs)
         ax.set_ylabel('Loss', fontsize=fs)
-        ax.set_title(f'{title} (best val: {best_val_loss:.4f})', fontsize=fs_t)
+        ax.set_title(f'{title} (best val: {best_val_loss:.4f}, ep {best_epoch})', fontsize=fs_t)
         ax.tick_params(labelsize=fs)
         ax.grid(True, alpha=0.3)
-        # Split legend: colours (upper right) + linestyles (lower left)
-        color_handles = [
-            Line2D([0], [0], color='blue', linewidth=2, label='Train'),
-            Line2D([0], [0], color='red',  linewidth=2, label='Val'),
-        ]
-        style_handles = [
-            Line2D([0], [0], color='grey', linestyle='-',  linewidth=2,   label='Total'),
-        ]
-        if tr_a or va_a:
-            style_handles.append(
-                Line2D([0], [0], color='grey', linestyle=':', linewidth=1.5, label='L_aug'))
-        if tr_f or va_f:
-            style_handles.append(
-                Line2D([0], [0], color='grey', linestyle='--', linewidth=1.5, label='L_friend'))
-        leg1 = ax.legend(handles=color_handles, loc='upper right', fontsize=fs)
-        ax.add_artist(leg1)
-        ax.legend(handles=style_handles, loc='lower left', fontsize=fs)
+        if show_legend:
+            # Split legend: colours (upper right) + linestyles (lower left)
+            color_handles = [
+                Line2D([0], [0], color='blue', linewidth=2, label='Train'),
+                Line2D([0], [0], color='red',  linewidth=2, label='Val'),
+            ]
+            style_handles = [
+                Line2D([0], [0], color='grey', linestyle='-',  linewidth=2,   label='Total'),
+            ]
+            if tr_a or va_a:
+                style_handles.append(
+                    Line2D([0], [0], color='grey', linestyle=':', linewidth=1.5, label='L_aug'))
+            if tr_f or va_f:
+                style_handles.append(
+                    Line2D([0], [0], color='grey', linestyle='--', linewidth=1.5, label='L_friend'))
+            leg1 = ax.legend(handles=color_handles, loc='upper right', fontsize=fs)
+            ax.add_artist(leg1)
+            ax.legend(handles=style_handles, loc='lower left', fontsize=fs)
 
     def _draw_overfit_ax(ax, ep, tr_l, va_l, tr_f, va_f, tr_a, va_a,
-                         title, best_in_view=True, fs=FS, fs_t=FS_T):
+                         title, best_in_view=True, show_legend=True, fs=FS, fs_t=FS_T):
         _tr = np.array(tr_l, dtype=float)
         _va = np.array(va_l, dtype=float)
         ax.plot(ep, np.where(_tr != 0, _va / _tr, np.nan),
@@ -672,7 +670,8 @@ def plot_training_curves(
         ax.set_xlabel('Epoch', fontsize=fs)
         ax.set_ylabel('Val / Train loss ratio', fontsize=fs)
         ax.set_title(title, fontsize=fs_t)
-        ax.legend(fontsize=fs)
+        if show_legend:
+            ax.legend(fontsize=fs)
         ax.tick_params(labelsize=fs)
         ax.grid(True, alpha=0.3)
 
@@ -681,11 +680,11 @@ def plot_training_curves(
     # ------------------------------------------------------------------
     fig = plt.figure(figsize=(14, 10))
     fig.suptitle(f'Training History - {model_type.upper()} Model', fontsize=FS_S)
-    outer_gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
+    outer_gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.30)
 
     ax00 = fig.add_subplot(outer_gs[0, 0])
     ax01 = fig.add_subplot(outer_gs[0, 1])
-    ax10 = fig.add_subplot(outer_gs[1, 0])
+    ax11 = fig.add_subplot(outer_gs[1, 1])
 
     # [0,0] all loss components
     _draw_loss_ax(ax00, epochs,
@@ -699,28 +698,28 @@ def plot_training_curves(
                      tr_fri, val_fri, tr_aug, val_aug,
                      'Overfitting Indicator')
 
-    # [1,0] learning rate + supervision schedule on dual y-axes
+    # [1,1] learning rate + supervision schedule on dual y-axes
     _lr_color = 'darkorange'
     _sw_color = 'green'
-    ax10.plot(epochs, history['lr'], color=_lr_color, linewidth=2, label='Learning Rate')
-    ax10.set_yscale('log')
-    ax10.set_xlabel('Epoch', fontsize=FS)
-    ax10.set_ylabel('Learning Rate', fontsize=FS, color=_lr_color)
-    ax10.tick_params(axis='y', labelcolor=_lr_color, labelsize=FS)
-    ax10.tick_params(axis='x', labelsize=FS)
-    ax10.set_title('LR & Supervision Schedule', fontsize=FS_T)
-    ax10.grid(True, alpha=0.3)
-    _add_best(ax10, FS)
-    ax10r = ax10.twinx()
-    ax10r.plot(epochs, sched if sched else [0] * n_epochs,
+    ax11.plot(epochs, history['lr'], color=_lr_color, linewidth=2, label='Learning Rate')
+    ax11.set_yscale('log')
+    ax11.set_xlabel('Epoch', fontsize=FS)
+    ax11.set_ylabel('Learning Rate', fontsize=FS, color=_lr_color)
+    ax11.tick_params(axis='y', labelcolor=_lr_color, labelsize=FS)
+    ax11.tick_params(axis='x', labelsize=FS)
+    ax11.set_title(f'LR & Supervision Schedule (ep {best_epoch})', fontsize=FS_T)
+    ax11.grid(True, alpha=0.3)
+    _add_best(ax11, FS)
+    ax11r = ax11.twinx()
+    ax11r.plot(epochs, sched if sched else [0] * n_epochs,
                color=_sw_color, linewidth=2, label=sched_label)
-    ax10r.set_ylabel(sched_label, fontsize=FS, color=_sw_color)
-    ax10r.tick_params(axis='y', labelcolor=_sw_color, labelsize=FS)
-    _l1, _lb1 = ax10.get_legend_handles_labels()
-    _l2, _lb2 = ax10r.get_legend_handles_labels()
-    ax10.legend(_l1 + _l2, _lb1 + _lb2, fontsize=FS)
+    ax11r.set_ylabel(sched_label, fontsize=FS, color=_sw_color)
+    ax11r.tick_params(axis='y', labelcolor=_sw_color, labelsize=FS)
+    _l1, _lb1 = ax11.get_legend_handles_labels()
+    _l2, _lb2 = ax11r.get_legend_handles_labels()
+    ax11.legend(_l1 + _l2, _lb1 + _lb2, fontsize=FS)
 
-    # [1,1] zoomed panels embedded as nested gridspec
+    # [1,0] zoomed panels embedded as nested gridspec
     if has_zoom:
         start_idx   = int(n_epochs * 0.8)
         epochs_zoom = list(epochs)[start_idx:]
@@ -730,9 +729,12 @@ def plot_training_curves(
             return seq[start_idx:] if seq else None
 
         inner_gs = gridspec.GridSpecFromSubplotSpec(
-            2, 1, subplot_spec=outer_gs[1, 1], hspace=0.65)
+            2, 1, subplot_spec=outer_gs[1, 0], hspace=0.15)
         ax_z0 = fig.add_subplot(inner_gs[0])
-        ax_z1 = fig.add_subplot(inner_gs[1])
+        ax_z1 = fig.add_subplot(inner_gs[1], sharex=ax_z0)
+
+        # Hide x-tick labels on top panel to save space
+        plt.setp(ax_z0.get_xticklabels(), visible=False)
 
         _FZ   = FS - 2
         _FZ_T = FS_T - 2
@@ -740,41 +742,14 @@ def plot_training_curves(
                       _sl(history['train_loss']), _sl(history['val_loss']),
                       _sl(tr_aug), _sl(val_aug), _sl(tr_fri), _sl(val_fri),
                       _sl(monitor), 'Loss (Zoomed)',
-                      best_in_view=best_in_z, fs=_FZ, fs_t=_FZ_T)
+                      best_in_view=best_in_z, show_legend=False, fs=_FZ, fs_t=_FZ_T)
+        ax_z0.set_xlabel('')
         _draw_overfit_ax(ax_z1, epochs_zoom,
                          _sl(history['train_loss']), _sl(history['val_loss']),
                          _sl(tr_fri), _sl(val_fri), _sl(tr_aug), _sl(val_aug),
-                         'Overfitting (Zoomed)',
-                         best_in_view=best_in_z, fs=_FZ, fs_t=_FZ_T)
+                         '',
+                         best_in_view=best_in_z, show_legend=False, fs=_FZ, fs_t=_FZ_T)
 
     plt.savefig(output_dir / f'training_curves{suffix}.png', dpi=150, bbox_inches='tight')
     print(f"✓ Training curves saved to {output_dir / f'training_curves{suffix}.png'}")
     plt.close(fig)
-
-    # ------------------------------------------------------------------
-    # Standalone zoomed figure — changes 1, 2, 3 applied
-    # ------------------------------------------------------------------
-    if has_zoom:
-        fig2, axes2 = plt.subplots(1, 2, figsize=(12, 4))
-        fig2.suptitle(
-            f'Training History (Final 20%) - {model_type.upper()} Model', fontsize=FS_S)
-
-        _draw_loss_ax(axes2[0], epochs_zoom,
-                      _sl(history['train_loss']), _sl(history['val_loss']),
-                      _sl(tr_aug), _sl(val_aug), _sl(tr_fri), _sl(val_fri),
-                      _sl(monitor), 'All Loss Components (Zoomed)',
-                      best_in_view=best_in_z)
-        _draw_overfit_ax(axes2[1], epochs_zoom,
-                         _sl(history['train_loss']), _sl(history['val_loss']),
-                         _sl(tr_fri), _sl(val_fri), _sl(tr_aug), _sl(val_aug),
-                         'Overfitting Indicator (Zoomed)',
-                         best_in_view=best_in_z)
-
-        plt.tight_layout()
-        plt.savefig(output_dir / f'training_curves_zoomed{suffix}.png',
-                    dpi=150, bbox_inches='tight')
-        print(f"✓ Zoomed training curves saved to "
-              f"{output_dir / f'training_curves_zoomed{suffix}.png'}")
-        plt.close(fig2)
-
-    plt.close('all')
