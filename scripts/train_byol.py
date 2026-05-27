@@ -668,13 +668,11 @@ def train_fold(train_loader, test_loader, extract_loader=None):
             avg_val_loss = val_loss / len(test_loader)
             avg_monitor_loss = monitor_loss / len(test_loader) if USE_CURRICULUM else None
 
-            # Model selection: use monitor loss when curriculum is active, otherwise val aug loss
-            selection_loss = avg_monitor_loss if USE_CURRICULUM else avg_val_aug_loss
-            is_best = selection_loss < best_val_loss
-            if is_best:
-                best_val_loss = selection_loss
-                best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
-                best_epoch = epoch + 1
+            # Test images are in training — val loss is not held-out; always keep last epoch
+            is_best = True
+            best_val_loss = avg_val_aug_loss  # for logging only
+            best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
+            best_epoch = epoch + 1
         else:
             # --full-dataset: always keep latest epoch as best
             avg_val_loss = avg_val_aug_loss = avg_val_friend_loss = avg_train_loss
@@ -788,7 +786,9 @@ labelled_labels = train_labels[labelled_mask]
 unlabelled_images = train_images[~labelled_mask]
 labelled_train_idx = train_idx[labelled_mask]
 
-print(f"  Train total: {len(train_idx)} ({len(labelled_images)} labelled, {len(unlabelled_images)} unlabelled)")
+print(f"  Train BYOL total: {len(train_idx) + (len(test_idx) if test_idx is not None else 0)} "
+      f"({len(labelled_images)} labelled, {len(unlabelled_images)} unlabelled train, "
+      f"{len(test_images) if test_images is not None else 0} test as unlabelled)")
 if test_images is not None:
     print(f"  Test:  {len(test_images)}")
 
@@ -813,6 +813,11 @@ else:
     train_extract_loader = DataLoader(unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
                                        num_workers=_nw, pin_memory=use_cuda,
                                        collate_fn=byol_collate_fn)
+
+# All images available to BYOL — test images join as pure unlabelled
+if test_images is not None:
+    test_unlab_ds = UnlabelledBYOLDataset(test_images, transform=byol_strong_aug)
+    _train_combined = ConcatDataset([_train_combined, test_unlab_ds])
 
 train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
                           num_workers=_nw, pin_memory=use_cuda,
@@ -1040,14 +1045,6 @@ for _item in _items:
             _, _test_2d = fit_umap(test_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
             np.save(DATA_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
 
-            _split_masks_test = {'Test': np.ones(_n_te, dtype=bool)}
-            for _col in ('initial', 'morphology'):
-                plot_umap_single(
-                    _test_2d, _lf_test, _col, CLASS_NAMES, LABEL_RANGES,
-                    title=f'Test — {_col}',
-                    save_path=UMAP_DIR / f'umap_test_{_col}{_suffix}.png',
-                    split_masks=_split_masks_test,
-                )
 
         # ── Outlier plot: extremes from the train portion of the all-UMAP ─────
         plot_umap_outliers(

@@ -1,0 +1,26 @@
+{
+    "train": {
+        "fri_vs_frii": {
+            "silhouette": 0.039300691336393356,
+            "davies_bouldin": 7.275309709080024,
+            "calinski_harabasz": 2.5155752102684765
+        },
+        "base_classes": {
+            "silhouette": -0.0157932061702013,
+            "davies_bouldin": 5.356835582941921,
+            "calinski_harabasz": 1.8392026484472335
+        }
+    },
+    "test": {
+        "fri_vs_frii": {
+            "silhouette": 0.01003736350685358,
+            "davies_bouldin": 7.058797098492962,
+            "calinski_harabasz": 1.395881038064161
+        },
+        "base_classes": {
+            "silhouette": -0.05563826486468315,
+            "davies_bouldin": 4.320986726579971,
+            "calinski_harabasz": 1.2320587391870583
+        }
+    }
+}

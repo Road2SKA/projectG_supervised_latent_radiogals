@@ -5,7 +5,7 @@ For each run directory matching --run-glob under --outputs-root:
   1. Load labelled + unlabelled train projections and indices.
   2. Build source names, labels (tier-scored human_label 1–5), and PCA features.
   3. Seed anomaly_scores from the labelled training set, run ScoreConverter.
-  4. Run GP active learning (Protege) querying --n-query-additional additional sources.
+  4. Run GP active learning (Protege) querying the entire unlabelled pool.
   5. Compute recall-curve AUC over the unqueried eval set.
   6. Save recall_curve, protege_scores.parquet, and protege_summary.json.
 
@@ -82,7 +82,7 @@ def run_GP_active_learning(features, labels, input_anomaly_scores, output_dir,
 # ---------------------------------------------------------------------------
 # Per-run processing
 # ---------------------------------------------------------------------------
-def process_run(run_dir: Path, n_query_additional: int, epsilon: float,
+def process_run(run_dir: Path, epsilon: float,
                 steps: int, suffix: str, csv_df: pd.DataFrame, labels_all: np.ndarray,
                 use_pca: bool = False):
     # --- Load data_seed from BYOL checkpoint ---
@@ -113,6 +113,9 @@ def process_run(run_dir: Path, n_query_additional: int, epsilon: float,
         # f=1: train_projections.npy is the full (labelled) set
         all_proj = lab_proj
         all_idx  = lab_idx
+
+    # n_query_additional is the full unlabelled pool — ensures total budget = train_size
+    n_query_additional = len(unlab_idx)
 
     # --- Source names (CSV row order aligned with labels_filtered.npy) ---
     source_names = csv_df.iloc[all_idx]["Source_Name"].values
@@ -233,7 +236,7 @@ def process_run(run_dir: Path, n_query_additional: int, epsilon: float,
         "n_eval":             n_eval,
         "n_eval_positives":   n_pos,
         "auc":                None if (isinstance(auc, float) and auc != auc) else auc,
-        "pca_components":     int(proj_pca.shape[1]),
+        "pca_components":     int(proj_final.shape[1]),
     }
     with open(protege_dir / f"protege_summary{suffix}.json", "w") as fh:
         json.dump(summary, fh, indent=2)
@@ -254,8 +257,6 @@ def main():
                         help="Root directory containing run subdirectories.")
     parser.add_argument("--run-glob",          default="run_no_val_run_f*_sw*",
                         help="Glob pattern for run directories.")
-    parser.add_argument("--n-query-additional", type=int, default=600,
-                        help="Number of additional sources to query after seeding.")
     parser.add_argument("--epsilon",           type=float, default=0.0,
                         help="GP acquisition epsilon: exploration-exploitation trade-off (0=exploit, 3=paper default).")
     parser.add_argument("--steps",             type=int, default=10,
@@ -308,7 +309,7 @@ def main():
         print(f"[{rd.name}]  f={f_val}  sw={sw_val}", flush=True)
         try:
             auc, n_eval, n_pos = process_run(
-                rd, args.n_query_additional, args.epsilon,
+                rd, args.epsilon,
                 args.steps, suffix, csv_df, labels_all,
                 use_pca=args.pca,
             )

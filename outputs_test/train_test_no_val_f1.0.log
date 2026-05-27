@@ -1,0 +1,136 @@
+using gpu
+✓ Using device: cuda
+  GPU: NVIDIA GH200 120GB
+  Memory: 102.01 GB
+
+======================================================================
+CONFIGURATION
+Output directory: /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825
+PyTorch version: 2.11.0+cu130
+CUDA available: True
+CUDA version: 13.0
+======================================================================
+Model type:     efficientnet-b0
+Feature compression mode: pca
+Projection dim: 256
+Hidden dim:     4096
+Dataset:        LOTSS
+Data dir:       /users/mbredber/p3_SUPLAT/data/preprocessed/lotss
+Label type:     full (20 dims)
+Batch size:     32
+Learning rate:  0.0003
+Epochs:         3
+Warmup epochs:  0
+Grad clip:      None
+EMA decay:      0.99
+Weighting:      closest
+F_label:        1.0
+Num workers:    4
+Compile:        disabled
+Device:         cuda
+Subsampling:    300 samples
+======================================================================
+
+Attempting to load LOTSS data...
+  Images: /users/mbredber/p3_SUPLAT/data/preprocessed/lotss/images_filtered.npy
+  Labels: /users/mbredber/p3_SUPLAT/data/preprocessed/lotss/labels_filtered.npy
+
+⚠ Subsampling 300/7596 samples
+
+✓ Data loaded
+  Images: (300, 89, 89) (float32)
+  Labels: (300, 20) (int8)
+  Range: [0.02, 1.00]
+
+Splitting data (70%/30%)...
+  Train BYOL total: 300 (210 labelled, 0 unlabelled train, 90 test as unlabelled)
+  Test:  90
+
+Creating datasets...
+  Augmentation: standard
+
+======================================================================
+✓ DATA LOADED
+======================================================================
+Train: 9 batches × 32
+Test:  3 batches × 32
+======================================================================
+
+✓ Test batch: torch.Size([32, 1, 89, 89]), torch.Size([32, 1, 89, 89])
+  Labelled fraction: 0.69
+✓ PCA fitted: 91 components
+
+Initializing model...
+======================================================================
+MODEL ARCHITECTURE (EFFICIENTNET-B0)
+======================================================================
+Total parameters:     8,771,795
+Trainable parameters: 4,764,823
+Encoder output:       1280-dim representation
+Projector:            PCA (fitted, 95% variance)
+Predictor output:     PCA-dim prediction (set after fit_pca)
+======================================================================
+
+GPU Memory allocated: 35 MB
+GPU Memory reserved: 118 MB
+✓ Optimizer: Adam (lr=0.0003)
+✓ Scheduler: constant
+✓ Loss: BYOL symmetric MSE
+
+======================================================================
+STARTING TRAINING
+======================================================================
+
+Epoch 1/3:   0%|          | 0/9 [00:00<?, ?it/s]Epoch 1/3:   0%|          | 0/9 [00:00<?, ?it/s, aug=3.6334]Epoch 1/3:  11%|█         | 1/9 [00:00<00:04,  1.84it/s, aug=3.6334]Epoch 1/3:  11%|█         | 1/9 [00:00<00:04,  1.84it/s, aug=1.9768]Epoch 1/3:  22%|██▏       | 2/9 [00:00<00:02,  2.54it/s, aug=1.9768]Epoch 1/3:  22%|██▏       | 2/9 [00:01<00:02,  2.54it/s, aug=1.5370]Epoch 1/3:  33%|███▎      | 3/9 [00:01<00:02,  3.00it/s, aug=1.5370]Epoch 1/3:  33%|███▎      | 3/9 [00:01<00:02,  3.00it/s, aug=1.3434]Epoch 1/3:  44%|████▍     | 4/9 [00:01<00:01,  3.28it/s, aug=1.3434]Epoch 1/3:  44%|████▍     | 4/9 [00:01<00:01,  3.28it/s, aug=1.2277]Epoch 1/3:  56%|█████▌    | 5/9 [00:01<00:01,  3.44it/s, aug=1.2277]Epoch 1/3:  56%|█████▌    | 5/9 [00:01<00:01,  3.44it/s, aug=1.2019]Epoch 1/3:  67%|██████▋   | 6/9 [00:01<00:00,  3.92it/s, aug=1.2019]Epoch 1/3:  67%|██████▋   | 6/9 [00:02<00:00,  3.92it/s, aug=1.1344]Epoch 1/3:  78%|███████▊  | 7/9 [00:02<00:00,  3.87it/s, aug=1.1344]Epoch 1/3:  78%|███████▊  | 7/9 [00:02<00:00,  3.87it/s, aug=1.0523]Epoch 1/3:  89%|████████▉ | 8/9 [00:02<00:00,  4.24it/s, aug=1.0523]Epoch 1/3:  89%|████████▉ | 8/9 [00:02<00:00,  4.24it/s, aug=1.0579]Epoch 1/3: 100%|██████████| 9/9 [00:02<00:00,  4.54it/s, aug=1.0579]Epoch 1/3: 100%|██████████| 9/9 [00:02<00:00,  3.67it/s, aug=1.0579]
+[DIAG epoch 1] mean is_labelled fraction: 0.7049 (expected ~1.0000)
+[DIAG epoch 1] labelled sub-batch sizes: min=17, mean=22.6
+Epoch    1/3 | train: 1.5704 (t_aug: 1.5739 t_fri: 1.5669) | val: 1.6068 (v_aug: 1.6075 v_fri: 1.6061) | lr: 3.00e-04 | sup: 1.000 ★
+Epoch 2/3:   0%|          | 0/9 [00:00<?, ?it/s]Epoch 2/3:   0%|          | 0/9 [00:00<?, ?it/s, aug=1.0219]Epoch 2/3:  11%|█         | 1/9 [00:00<00:02,  3.56it/s, aug=1.0219]Epoch 2/3:  11%|█         | 1/9 [00:00<00:02,  3.56it/s, aug=0.9502]Epoch 2/3:  22%|██▏       | 2/9 [00:00<00:01,  3.64it/s, aug=0.9502]Epoch 2/3:  22%|██▏       | 2/9 [00:00<00:01,  3.64it/s, aug=0.9710]Epoch 2/3:  33%|███▎      | 3/9 [00:00<00:01,  4.26it/s, aug=0.9710]Epoch 2/3:  33%|███▎      | 3/9 [00:00<00:01,  4.26it/s, aug=0.9684]Epoch 2/3:  44%|████▍     | 4/9 [00:00<00:01,  4.61it/s, aug=0.9684]Epoch 2/3:  44%|████▍     | 4/9 [00:01<00:01,  4.61it/s, aug=0.9374]Epoch 2/3:  56%|█████▌    | 5/9 [00:01<00:00,  4.83it/s, aug=0.9374]Epoch 2/3:  56%|█████▌    | 5/9 [00:01<00:00,  4.83it/s, aug=0.9305]Epoch 2/3:  67%|██████▋   | 6/9 [00:01<00:00,  4.40it/s, aug=0.9305]Epoch 2/3:  67%|██████▋   | 6/9 [00:01<00:00,  4.40it/s, aug=0.9298]Epoch 2/3:  78%|███████▊  | 7/9 [00:01<00:00,  4.39it/s, aug=0.9298]Epoch 2/3:  78%|███████▊  | 7/9 [00:01<00:00,  4.39it/s, aug=0.9001]Epoch 2/3:  89%|████████▉ | 8/9 [00:01<00:00,  4.66it/s, aug=0.9001]Epoch 2/3:  89%|████████▉ | 8/9 [00:01<00:00,  4.66it/s, aug=0.8849]Epoch 2/3: 100%|██████████| 9/9 [00:01<00:00,  4.86it/s, aug=0.8849]Epoch 2/3: 100%|██████████| 9/9 [00:01<00:00,  4.51it/s, aug=0.8849]
+Epoch    2/3 | train: 0.9477 (t_aug: 0.9438 t_fri: 0.9516) | val: 1.3311 (v_aug: 1.3207 v_fri: 1.3415) | lr: 3.00e-04 | sup: 1.000 ★
+Epoch 3/3:   0%|          | 0/9 [00:00<?, ?it/s]Epoch 3/3:   0%|          | 0/9 [00:00<?, ?it/s, aug=0.8974]Epoch 3/3:  11%|█         | 1/9 [00:00<00:02,  3.73it/s, aug=0.8974]Epoch 3/3:  11%|█         | 1/9 [00:00<00:02,  3.73it/s, aug=0.9289]Epoch 3/3:  22%|██▏       | 2/9 [00:00<00:01,  4.62it/s, aug=0.9289]Epoch 3/3:  22%|██▏       | 2/9 [00:00<00:01,  4.62it/s, aug=0.8874]Epoch 3/3:  33%|███▎      | 3/9 [00:00<00:01,  4.99it/s, aug=0.8874]Epoch 3/3:  33%|███▎      | 3/9 [00:00<00:01,  4.99it/s, aug=0.9007]Epoch 3/3:  44%|████▍     | 4/9 [00:00<00:00,  5.14it/s, aug=0.9007]Epoch 3/3:  44%|████▍     | 4/9 [00:01<00:00,  5.14it/s, aug=0.8869]Epoch 3/3:  56%|█████▌    | 5/9 [00:01<00:00,  5.19it/s, aug=0.8869]Epoch 3/3:  56%|█████▌    | 5/9 [00:01<00:00,  5.19it/s, aug=0.9153]Epoch 3/3:  67%|██████▋   | 6/9 [00:01<00:00,  5.26it/s, aug=0.9153]Epoch 3/3:  67%|██████▋   | 6/9 [00:01<00:00,  5.26it/s, aug=0.8615]Epoch 3/3:  78%|███████▊  | 7/9 [00:01<00:00,  5.28it/s, aug=0.8615]Epoch 3/3:  78%|███████▊  | 7/9 [00:01<00:00,  5.28it/s, aug=0.8661]Epoch 3/3:  89%|████████▉ | 8/9 [00:01<00:00,  5.29it/s, aug=0.8661]Epoch 3/3:  89%|████████▉ | 8/9 [00:01<00:00,  5.29it/s, aug=0.8529]Epoch 3/3: 100%|██████████| 9/9 [00:01<00:00,  5.32it/s, aug=0.8529]Epoch 3/3: 100%|██████████| 9/9 [00:01<00:00,  5.11it/s, aug=0.8529]
+Epoch    3/3 | train: 0.8913 (t_aug: 0.8886 t_fri: 0.8939) | val: 0.9183 (v_aug: 0.8969 v_fri: 0.9397) | lr: 3.00e-04 | sup: 1.000 ★
+======================================================================
+TRAINING COMPLETE
+======================================================================
+Best self-supervised val loss: 0.8969
+======================================================================
+
+
+Evaluating on TEST set...
+Test:   0%|          | 0/3 [00:00<?, ?it/s]Test:  33%|███▎      | 1/3 [00:00<00:00,  5.65it/s]Test: 100%|██████████| 3/3 [00:00<00:00,  9.49it/s]Test: 100%|██████████| 3/3 [00:00<00:00,  8.64it/s]
+Test Loss: 0.9133  Best Val: 0.8969
+✓ Model checkpoint saved to /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825/byol_model_best.pt
+✓ Training history saved to /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825/data/training_history.npy
+
+Generating training curve plots...
+✓ Training curves saved to /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825/figures/training_curves.png
+
+Extracting projections...
+Extracting:   0%|          | 0/7 [00:00<?, ?it/s]Extracting:  29%|██▊       | 2/7 [00:00<00:00, 18.42it/s]Extracting: 100%|██████████| 7/7 [00:00<00:00, 33.93it/s]
+   Train set projections: (210, 91)
+Extracting:   0%|          | 0/3 [00:00<?, ?it/s]Extracting:  67%|██████▋   | 2/3 [00:00<00:00, 18.78it/s]Extracting: 100%|██████████| 3/3 [00:00<00:00, 23.37it/s]
+   Test set projections: (90, 91)
+
+✓ Projections saved to /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825/data/
+
+Generating UMAP visualizations...
+  Fitting UMAP on 300 samples...
+/users/mbredber/p3_SUPLAT/.venv/lib64/python3.11/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+    ✓ Saved umap_all_initial.png
+    ✓ Saved umap_all_morphology.png
+    ✓ Saved umap_all_train_labelled.png
+  Fitting UMAP on 90 samples...
+/users/mbredber/p3_SUPLAT/.venv/lib64/python3.11/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+    ✓ Saved outlier plot to /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825/figures/umap/umap_outliers.png
+
+✓ UMAP plots saved to /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825/figures/umap/
+✓ Projection clustering metrics saved to /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825/projection_metrics.json
+
+======================================================================
+SCRIPT COMPLETE
+======================================================================
+All outputs saved to: /users/mbredber/p3_SUPLAT/outputs_test/run_test_no_val_f1.0_20260527_1825
+======================================================================
+
