@@ -20,7 +20,7 @@ Usage examples:
 
     # Only specific datasets
     python embed_and_umap.py --checkpoint runs/byol_best.pt \
-        --datasets mgcls_20k mirabest radio_galaxy_dataset
+        --datasets mgcls_20k mirabest first
 
     # Colour by morphology label (labelled datasets only)
     python embed_and_umap.py --checkpoint runs/byol_best.pt \
@@ -79,7 +79,7 @@ DATASET_COLOURS = [
     "#55A868",   # green       — mgcls_5k
     "#C44E52",   # red         — mightee
     "#8172B2",   # purple      — mirabest
-    "#CCB974",   # yellow      — radio_galaxy_dataset
+    "#CCB974",   # yellow      — first
     "#64B5CD",   # light blue  — mightee_fr
 ]
 

@@ -1,5 +1,5 @@
 """
-preprocess_radio_galaxy_dataset.py
+preprocess_first.py
 
 Converts the RadioGalaxyDataset HDF5 file into 89x89 .npy crops for
 the SUPLAT BYOL encoder.
@@ -26,15 +26,15 @@ Pipeline per image:
 
 Download:
     Clone https://github.com/floriangriese/RadioGalaxyDataset and copy
-    galaxy_data_h5.h5 to data/raw/radio_galaxy_dataset/, or download
+    galaxy_data_h5.h5 to data/raw/first/, or download
     galaxy_data.zip from Zenodo 7120632 and unzip it there.
 
 Usage:
-    python preprocess_radio_galaxy_dataset.py              # use defaults
-    python preprocess_radio_galaxy_dataset.py \
-        --h5_path    data/raw/radio_galaxy_dataset/galaxy_data_h5.h5 \
-        --output_dir data/preprocessed/radio_galaxy_dataset \
-        --labels_csv data/metadata/radio_galaxy_dataset_labels.csv
+    python preprocess_first.py              # use defaults
+    python preprocess_first.py \
+        --h5_path    data/raw/first/galaxy_data_h5.h5 \
+        --output_dir data/preprocessed/first \
+        --labels_csv data/metadata/first_labels.csv
 """
 
 import os
@@ -150,17 +150,17 @@ if __name__ == "__main__":
         description="Preprocess RadioGalaxyDataset HDF5 → 89x89 .npy"
     )
     parser.add_argument("--h5_path",
-                        default="data/raw/radio_galaxy_dataset/galaxy_data_h5.h5",
+                        default="data/raw/first/galaxy_data_h5.h5",
                         help="Path to galaxy_data_h5.h5 "
-                             "(default: data/raw/radio_galaxy_dataset/galaxy_data_h5.h5)")
+                             "(default: data/raw/first/galaxy_data_h5.h5)")
     parser.add_argument("--output_dir",
-                        default="data/preprocessed/radio_galaxy_dataset",
+                        default="data/preprocessed/first",
                         help="Where to save .npy crops "
-                             "(default: data/preprocessed/radio_galaxy_dataset)")
+                             "(default: data/preprocessed/first)")
     parser.add_argument("--labels_csv",
-                        default="data/metadata/radio_galaxy_dataset_labels.csv",
+                        default="data/metadata/first_labels.csv",
                         help="Path for output labels CSV "
-                             "(default: data/metadata/radio_galaxy_dataset_labels.csv)")
+                             "(default: data/metadata/first_labels.csv)")
     args = parser.parse_args()
 
     main(args.h5_path, args.output_dir, args.labels_csv)
