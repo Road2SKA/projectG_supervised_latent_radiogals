@@ -33,7 +33,7 @@ from suplat.models.byol_models import (
     create_convnext_tiny_backbone,
 )
 from suplat.trainer.trainer import byol_loss, get_warmup_lr, get_supervision_weight, extract_embeddings_from_loader
-from suplat.utils.plotting import fit_umap, plot_umap_single, plot_umap_outliers, plot_training_curves
+from suplat.utils.plotting import fit_umap, plot_umap_single, plot_umap_outliers, plot_training_curves, plot_umap_scalar
 
 # Check device availability
 if torch.cuda.is_available(): 
@@ -529,17 +529,18 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         print(f"✓ Gradient clipping: max_norm={GRAD_CLIP}")
     print("✓ Loss: BYOL symmetric MSE")
 
+    _compute_val = test_loader is not None and F_LABEL > 0 and SUPERVISION_WEIGHT > 0
+
     history = {
         'train_loss': [],
         'train_aug_loss': [],
         'train_friend_loss': [],
-        'val_loss': [],
-        'val_aug_loss': [],
-        'val_friend_loss': [],
         'monitor_val_loss': [],
         'lr': [],
         'supervision_schedule': [],
     }
+    if _compute_val:
+        history['val_friend_loss'] = []
 
     best_val_loss = float('inf')
     best_model_state = None
@@ -637,50 +638,37 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         avg_train_friend_loss = train_friend_loss / train_friend_batches if train_friend_batches > 0 else 0.0
 
         # -------------------------------------------------------------------
-        # VALIDATION: scheduled loss + (if curriculum) monitoring loss
+        # VALIDATION: friend loss only (meaningful only when F_LABEL > 0 and sw > 0)
         # -------------------------------------------------------------------
-        if test_loader is not None:
+        if _compute_val:
             fold_model.eval()
-            val_aug_loss = 0.0
             val_friend_loss = 0.0
-            val_loss = 0.0
             monitor_loss = 0.0
 
             with torch.no_grad():
-                for x1, x1_trans, x2_friend, _ in test_loader:
-                    x1, x1_trans, x2_friend = x1.to(device), x1_trans.to(device), x2_friend.to(device)
-
-                    pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_trans)
-                    loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
+                for x1, _x1_trans, x2_friend, is_labelled in test_loader:
+                    x1 = x1.to(device)
+                    x2_friend = x2_friend.to(device)
                     pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
-                    loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
-
-                    val_aug_loss += loss_trans.item()
-                    val_friend_loss += loss_friend.item()
-                    val_loss += ((loss_trans + current_supervision_weight * loss_friend)
-                                 / (1 + current_supervision_weight)).item()
+                    val_friend_loss += byol_loss(pred1_f, pred2_f, proj1_f, proj2_f).item()
 
                     if USE_CURRICULUM:
+                        x1_trans = _x1_trans.to(device)
                         monitor_loss += _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend)
 
-            avg_val_aug_loss = val_aug_loss / len(test_loader)
             avg_val_friend_loss = val_friend_loss / len(test_loader)
-            avg_val_loss = val_loss / len(test_loader)
             avg_monitor_loss = monitor_loss / len(test_loader) if USE_CURRICULUM else None
+            best_val_loss = avg_val_friend_loss
 
-            # Test images are in training — val loss is not held-out; always keep last epoch
-            is_best = True
-            best_val_loss = avg_val_aug_loss  # for logging only
-            best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
-            best_epoch = epoch + 1
         else:
-            # --full-dataset: always keep latest epoch as best
-            avg_val_loss = avg_val_aug_loss = avg_val_friend_loss = avg_train_loss
+            avg_val_friend_loss = 0.0
             avg_monitor_loss = None
-            best_val_loss = avg_train_loss
-            best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
-            best_epoch = epoch + 1
-            is_best = True
+            best_val_loss = avg_train_aug_loss
+
+        # Test images are in the training pool — always keep last epoch as best
+        is_best = True
+        best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
+        best_epoch = epoch + 1
 
         # -------------------------------------------------------------------
         # LOGGING
@@ -689,20 +677,19 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         history['train_loss'].append(avg_train_loss)
         history['train_aug_loss'].append(avg_train_aug_loss)
         history['train_friend_loss'].append(avg_train_friend_loss)
-        history['val_loss'].append(avg_val_loss)
-        history['val_aug_loss'].append(avg_val_aug_loss)
-        history['val_friend_loss'].append(avg_val_friend_loss)
         history['monitor_val_loss'].append(avg_monitor_loss)
         history['lr'].append(current_lr)
         history['supervision_schedule'].append(current_supervision_weight)
+        if _compute_val:
+            history['val_friend_loss'].append(avg_val_friend_loss)
 
         best_marker = ' ★' if is_best else ''
         sup_str = f" | sup: {current_supervision_weight:.3f}"
         mon_str = f" | mon: {avg_monitor_loss:.4f}" if USE_CURRICULUM else ""
-        print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS}"
-              f" | train: {avg_train_loss:.4f} (t_aug: {avg_train_aug_loss:.4f} t_fri: {avg_train_friend_loss:.4f})"
-              f" | val: {avg_val_loss:.4f} (v_aug: {avg_val_aug_loss:.4f} v_fri: {avg_val_friend_loss:.4f})"
-              f"{mon_str} | lr: {current_lr:.2e}{sup_str}{best_marker}")
+        _loss_str = f"t_aug: {avg_train_aug_loss:.4f}"
+        if avg_train_friend_loss > 0 and _compute_val:
+            _loss_str += f"  t_fri: {avg_train_friend_loss:.4f}  v_fri: {avg_val_friend_loss:.4f}"
+        print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | {_loss_str}{mon_str} | lr: {current_lr:.2e}{sup_str}{best_marker}")
 
         if epoch >= WARMUP_EPOCHS:
             scheduler.step()
@@ -814,7 +801,8 @@ else:
                                        num_workers=_nw, pin_memory=use_cuda,
                                        collate_fn=byol_collate_fn)
 
-# All images available to BYOL — test images join as pure unlabelled
+# Test images always enter the BYOL training pool regardless of F_LABEL or supervision_weight.
+# This is intentional: all images should have their representations learned.
 if test_images is not None:
     test_unlab_ds = UnlabelledBYOLDataset(test_images, transform=byol_strong_aug)
     _train_combined = ConcatDataset([_train_combined, test_unlab_ds])
@@ -1039,6 +1027,49 @@ for _item in _items:
                 save_path=UMAP_DIR / f'umap_all_{_col}{_suffix}.png',
                 split_masks=_split_masks_all,
             )
+
+        # ── Scalar colourings: brightness and label count ─────────────────────
+        _img_parts = []
+        if unlab_projections is not None:
+            _img_parts.append(unlabelled_images[:_n_ul])
+        _img_parts.append(train_images[:_n_tr])
+        if test_projections is not None:
+            _img_parts.append(test_images[:_n_te])
+        _all_images_arr = np.concatenate(_img_parts, axis=0)
+
+        _all_pixel_sum = _all_images_arr.sum(axis=(1, 2))
+        plot_umap_scalar(
+            _all_2d, _all_pixel_sum,
+            title='All — brightness',
+            cbar_label='Total pixel sum',
+            save_path=UMAP_DIR / f'umap_all_brightness{_suffix}.png',
+            cmap='plasma',
+        )
+
+        # Interest score (1–5) from tier assignment, mirroring Protege config.
+        # Label column order matches labels_filtered.npy:
+        # 0=fri,1=frii,2=hybrid,3=spiral,4=relaxed,5=cshaped,6=sshaped,7=misaligned,
+        # 8=wings,9=xshaped,10=straight,11=multihotspots,12=continuous,13=banding,
+        # 14=onesided,15=restarted,16=cluster,17=merger,18=diffuse,19=unknown
+        _INTEREST_TIERS = [
+            (2, [0, 1, 2, 10, 11, 12]),    # fri, frii, hybrid, straight, multihotspots, continuous
+            (3, [3, 4, 5, 7, 8, 13, 14, 15]),  # spiral, relaxed, cshaped, misaligned, wings, banding, onesided, restarted
+            (4, [6, 16, 17, 18]),           # sshaped, cluster, merger, diffuse
+            (5, [9, 19]),                   # xshaped, unknown
+        ]
+        _lf_b = _all_lf.astype(bool)
+        _interest = np.ones(len(_all_lf), dtype=float)
+        for _score, _cols in _INTEREST_TIERS:
+            _interest[_lf_b[:, _cols].any(axis=1)] = _score
+        plot_umap_scalar(
+            _all_2d, _interest,
+            title='All — interest score',
+            cbar_label='Interest score',
+            save_path=UMAP_DIR / f'umap_all_interest{_suffix}.png',
+            cmap='plasma',
+            vmin=1, vmax=5,
+            cbar_ticks=[1, 2, 3, 4, 5],
+        )
 
         # ── "test" UMAP: test only ────────────────────────────────────────────
         if test_projections is not None:
