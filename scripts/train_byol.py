@@ -581,15 +581,9 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         train_friend_batches = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        if epoch == 0:
-            _e0_islabelled_fracs = []
-            _e0_lab_sub_sizes = []
-        for batch_idx, (x1, x1_aug, x2_friend, is_labelled) in enumerate(pbar):
+        for x1, x1_aug, x2_friend, is_labelled in pbar:
             x1, x1_aug = x1.to(device), x1_aug.to(device)
             # is_labelled stays on CPU for x2_friend indexing
-
-            if epoch == 0:
-                _e0_islabelled_fracs.append(is_labelled.float().mean().item())
 
             # L_aug: ALL samples
             pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_aug)
@@ -605,8 +599,6 @@ def train_fold(train_loader, test_loader, extract_loader=None):
                 loss = loss + current_supervision_weight * loss_friend
                 train_friend_loss += loss_friend.item()
                 train_friend_batches += 1
-                if epoch == 0:
-                    _e0_lab_sub_sizes.append(int(is_labelled.sum()))
 
             loss = loss / (1 + current_supervision_weight)
 
@@ -621,17 +613,6 @@ def train_fold(train_loader, test_loader, extract_loader=None):
             train_loss += loss.item()
             train_aug_loss += loss_trans.item()
             pbar.set_postfix({'aug': f'{loss_trans.item():.4f}'})
-
-        if epoch == 0:
-            _mean_frac = sum(_e0_islabelled_fracs) / len(_e0_islabelled_fracs)
-            print(f"[DIAG epoch 1] mean is_labelled fraction: {_mean_frac:.4f} "
-                  f"(expected ~{F_LABEL:.4f})")
-            if _e0_lab_sub_sizes:
-                print(f"[DIAG epoch 1] labelled sub-batch sizes: "
-                      f"min={min(_e0_lab_sub_sizes)}, "
-                      f"mean={sum(_e0_lab_sub_sizes)/len(_e0_lab_sub_sizes):.1f}")
-            else:
-                print("[DIAG epoch 1] no batches triggered L_friend (is_labelled.sum() always < 8)")
 
         avg_train_loss = train_loss / len(train_loader)
         avg_train_aug_loss = train_aug_loss / len(train_loader)
@@ -666,7 +647,6 @@ def train_fold(train_loader, test_loader, extract_loader=None):
             best_val_loss = avg_train_aug_loss
 
         # Test images are in the training pool — always keep last epoch as best
-        is_best = True
         best_model_state = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
         best_epoch = epoch + 1
 
@@ -683,13 +663,12 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         if _compute_val:
             history['val_friend_loss'].append(avg_val_friend_loss)
 
-        best_marker = ' ★' if is_best else ''
         sup_str = f" | sup: {current_supervision_weight:.3f}"
         mon_str = f" | mon: {avg_monitor_loss:.4f}" if USE_CURRICULUM else ""
         _loss_str = f"t_aug: {avg_train_aug_loss:.4f}"
         if avg_train_friend_loss > 0 and _compute_val:
             _loss_str += f"  t_fri: {avg_train_friend_loss:.4f}  v_fri: {avg_val_friend_loss:.4f}"
-        print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | {_loss_str}{mon_str} | lr: {current_lr:.2e}{sup_str}{best_marker}")
+        print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | {_loss_str}{mon_str} | lr: {current_lr:.2e}{sup_str}")
 
         if epoch >= WARMUP_EPOCHS:
             scheduler.step()
@@ -1046,16 +1025,15 @@ for _item in _items:
             cmap='plasma',
         )
 
-        # Interest score (1–5) from tier assignment, mirroring Protege config.
+        # Interest score (1–4) from tier assignment, mirroring Protege config.
         # Label column order matches labels_filtered.npy:
         # 0=fri,1=frii,2=hybrid,3=spiral,4=relaxed,5=cshaped,6=sshaped,7=misaligned,
         # 8=wings,9=xshaped,10=straight,11=multihotspots,12=continuous,13=banding,
         # 14=onesided,15=restarted,16=cluster,17=merger,18=diffuse,19=unknown
         _INTEREST_TIERS = [
-            (2, [0, 1, 2, 10, 11, 12]),    # fri, frii, hybrid, straight, multihotspots, continuous
-            (3, [3, 4, 5, 7, 8, 13, 14, 15]),  # spiral, relaxed, cshaped, misaligned, wings, banding, onesided, restarted
-            (4, [6, 16, 17, 18]),           # sshaped, cluster, merger, diffuse
-            (5, [9, 19]),                   # xshaped, unknown
+            (2, [4, 5, 7, 8, 11, 13, 14, 15]),  # relaxed, cshaped, misaligned, wings, multihotspots, banding, onesided, restarted
+            (3, [3, 6, 18]),                     # spiral, sshaped, diffuse
+            (4, [9, 16, 17, 19]),                # xshaped, cluster, merger, unknown
         ]
         _lf_b = _all_lf.astype(bool)
         _interest = np.ones(len(_all_lf), dtype=float)
@@ -1067,8 +1045,8 @@ for _item in _items:
             cbar_label='Interest score',
             save_path=UMAP_DIR / f'umap_all_interest{_suffix}.png',
             cmap='plasma',
-            vmin=1, vmax=5,
-            cbar_ticks=[1, 2, 3, 4, 5],
+            vmin=1, vmax=4,
+            cbar_ticks=[1, 2, 3, 4],
         )
 
         # ── "test" UMAP: test only ────────────────────────────────────────────
@@ -1098,6 +1076,19 @@ for _item in _items:
         _metric_splits = [('train', train_projections, train_labels[:len(train_projections)])]
         if test_projections is not None:
             _metric_splits.append(('test', test_projections, test_labels[:len(test_projections)]))
+        # "all" = unlabelled train (zero labels) + labelled train + test
+        _all_m_projs  = []
+        _all_m_labels = []
+        if unlab_projections is not None:
+            _all_m_projs.append(unlab_projections)
+            _all_m_labels.append(np.zeros((len(unlab_projections), train_labels.shape[1]),
+                                          dtype=train_labels.dtype))
+        _all_m_projs.append(train_projections)
+        _all_m_labels.append(train_labels[:len(train_projections)])
+        if test_projections is not None:
+            _all_m_projs.append(test_projections)
+            _all_m_labels.append(test_labels[:len(test_projections)])
+        _metric_splits.append(('all', np.concatenate(_all_m_projs), np.concatenate(_all_m_labels)))
         for split, projections, split_labels in _metric_splits:
             metrics[split] = {'fri_vs_frii': {}, 'base_classes': {}}
             fri_only = (split_labels[:, 0] == 1) & (split_labels[:, 1] == 0)

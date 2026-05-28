@@ -3,7 +3,7 @@ run_protege_sweep.py — Protege GP active-learning sweep over BYOL run director
 
 For each run directory matching --run-glob under --outputs-root:
   1. Load labelled + unlabelled train projections and indices.
-  2. Build source names, labels (tier-scored human_label 1–5), and PCA features.
+  2. Build source names, labels (tier-scored human_label 1–4), and PCA features.
   3. Seed anomaly_scores from the labelled training set, run ScoreConverter.
   4. Run GP active learning (Protege) querying the entire unlabelled pool.
   5. Compute recall-curve AUC over the unqueried eval set.
@@ -42,11 +42,10 @@ LABEL_COLS = [
     "restarted", "cluster", "merger", "diffuse", "unknown",
 ]
 
-SCORE_5 = ["xshaped", "unknown"]
-SCORE_4 = ["cluster", "merger", "diffuse", "sshaped"]
-SCORE_3 = ["restarted", "onesided", "banding", "cshaped", "wings", "misaligned", "spiral", "relaxed"]
-SCORE_2 = ["fri", "frii", "hybrid", "straight", "multihotspots", "continuous"]
-TIERS   = [(5, SCORE_5), (4, SCORE_4), (3, SCORE_3), (2, SCORE_2)]
+SCORE_4 = ["xshaped", "unknown", "cluster", "merger"]
+SCORE_3 = ["diffuse", "sshaped", "spiral"]
+SCORE_2 = ["restarted", "onesided", "banding", "cshaped", "wings", "misaligned", "multihotspots", "relaxed"]
+TIERS   = [(4, SCORE_4), (3, SCORE_3), (2, SCORE_2)]
 
 
 # ---------------------------------------------------------------------------
