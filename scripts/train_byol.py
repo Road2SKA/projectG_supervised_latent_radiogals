@@ -6,7 +6,7 @@ Supports convnet, efficientnet-b0, resnet18, resnet50, and convnext-tiny archite
 
 Projector modes:
   mlp  — Trainable MLP projector, EMA-updated with target network
-  pca  — PCA projector re-fitted after each epoch (fixed n_components = --projection-dim)
+  pca  — PCA projector re-fitted after each epoch (--projection-dim D for fixed D components, or 95% variance threshold if omitted)
   none — No projector; encoder output (1280-dim) fed directly into predictor
 """
 
@@ -134,8 +134,9 @@ def parse_args():
                     help="Projector type: 'none' (no projector, default), 'mlp' (learned MLP head), 'pca' (PCA re-fitted each epoch)")
     ap.add_argument("--pca-verbose", action="store_true", default=False,
                     help="Print PCA variance-explained and drift diagnostics each epoch (pca mode only, off by default)")
-    ap.add_argument("--projection-dim", type=int, default=256,
-                    help="Projection head output dimension; for pca mode, sets fixed n_components (default: 256)")
+    ap.add_argument("--projection-dim", type=int, default=None,
+                    help="Projection head output dimension; for pca mode, sets fixed n_components. "
+                         "If omitted, pca mode uses 95%% variance threshold (default: None)")
     ap.add_argument("--hidden-dim", type=int, default=4096,
                     help="Hidden layer dimension in MLP heads (default: 4096)")
 
@@ -297,7 +298,10 @@ print(f"{'='*70}")
 print(f"Model type:     {MODEL_TYPE}")
 print(f"Projector:      {PROJECTOR}")
 if PROJECTOR == 'pca':
-    print(f"PCA components: {PROJECTION_DIM} (fixed, re-fitted each epoch)")
+    if PROJECTION_DIM is not None:
+        print(f"PCA components: {PROJECTION_DIM} (fixed, re-fitted each epoch)")
+    else:
+        print(f"PCA components: 95% variance threshold (re-fitted each epoch)")
 elif PROJECTOR == 'mlp':
     print(f"Projection dim: {PROJECTION_DIM}")
 print(f"Hidden dim:     {HIDDEN_DIM}")
@@ -418,10 +422,10 @@ def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
     return (loss_trans + loss_friend).item()
 
 
-def refit_pca(fold_model, extract_loader, device, verbose=False):
+def refit_pca(fold_model, extract_loader, device, hidden_dim, verbose=False):
     """
     Re-fit PCA projector after an epoch using the current online encoder's outputs.
-    Does NOT rebuild the predictor — projection dim is fixed so it remains valid.
+    Rebuilds the predictor if the PCA output dimension changes (variance-threshold mode).
     """
     fold_model.eval()
     enc_outputs = []
@@ -430,6 +434,7 @@ def refit_pca(fold_model, extract_loader, device, verbose=False):
             enc_outputs.append(fold_model.online_encoder(x1.to(device)).float().cpu())
     embeddings = torch.cat(enc_outputs, dim=0)
 
+    old_dim = fold_model.online_projector.out_dim if fold_model.online_projector._fitted else None
     old_components = fold_model.online_projector.components_.cpu().clone() if fold_model.online_projector._fitted else None
 
     fold_model.online_projector.fit(embeddings)
@@ -438,14 +443,22 @@ def refit_pca(fold_model, extract_loader, device, verbose=False):
     for param in fold_model.target_projector.parameters():
         param.requires_grad = False
 
+    new_dim = fold_model.online_projector.out_dim
+    if new_dim != old_dim:
+        fold_model.online_predictor = PredictionHead(
+            in_dim=new_dim, hidden_dim=hidden_dim,
+            out_dim=new_dim, bn_momentum=0.1,
+        ).to(device)
+
     if verbose:
         var_exp = fold_model.online_projector.variance_explained_
         drift_str = ""
-        if old_components is not None:
+        if old_components is not None and new_dim == old_dim:
             drift = (fold_model.online_projector.components_.cpu() - old_components).norm().item()
             drift_str = f"  drift: {drift:.4f}"
-        print(f"  [PCA] Re-fitted: {fold_model.online_projector.out_dim} components  "
-              f"var_explained: {var_exp:.1%}{drift_str}")
+        dim_str = f"  (dim: {old_dim} → {new_dim})" if new_dim != old_dim else ""
+        print(f"  [PCA] Re-fitted: {new_dim} components  "
+              f"var_explained: {var_exp:.1%}{drift_str}{dim_str}")
 
     fold_model.train()
 
@@ -505,15 +518,18 @@ def train_fold(train_loader, test_loader, extract_loader=None):
 
     # -------------------------------------------------------------------------
     # PCA PROJECTOR SETUP (pca mode only)
-    # For pca mode: replace variance-based PCA projectors with fixed-n_components
-    # versions, do an initial fit, and build the predictor.
+    # Do an initial fit and build the predictor. If --projection-dim is given,
+    # uses fixed n_components; otherwise falls back to 95% variance threshold.
     # -------------------------------------------------------------------------
     if PROJECTOR == 'pca':
         assert extract_loader is not None, "extract_loader required for pca projector"
 
-        # Replace projectors with fixed-n_components variants
-        fold_model.online_projector = PCAProjection(n_components=PROJECTION_DIM)
-        fold_model.target_projector = PCAProjection(n_components=PROJECTION_DIM)
+        if PROJECTION_DIM is not None:
+            fold_model.online_projector = PCAProjection(n_components=PROJECTION_DIM)
+            fold_model.target_projector = PCAProjection(n_components=PROJECTION_DIM)
+        else:
+            fold_model.online_projector = PCAProjection(variance_threshold=0.95)
+            fold_model.target_projector = PCAProjection(variance_threshold=0.95)
         fold_model = fold_model.to(device)
 
         # Collect encoder outputs for initial fit
@@ -531,7 +547,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         for param in fold_model.target_projector.parameters():
             param.requires_grad = False
 
-        # Build predictor now that PCA output dim is known (== PROJECTION_DIM)
+        # Build predictor now that PCA output dim is known
         pca_out_dim = fold_model.online_projector.out_dim
         fold_model.online_predictor = PredictionHead(
             in_dim=pca_out_dim, hidden_dim=HIDDEN_DIM,
@@ -564,8 +580,11 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         print(f"Projector:            MLP -> {PROJECTION_DIM}-dim projection")
         print(f"Predictor output:     {PROJECTION_DIM}-dim prediction")
     elif PROJECTOR == 'pca':
-        print(f"Projector:            PCA (fixed {PROJECTION_DIM} components, re-fitted each epoch)")
-        print(f"Predictor output:     {PROJECTION_DIM}-dim prediction")
+        if PROJECTION_DIM is not None:
+            print(f"Projector:            PCA (fixed {PROJECTION_DIM} components, re-fitted each epoch)")
+        else:
+            print(f"Projector:            PCA (95% variance threshold, re-fitted each epoch)")
+        print(f"Predictor output:     {pca_out_dim}-dim prediction (initial)")
     else:
         print("Projector:            none (encoder -> predictor directly)")
         print(f"Predictor output:     {_enc_dim}-dim prediction")
@@ -693,7 +712,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         # PCA RE-FIT (pca mode only): update projector with current encoder
         # -------------------------------------------------------------------
         if PROJECTOR == 'pca':
-            refit_pca(fold_model, extract_loader, device, verbose=args.pca_verbose)
+            refit_pca(fold_model, extract_loader, device, hidden_dim=HIDDEN_DIM, verbose=args.pca_verbose)
 
         # -------------------------------------------------------------------
         # VALIDATION
