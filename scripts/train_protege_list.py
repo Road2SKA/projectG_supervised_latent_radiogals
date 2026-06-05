@@ -180,7 +180,7 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
     If train_idx is provided, also computes train-set curves (complexity_train /
     ellipses_train) using the same fitted IsoForest.
     """
-    out_path = outputs_root / f"baselines_{data_seed}.json"
+    out_path = outputs_root / "anomaly_baselines" / f"baselines_{data_seed}.json"
     test_idx_path = data_dir / "test_idx.npy"
     test_hash = hashlib.sha256(open(test_idx_path, "rb").read()).hexdigest()
 
@@ -215,8 +215,8 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
 
     # ── Baseline 2: Ellipses + IsolationForest on all images ─────────────────
     images    = np.load(IMAGES_PATH).astype(np.float32) / 255.0
-    ell_cache = outputs_root / f"_ell_cache_{data_seed}"
-    ell_cache.mkdir(exist_ok=True)
+    ell_cache = outputs_root / "anomaly_baselines" / f"_ell_cache_{data_seed}"
+    ell_cache.mkdir(parents=True, exist_ok=True)
 
     ds  = _NumpyImageDataset(images, output_dir=str(ell_cache), force_rerun=False)
     ext = _sf.EllipseFitFeatures(percentiles=[90, 70, 50, 0], channel=0,
@@ -271,6 +271,7 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
         print(f"  baselines: train complexity AUC={auc_comp_tr:.4f}  "
               f"train ellipses AUC={auc_ell_tr:.4f}", flush=True)
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as fh:
         json.dump(result, fh)
     return result

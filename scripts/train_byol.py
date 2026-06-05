@@ -24,6 +24,9 @@ import json
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
 from torch.utils.data import DataLoader, ConcatDataset
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
@@ -175,6 +178,11 @@ def parse_args():
 # CONFIGURATION
 # =============================================================================
 args = parse_args()
+
+if args.projector == 'mlp' and args.projection_dim is None:
+    import sys
+    print("ERROR: --projection-dim is required when --projector mlp", file=sys.stderr)
+    sys.exit(1)
 
 # Model hyperparameters
 BATCH_SIZE = args.batch_size
@@ -1029,6 +1037,49 @@ for _item in _items:
         unlab_projections = None
 
     print(f"\nProjections saved to {DATA_DIR}/")
+
+    # =========================================================================
+    # PCA VARIANCE ANALYSIS  (dimensionality collapse diagnostic)
+    # =========================================================================
+    print(f"\nComputing PCA variance analysis{_label}...")
+    _pca_all = np.concatenate(
+        [p for p in [unlab_projections, train_projections, test_projections] if p is not None]
+    )
+    _n_pca_components = min(128, _pca_all.shape[1])
+    _pca_diag = PCA(n_components=_n_pca_components, random_state=SEED)
+    _pca_diag.fit(_pca_all)
+
+    _cumvar   = np.cumsum(_pca_diag.explained_variance_ratio_)
+    _n_95     = int(np.searchsorted(_cumvar, 0.95)) + 1 if _cumvar[-1] >= 0.95 else f">{_n_pca_components}"
+    _n_99     = int(np.searchsorted(_cumvar, 0.99)) + 1 if _cumvar[-1] >= 0.99 else f">{_n_pca_components}"
+    print(f"  Projection dim : {_pca_all.shape[1]}d  ({len(_pca_all)} sources)")
+    print(f"  Dims for 95%% variance : {_n_95}")
+    print(f"  Dims for 99%% variance : {_n_99}")
+    print(f"  Variance in first {_n_pca_components} components : {_cumvar[-1]:.4f}")
+
+    fig, ax = plt.subplots(figsize=(max(6, _n_pca_components * 0.25), 4))
+    ax.bar(np.arange(1, _n_pca_components + 1),
+           _pca_diag.explained_variance_ratio_ * 100,
+           color="tab:blue", width=1.0)
+    if isinstance(_n_95, int):
+        ax.axvline(_n_95, color="tab:orange", linestyle="--", linewidth=1.5,
+                   label=f"95% variance ({_n_95}d)")
+    if isinstance(_n_99, int):
+        ax.axvline(_n_99, color="tab:red", linestyle=":", linewidth=1.5,
+                   label=f"99% variance ({_n_99}d)")
+    ax.set_xlabel("PCA component")
+    ax.set_ylabel("Explained variance (%)")
+    ax.set_title(
+        f"Latent space PCA variance  —  {_pca_all.shape[1]}d projection\n"
+        f"95% in {_n_95}d  |  99% in {_n_99}d  |  {_n_pca_components}-component coverage: {_cumvar[-1]:.3f}"
+    )
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    _pca_fig_path = FIGURES_DIR / f"pca_variance{_suffix}.png"
+    fig.savefig(_pca_fig_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  PCA variance plot saved to {_pca_fig_path}")
 
     # =========================================================================
     # UMAP VISUALIZATIONS
