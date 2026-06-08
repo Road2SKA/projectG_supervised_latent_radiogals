@@ -1020,7 +1020,7 @@ for _item in _items:
         # Interest score (1–4) from tier assignment, mirroring Protege config.
         _lf_b    = _all_lf.astype(bool)
         _interest = np.ones(len(_all_lf), dtype=float)
-        for _score, _cols in TIERS:
+        for _score, _cols in reversed(TIERS):
             _col_idx = [LABEL_COLS.index(c) for c in _cols]
             _interest[_lf_b[:, _col_idx].any(axis=1)] = _score
         plot_umap_scalar(
@@ -1149,14 +1149,14 @@ if args.run_protege:
     # --- Build human_label for train ---
     _labels_train_df = pd.DataFrame(_labels_all[cat_idx].astype(bool), columns=LABEL_COLS)
     _human_train = np.ones(len(_labels_train_df), dtype=int)
-    for _sv, _sc in TIERS:
+    for _sv, _sc in reversed(TIERS):
         _human_train[_labels_train_df[_sc].any(axis=1).values] = _sv
     labels_df = pd.DataFrame({"human_label": _human_train}, index=train_source_names)
 
     # --- Build human_label for test ---
     _labels_test_df = pd.DataFrame(_labels_all[test_idx_prot].astype(bool), columns=LABEL_COLS)
     _human_test = np.ones(len(_labels_test_df), dtype=int)
-    for _sv, _sc in TIERS:
+    for _sv, _sc in reversed(TIERS):
         _human_test[_labels_test_df[_sc].any(axis=1).values] = _sv
     test_labels_df = pd.DataFrame({"human_label": _human_test}, index=test_source_names)
 

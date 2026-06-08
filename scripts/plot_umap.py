@@ -69,6 +69,48 @@ DATASET_COLORS = [
 # RUN-DIR MODE
 # =============================================================================
 
+def plot_umap_minimal(embedding_2d, all_lf, save_path):
+    """Dots-on-blue UMAP: no axes, no text, no grid."""
+    from suplat.utils.plotting import get_pure_class_colors
+
+    BG_COLOR   = '#0a192f'            # dark navy background
+    NONPURE_C  = '#ffffff'            # white for multi/unclassified
+    CLASS_COLORS = [                  # visible on dark blue
+        '#FFD700',  # FRI             — gold
+        '#FF6B6B',  # FRII            — coral red
+        '#69FF94',  # Hybrids         — lime green
+        '#FF9DE2',  # Spirals         — pink
+        '#00CFFF',  # Relaxed doubles — cyan
+    ]
+
+    label_start, label_end = LABEL_RANGES['initial']
+    type_labels = all_lf[:, label_start:label_end]
+    colors, _ = get_pure_class_colors(type_labels, 'initial', CLASS_NAMES)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.axis('off')
+
+    mask = colors == -1
+    if np.any(mask):
+        ax.scatter(embedding_2d[mask, 0], embedding_2d[mask, 1],
+                   c=NONPURE_C, s=8, alpha=0.15, linewidths=0, zorder=1)
+
+    for i, color in enumerate(CLASS_COLORS):
+        mask = colors == i
+        if np.any(mask):
+            ax.scatter(embedding_2d[mask, 0], embedding_2d[mask, 1],
+                       c=color, s=10, alpha=0.85, linewidths=0, zorder=2)
+
+    plt.tight_layout(pad=0)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight',
+                facecolor=BG_COLOR, edgecolor='none')
+    print(f"    Saved {save_path.name}")
+    plt.close()
+
+
 def run_dir_main(args):
     """Reproduce train_byol.py UMAP plots from a completed run directory."""
     from suplat.utils.plotting import fit_umap, plot_umap_single, plot_umap_outliers
@@ -77,6 +119,59 @@ def run_dir_main(args):
     data_dir = run_dir / 'data'
     umap_dir = run_dir / 'figures' / 'umap'
     umap_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Fast path: --minimal with pre-computed coords ─────────────────────────
+    coords_path = data_dir / 'umap_all_coords.npy'
+    if args.minimal and coords_path.exists():
+        print(f"Loading pre-computed UMAP coordinates from {coords_path}...")
+        _all_2d = np.load(coords_path)
+
+        labelled_train_idx = np.load(data_dir / 'labelled_train_idx.npy')
+        test_idx           = np.load(data_dir / 'test_idx.npy')
+
+        labels_path = args.data_dir / 'labels_filtered.npy'
+        if not labels_path.exists():
+            print(f"ERROR: labels file not found: {labels_path}", file=sys.stderr)
+            sys.exit(1)
+        labels_full = np.load(labels_path)
+
+        # Use mmap to get projection lengths without loading full arrays
+        _tr_proj_path = (data_dir / 'train_projections.npy'
+                         if (data_dir / 'train_projections.npy').exists()
+                         else data_dir / 'labelled_train_projections.npy')
+        _n_tr = len(np.load(_tr_proj_path, mmap_mode='r'))
+
+        _lf_train = labels_full[labelled_train_idx][:_n_tr]
+        _lf_test  = labels_full[test_idx]
+
+        # Optional val split
+        _val_idx_path = data_dir / 'val_idx.npy'
+        if _val_idx_path.exists():
+            val_idx = np.load(_val_idx_path)
+            _n_va = len(np.load(data_dir / 'val_projections.npy', mmap_mode='r'))
+            _lf_val = labels_full[val_idx][:_n_va]
+        else:
+            _lf_val = None
+
+        _unlab_proj_path = data_dir / 'unlabelled_train_projections.npy'
+        if _unlab_proj_path.exists():
+            _n_ul = len(np.load(_unlab_proj_path, mmap_mode='r'))
+        else:
+            _n_ul = 0
+
+        parts = []
+        if _n_ul > 0:
+            parts.append(np.zeros((_n_ul, _lf_train.shape[1]), dtype=_lf_train.dtype))
+        parts.append(_lf_train)
+        if _lf_val is not None:
+            parts.append(_lf_val)
+        parts.append(_lf_test)
+        _all_lf = np.concatenate(parts)
+
+        print(f"  Coords: {_all_2d.shape}  Labels: {_all_lf.shape}")
+        plot_umap_minimal(_all_2d, _all_lf, umap_dir / 'umap_all_initial_minimal.png')
+        print(f"\nMinimal UMAP saved to {umap_dir}/")
+        return
 
     # ── Load projections ──────────────────────────────────────────────────────
     print("Loading projections...")
@@ -177,6 +272,9 @@ def run_dir_main(args):
                 save_prefix='umap_outliers',
             )
 
+    if args.minimal:
+        plot_umap_minimal(_all_2d, _all_lf, umap_dir / 'umap_all_initial_minimal.png')
+
     print(f"\nUMAP plots saved to {umap_dir}/")
 
 
@@ -230,7 +328,6 @@ def plot_by_dataset(xy, ds_idx, datasets, output_path):
     ax.set_xlabel("UMAP 1"); ax.set_ylabel("UMAP 2")
     ax.set_title("UMAP — coloured by dataset")
     ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=12)
-    ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -255,7 +352,6 @@ def plot_by_label(xy, labels, output_path):
     ax.set_xlabel("UMAP 1"); ax.set_ylabel("UMAP 2")
     ax.set_title("UMAP — coloured by label")
     ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=12)
-    ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -292,6 +388,9 @@ def main():
                          f"(default: {DEFAULT_DATA_DIR})")
     ap.add_argument("--no-outlier-plot", action="store_true",
                     help="Skip the outlier image panel (run-dir mode only)")
+    ap.add_argument("--minimal", action="store_true",
+                    help="Save a minimal dots-on-blue plot (umap_all_initial_minimal.png). "
+                         "Uses pre-computed umap_all_coords.npy if available.")
     ap.add_argument("--umap-n-neighbors", type=int, default=30,
                     help="UMAP n_neighbors (default: 30, same as train_byol.py)")
     ap.add_argument("--umap-min-dist",    type=float, default=0.1,
