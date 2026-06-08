@@ -133,7 +133,7 @@ def _plot_umap_ax(
     ax.set_xlabel('UMAP 1')
     ax.set_ylabel('UMAP 2')
     ax.set_aspect('equal', adjustable='datalim')
-    ax.grid(True, alpha=0.3)
+
 
     _title = title if title is not None else class_type.capitalize()
     ax.text(0.5, 0.97, _title, transform=ax.transAxes,
@@ -226,7 +226,7 @@ def plot_umap_single(
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
                           alpha=0.7, edgecolor='none'))
         ax.legend(fontsize=13)
-        ax.grid(True, alpha=0.3)
+
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -277,7 +277,7 @@ def plot_umap_scalar(
     ax.set_xlabel('UMAP 1')
     ax.set_ylabel('UMAP 2')
     ax.set_aspect('equal', adjustable='datalim')
-    ax.grid(True, alpha=0.3)
+
     ax.text(0.5, 0.97, f'{title} ({n_total})', transform=ax.transAxes,
             ha='center', va='top', fontsize=11, fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
@@ -458,7 +458,7 @@ def plot_umap_overlay(
         ax.set_ylabel('UMAP 2')
         ax.set_title(f'{class_type.capitalize()} | test in train space')
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11)
-        ax.grid(True, alpha=0.3)
+
 
     plt.tight_layout()
     save_path = OUTPUT_DIR / f'{save_prefix}.png'
