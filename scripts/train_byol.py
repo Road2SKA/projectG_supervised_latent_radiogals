@@ -28,7 +28,7 @@ import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from tqdm import tqdm
 
@@ -85,6 +85,11 @@ def parse_args():
     ap.add_argument("--weighting", type=str, default="closest",
                     choices=["closest", "ponderate"],
                     help="Weight function for sampling pairs: 'closest' or 'ponderate' (default: closest)")
+    ap.add_argument("--class-weighting", type=str, default=None,
+                    choices=["score", "label"],
+                    help="Oversample rare classes: 'score' (by interest tier 1-4) "
+                         "or 'label' (by inverse frequency of each binary label). "
+                         "Default: None (uniform shuffle).")
     ap.add_argument("--f-label", type=float, default=1.0,
                     help="Fraction of training split that receives labels (default: 1.0 = fully supervised)")
     ap.add_argument("--supervision-weight", type=float, default=1.0,
@@ -205,6 +210,7 @@ USE_COMPILE = args.compile
 # Dataset configuration
 DATASET_NAME = args.dataset
 F_LABEL = args.f_label
+CLASS_WEIGHTING = args.class_weighting
 
 # Data subsampling
 SUBSAMPLE_SIZE = args.subsample
@@ -323,6 +329,7 @@ print(f"Warmup epochs:  {WARMUP_EPOCHS}")
 print(f"Grad clip:      {GRAD_CLIP if GRAD_CLIP else 'None'}")
 print(f"EMA decay:      {EMA_DECAY}")
 print(f"Weighting:      {args.weighting}")
+print(f"Class weighting:{CLASS_WEIGHTING if CLASS_WEIGHTING else 'None (uniform)'}")
 print(f"F_label:        {F_LABEL}")
 print(f"Num workers:    {NUM_WORKERS}")
 print(f"Compile:        {'enabled' if USE_COMPILE else 'disabled'}")
@@ -571,7 +578,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
 
     if USE_COMPILE and MODEL_TYPE in ("efficientnet-b0", "resnet18", "resnet50", "convnext-tiny"):
         print("Compiling model with torch.compile() ...")
-        fold_model = torch.compile(fold_model, backend="cudagraphs")
+        fold_model = torch.compile(fold_model, backend="aot_eager", dynamic=True)
 
     total_params = sum(p.numel() for p in fold_model.parameters())
     trainable_params = sum(p.numel() for p in fold_model.parameters() if p.requires_grad)
@@ -856,22 +863,22 @@ print(f"  Test:  {len(test_images)}")
 # Datasets
 print("\nCreating datasets...")
 print(f"  Augmentation: {args.augmentation}")
-unlab_ds = UnlabelledBYOLDataset(unlabelled_images, transform=byol_strong_aug)
+train_unlab_ds = UnlabelledBYOLDataset(unlabelled_images, transform=byol_strong_aug)
 
 _nw = NUM_WORKERS if use_cuda else 0
 
 if len(labelled_images) > 0:
     lab_df = pd.DataFrame(labelled_labels)
-    lab_ds = BYOLSupDataset(tags_data=lab_df, img_data=labelled_images,
+    train_lab_ds = BYOLSupDataset(tags_data=lab_df, img_data=labelled_images,
                              transform=byol_strong_aug, friend_transform=byol_strong_aug,
                              weightfunc=WEIGHTING_FUNC, p_pair_from_class=0.5)
-    _train_combined = ConcatDataset([lab_ds, unlab_ds])
-    train_extract_loader = DataLoader(lab_ds, batch_size=BATCH_SIZE, shuffle=False,
+    _train_combined = ConcatDataset([train_lab_ds, train_unlab_ds])
+    train_extract_loader = DataLoader(train_lab_ds, batch_size=BATCH_SIZE, shuffle=False,
                                        num_workers=_nw, pin_memory=use_cuda)
 else:
-    lab_ds = None
-    _train_combined = unlab_ds
-    train_extract_loader = DataLoader(unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
+    train_lab_ds = None
+    _train_combined = train_unlab_ds
+    train_extract_loader = DataLoader(train_unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
                                        num_workers=_nw, pin_memory=use_cuda,
                                        collate_fn=byol_collate_fn)
 
@@ -879,10 +886,72 @@ else:
 test_unlab_ds = UnlabelledBYOLDataset(test_images, transform=byol_strong_aug)
 _train_combined = ConcatDataset([_train_combined, test_unlab_ds])
 
-train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
-                          num_workers=_nw, pin_memory=use_cuda,
-                          collate_fn=byol_collate_fn)
-unlab_extract_loader = DataLoader(unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
+# =============================================================================
+# PROTEGE TIER CONSTANTS
+# =============================================================================
+LABEL_COLS = [
+    "fri", "frii", "hybrid", "spiral", "relaxed",
+    "cshaped", "sshaped", "misaligned", "wings", "xshaped",
+    "straight", "multihotspots", "continuous", "banding", "onesided",
+    "restarted", "cluster", "merger", "diffuse", "unknown",
+]
+SCORE_4 = ["xshaped", "unknown", "cluster", "merger"]
+SCORE_3 = ["diffuse", "sshaped", "spiral"]
+SCORE_2 = ["restarted", "onesided", "banding", "cshaped", "wings", "misaligned", "multihotspots", "relaxed"]
+SCORE_1 = ["fri", "frii", "hybrid", "straight", "continuous"]
+TIERS   = [(4, SCORE_4), (3, SCORE_3), (2, SCORE_2), (1, SCORE_1)]
+POSITIVE_THRESHOLD   = 3
+PROTEGE_INITIAL_STEPS = 10
+
+# Warn and disable class-weighting when there are no labelled samples
+if CLASS_WEIGHTING is not None and F_LABEL == 0.0:
+    print("WARNING: --class-weighting has no effect when F_LABEL=0 (no labelled samples). "
+          "Falling back to uniform sampling.")
+    CLASS_WEIGHTING = None
+
+if CLASS_WEIGHTING is not None:
+    n_lab   = len(labelled_images)
+    n_unlab = len(unlabelled_images)
+    n_test  = len(test_images)
+
+    if CLASS_WEIGHTING == "score":
+        lab_col_idx = {c: i for i, c in enumerate(LABEL_COLS)}
+        scores = np.ones(n_lab, dtype=float)
+        for tier_score, tier_cols in reversed(TIERS):
+            col_indices = [lab_col_idx[c] for c in tier_cols]
+            scores[labelled_labels[:, col_indices].any(axis=1)] = tier_score
+        score_counts = {s: max((scores == s).sum(), 1) for s in [1, 2, 3, 4]}
+        lab_weights = np.array([1.0 / score_counts[s] for s in scores])
+
+    else:  # "label"
+        label_freq = labelled_labels.mean(axis=0).clip(min=1e-6)
+        inv_freq = 1.0 / label_freq
+        pos_counts = labelled_labels.sum(axis=1)
+        lab_weights = np.where(
+            pos_counts > 0,
+            (labelled_labels * inv_freq).sum(axis=1) / pos_counts.clip(min=1),
+            1.0,
+        )
+
+    lab_weights = lab_weights / lab_weights.mean()
+    sample_weights = np.concatenate([
+        lab_weights,
+        np.ones(n_unlab + n_test),  # unlabelled/test: neutral weight
+    ])
+    _sampler = WeightedRandomSampler(
+        weights=torch.from_numpy(sample_weights).float(),
+        num_samples=len(_train_combined),
+        replacement=True,
+    )
+    train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE,
+                              sampler=_sampler, drop_last=True,
+                              num_workers=_nw, pin_memory=use_cuda,
+                              collate_fn=byol_collate_fn)
+else:
+    train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE, shuffle=True,
+                              drop_last=True, num_workers=_nw, pin_memory=use_cuda,
+                              collate_fn=byol_collate_fn)
+unlab_extract_loader = DataLoader(train_unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
                                    num_workers=_nw, pin_memory=use_cuda,
                                    collate_fn=byol_collate_fn)
 pca_fit_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE,
@@ -920,23 +989,6 @@ model, history, best_val_loss, best_epoch = train_fold(
 print("\nEvaluating on TEST set...")
 avg_test_loss = evaluate_test(model, test_loader)
 print(f"Test Loss: {avg_test_loss:.4f}  Best Val: {best_val_loss:.4f}")
-
-# =============================================================================
-# PROTEGE TIER CONSTANTS
-# =============================================================================
-LABEL_COLS = [
-    "fri", "frii", "hybrid", "spiral", "relaxed",
-    "cshaped", "sshaped", "misaligned", "wings", "xshaped",
-    "straight", "multihotspots", "continuous", "banding", "onesided",
-    "restarted", "cluster", "merger", "diffuse", "unknown",
-]
-SCORE_4 = ["xshaped", "unknown", "cluster", "merger"]
-SCORE_3 = ["diffuse", "sshaped", "spiral"]
-SCORE_2 = ["restarted", "onesided", "banding", "cshaped", "wings", "misaligned", "multihotspots", "relaxed"]
-SCORE_1 = ["fri", "frii", "hybrid", "straight", "continuous"]
-TIERS   = [(4, SCORE_4), (3, SCORE_3), (2, SCORE_2), (1, SCORE_1)]
-POSITIVE_THRESHOLD   = 3
-PROTEGE_INITIAL_STEPS = 10
 
 # =============================================================================
 # DOWNSTREAM: per-model loop
