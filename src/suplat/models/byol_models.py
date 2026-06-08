@@ -243,18 +243,21 @@ class PCAProjection(nn.Module):
     """
     Fixed (non-trainable) PCA projection.
     Reduces encoder representations to the minimum number of principal components
-    needed to explain `variance_threshold` of the total variance.
+    needed to explain `variance_threshold` of the total variance, OR to a fixed
+    `n_components` if specified (takes priority over variance_threshold).
     Must be fitted on encoder outputs via fit() before use.
     """
-    def __init__(self, variance_threshold=0.95):
+    def __init__(self, variance_threshold=0.95, n_components=None):
         super().__init__()
         self.variance_threshold = variance_threshold
+        self.n_components = n_components  # if set, overrides variance_threshold
         self._fitted = False
 
     def fit(self, X: torch.Tensor):
         """
         Compute PCA on representations X of shape (N, D).
-        Selects fewest components needed to reach variance_threshold.
+        If n_components is set, uses that fixed count; otherwise selects fewest
+        components needed to reach variance_threshold.
         """
         X = X.detach().float()
         mean = X.mean(dim=0)
@@ -267,9 +270,13 @@ class PCAProjection(nn.Module):
         self.register_buffer('mean_', mean)
         self.register_buffer('active_mask_', active)
         _, S, Vh = torch.linalg.svd(X_centered[:, active], full_matrices=False)
-        cumvar = (S ** 2).cumsum(0) / (S ** 2).sum()
-        n_components = int((cumvar < self.variance_threshold).sum().item()) + 1
-        self.register_buffer('components_', Vh[:n_components])  # (n_components, n_active)
+        if self.n_components is not None:
+            n_comp = min(self.n_components, Vh.shape[0])
+        else:
+            cumvar = (S ** 2).cumsum(0) / (S ** 2).sum()
+            n_comp = int((cumvar < self.variance_threshold).sum().item()) + 1
+        self.register_buffer('components_', Vh[:n_comp])  # (n_comp, n_active)
+        self.variance_explained_ = float(((S[:n_comp] ** 2).sum() / (S ** 2).sum()).item())
         self._fitted = True
 
     @property

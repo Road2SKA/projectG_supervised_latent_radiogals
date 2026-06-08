@@ -235,6 +235,60 @@ def plot_umap_single(
 
 
 # =============================================================================
+# SCALAR-COLOURED UMAP PLOT
+# =============================================================================
+
+def plot_umap_scalar(
+    embedding_2d: np.ndarray,
+    scalar_values: np.ndarray,
+    title: str,
+    cbar_label: str,
+    save_path: Path,
+    cmap: str = 'plasma',
+    vmin: float | None = None,
+    vmax: float | None = None,
+    cbar_ticks: list | None = None,
+) -> None:
+    """
+    Plot UMAP coloured by a continuous or discrete scalar value (e.g. brightness or
+    label count).
+
+    Args:
+        embedding_2d:   (N, 2) UMAP coordinates
+        scalar_values:  (N,) scalar per point
+        title:          figure title
+        cbar_label:     colorbar label
+        save_path:      full path for saved PNG
+        cmap:           matplotlib colormap name
+        vmin:           colorbar minimum (default: data min)
+        vmax:           colorbar maximum (default: data max)
+        cbar_ticks:     explicit colorbar tick positions (default: auto)
+    """
+    n_total = len(embedding_2d)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sc = ax.scatter(
+        embedding_2d[:, 0], embedding_2d[:, 1],
+        c=scalar_values, cmap=cmap, s=10, alpha=0.7,
+        vmin=vmin, vmax=vmax,
+    )
+    cbar = plt.colorbar(sc, ax=ax, label=cbar_label, fraction=0.046, pad=0.04)
+    if cbar_ticks is not None:
+        cbar.set_ticks(cbar_ticks)
+    ax.set_xlabel('UMAP 1')
+    ax.set_ylabel('UMAP 2')
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.grid(True, alpha=0.3)
+    ax.text(0.5, 0.97, f'{title} ({n_total})', transform=ax.transAxes,
+            ha='center', va='top', fontsize=11, fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                      alpha=0.7, edgecolor='none'))
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"    ✓ Saved {save_path.name}")
+    plt.close()
+
+
+# =============================================================================
 # MAIN UMAP PLOT FUNCTION
 # =============================================================================
 
@@ -460,9 +514,16 @@ def plot_umap_outliers(
     anchors  = [cands[0]]
     # anchor 1: farthest from anchor 0
     anchors.append(int(max(cands[1:], key=lambda c: np.linalg.norm(train_2d[c] - train_2d[anchors[0]]))))
-    # anchor 2: maximises min-distance to both existing anchors
-    anchors.append(int(max(
-        (c for c in cands if c not in anchors),
+    # anchor 2: maximises min-distance to both existing anchors, subject to a minimum
+    # separation of d(a0,a1)/3 from every existing anchor — guaranteeing all three
+    # pairwise distances are within a 3× factor of each other.
+    d01 = np.linalg.norm(train_2d[anchors[0]] - train_2d[anchors[1]])
+    min_sep = d01 / 3.0
+    eligible = [c for c in cands if c not in anchors
+                and all(np.linalg.norm(train_2d[c] - train_2d[a]) >= min_sep for a in anchors)]
+    if not eligible:
+        eligible = [c for c in cands if c not in anchors]  # fallback if constraint cannot be met
+    anchors.append(int(max(eligible,
         key=lambda c: min(np.linalg.norm(train_2d[c] - train_2d[a]) for a in anchors),
     )))
 
@@ -590,7 +651,6 @@ def plot_training_curves(
     sched       = history.get('supervision_schedule')
     sched_label = 'Supervision Weight' if loss_mode == 'both' else 'Pairing Probability'
 
-    val_aug = history.get('val_aug_loss')
     val_fri = history.get('val_friend_loss')
     tr_aug  = history.get('train_aug_loss')
     tr_fri  = history.get('train_friend_loss')
@@ -606,7 +666,8 @@ def plot_training_curves(
     def _draw_loss_ax(ax, ep, tr_l, va_l, tr_a, va_a, tr_f, va_f, mon,
                       title, best_in_view=True, show_legend=True, fs=FS, fs_t=FS_T):
         ax.plot(ep, tr_l, 'b-',  linewidth=2)
-        ax.plot(ep, va_l, 'r-',  linewidth=2)
+        if va_l:
+            ax.plot(ep, va_l, 'r-',  linewidth=2)
         if tr_a:
             ax.plot(ep, tr_a, color='blue', linestyle=':', linewidth=1.5, alpha=0.8)
         if va_a:
@@ -648,9 +709,10 @@ def plot_training_curves(
     def _draw_overfit_ax(ax, ep, tr_l, va_l, tr_f, va_f, tr_a, va_a,
                          title, best_in_view=True, show_legend=True, fs=FS, fs_t=FS_T):
         _tr = np.array(tr_l, dtype=float)
-        _va = np.array(va_l, dtype=float)
-        ax.plot(ep, np.where(_tr != 0, _va / _tr, np.nan),
-                color='#1f77b4', label='Val/Train total', linewidth=2)
+        if va_l is not None:
+            _va = np.array(va_l, dtype=float)
+            ax.plot(ep, np.where(_tr != 0, _va / _tr, np.nan),
+                    color='#1f77b4', label='Val/Train total', linewidth=2)
         if tr_f and va_f:
             _tf = np.array(tr_f, dtype=float)
             _vf = np.array(va_f, dtype=float)
@@ -688,14 +750,14 @@ def plot_training_curves(
 
     # [0,0] all loss components
     _draw_loss_ax(ax00, epochs,
-                  history['train_loss'], history['val_loss'],
-                  tr_aug, val_aug, tr_fri, val_fri, monitor,
+                  history['train_loss'], history.get('val_loss'),
+                  tr_aug, None, tr_fri, val_fri, monitor,
                   'All Loss Components')
 
     # [0,1] overfitting indicator
     _draw_overfit_ax(ax01, epochs,
-                     history['train_loss'], history['val_loss'],
-                     tr_fri, val_fri, tr_aug, val_aug,
+                     history['train_loss'], history.get('val_loss'),
+                     tr_fri, val_fri, tr_aug, None,
                      'Overfitting Indicator')
 
     # [1,1] learning rate + supervision schedule on dual y-axes
@@ -738,15 +800,16 @@ def plot_training_curves(
 
         _FZ   = FS - 2
         _FZ_T = FS_T - 2
+        _val_loss = history.get('val_loss')
         _draw_loss_ax(ax_z0, epochs_zoom,
-                      _sl(history['train_loss']), _sl(history['val_loss']),
-                      _sl(tr_aug), _sl(val_aug), _sl(tr_fri), _sl(val_fri),
+                      _sl(history['train_loss']), _sl(_val_loss),
+                      _sl(tr_aug), None, _sl(tr_fri), _sl(val_fri),
                       _sl(monitor), 'Loss (Zoomed)',
                       best_in_view=best_in_z, show_legend=False, fs=_FZ, fs_t=_FZ_T)
         ax_z0.set_xlabel('')
         _draw_overfit_ax(ax_z1, epochs_zoom,
-                         _sl(history['train_loss']), _sl(history['val_loss']),
-                         _sl(tr_fri), _sl(val_fri), _sl(tr_aug), _sl(val_aug),
+                         _sl(history['train_loss']), _sl(_val_loss),
+                         _sl(tr_fri), _sl(val_fri), _sl(tr_aug), None,
                          '',
                          best_in_view=best_in_z, show_legend=False, fs=_FZ, fs_t=_FZ_T)
 

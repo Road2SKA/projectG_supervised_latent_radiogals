@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 """
 BYOL Implementation for Radio Galaxy Classification
-Training script with configurable projector modes.
-Supports convnet, efficientnet-b0, resnet18, resnet50, and convnext-tiny architectures.
-
-Projector modes:
-  mlp  — Trainable MLP projector, EMA-updated with target network
-  pca  — PCA projector re-fitted after each epoch (--projection-dim D for fixed D components, or 95% variance threshold if omitted)
-  none — No projector; encoder output (1280-dim) fed directly into predictor
+Training script for SLURM GPU submission
+Supports convnet, efficientnet-b0, resnet18, resnet50, and convnext-tiny architectures
 """
 
 # =============================================================================
 # IMPORTS
 # =============================================================================
 import argparse
-import copy
 import os
 import sys as _sys
 from datetime import datetime
@@ -24,9 +18,6 @@ import json
 import numpy as np
 import pandas as pd
 import torch
-import matplotlib; matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
 from torch.utils.data import DataLoader, ConcatDataset
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
@@ -37,7 +28,6 @@ from suplat.data.augmentations import get_augmentation
 from suplat.models.byol_models import (
     BYOLEfficient, BYOLEfficientNetB0,
     BYOLPretrainedBackbone,
-    PCAProjection, PredictionHead,
     create_resnet18_backbone,
     create_resnet50_backbone,
     create_convnext_tiny_backbone,
@@ -46,9 +36,9 @@ from suplat.trainer.trainer import byol_loss, get_warmup_lr, get_supervision_wei
 from suplat.utils.plotting import fit_umap, plot_umap_single, plot_umap_outliers, plot_training_curves, plot_umap_scalar
 
 # Check device availability
-if torch.cuda.is_available():
+if torch.cuda.is_available(): 
     print("using gpu")
-else:
+else: 
     print("using cpu")
 
 # =============================================================================
@@ -56,14 +46,14 @@ else:
 # =============================================================================
 def parse_args():
     """Parse command-line arguments for BYOL training configuration"""
-    ap = argparse.ArgumentParser(description="BYOL training with configurable projector modes")
-
+    ap = argparse.ArgumentParser(description="BYOL training for radio galaxy classification")
+    
     # Random seed
     ap.add_argument("--seed", type=int, default=42,
                     help="Random seed for reproducibility (default: 42)")
     ap.add_argument("--data-seed", type=int, default=None,
                     help="Random seed for data split (if default (None), uses --seed)")
-
+    
     # Data configuration
     ap.add_argument("--data-dir", type=Path,
                     default=Path('/users/mbredber/p3_SUPLAT/data/preprocessed/lotss'),
@@ -71,7 +61,7 @@ def parse_args():
     ap.add_argument("--dataset", type=str, default="LOTSS",
                     choices=["LOTSS", "MOCK"],
                     help="Dataset to use: LOTSS (real data) or MOCK (synthetic data)")
-
+    
     # Label configuration
     ap.add_argument("--label-type", type=str, default="full",
                     choices=["full", "all", "classical", "initial", "morphology", "environment", "derived"],
@@ -80,7 +70,7 @@ def parse_args():
                         "'morphology' (5-14: C-curve, S-curve, Misalignment, Wings, X-shaped, Straight jets, Multiple hotspots, "
                         "Continuous jets, Banding, One-sided, Restarted), 'environment' (15-18: Cluster, Merger, Diffuse emission, Unknown), "
                         "'derived' (19-23: Compact+hybrids, Hybrid FRI/FRII, Curved FRIs, Curved FRIIs, Straight+multi hotspots)")
-
+    
     # Dataset pairing strategy
     ap.add_argument("--weighting", type=str, default="closest",
                     choices=["closest", "ponderate"],
@@ -96,7 +86,7 @@ def parse_args():
                     help="Starting supervision weight for scheduled curriculum (default: 0.0)")
     ap.add_argument("--supervision-weight-end", type=float, default=1.0,
                     help="Ending supervision weight for scheduled curriculum (default: 1.0)")
-
+    
     # Data subsampling
     ap.add_argument("--subsample", type=int, default=None,
                     help="Subsample dataset to N samples (for quick testing)")
@@ -105,12 +95,12 @@ def parse_args():
     ap.add_argument("--augmentation", type=str, default="standard",
                     choices=["standard", "extended"],
                     help="Augmentation pipeline: 'standard' (flip+rotate) or 'extended' (+ gaussian noise + intensity scaling)")
-
+    
     # Model selection
     ap.add_argument("--model-type", type=str, default="efficientnet-b0",
                     choices=["efficientnet-b0", "convnet", "resnet18", "resnet50", "convnext-tiny"],
                     help="Model architecture: 'efficientnet-b0' (EfficientNet-B0, 1280-dim), 'convnet' (custom plain CNN, 512-dim), 'resnet18' (ResNet-18, 512-dim), 'resnet50' (ResNet-50, 2048-dim), 'convnext-tiny' (ConvNeXt-Tiny, 768-dim)")
-
+    
     # Training hyperparameters
     ap.add_argument("--batch-size", type=int, default=32,
                     help="Batch size for training (default: 32)")
@@ -131,18 +121,15 @@ def parse_args():
                     help="Number of learning rate warmup epochs (default: 0)")
     ap.add_argument("--compile", action="store_true", default=False,
                     help="torch.compile the model (EfficientNet-B0 only; ~30s overhead, then faster)")
-    # Projector configuration
-    ap.add_argument("--projector", type=str, default="none",
-                    choices=["mlp", "pca", "none"],
-                    help="Projector type: 'none' (no projector, default), 'mlp' (learned MLP head), 'pca' (PCA re-fitted each epoch)")
-    ap.add_argument("--pca-verbose", action="store_true", default=False,
-                    help="Print PCA variance-explained and drift diagnostics each epoch (pca mode only, off by default)")
-    ap.add_argument("--projection-dim", type=int, default=None,
-                    help="Projection head output dimension; for pca mode, sets fixed n_components. "
-                         "If omitted, pca mode uses 95%% variance threshold (default: None)")
+    # Model architecture
+    ap.add_argument("--feature-compression-mode", type=str, default="pca",
+                    choices=["pca", "mlp", "none"],
+                    help="Projector type: 'pca' (PCA keeping 95%% variance, default), 'mlp' (learned MLP head), 'none' (no projector)")
+    ap.add_argument("--projection-dim", type=int, default=256,
+                    help="Projection head output dimension (default: 256)")
     ap.add_argument("--hidden-dim", type=int, default=4096,
                     help="Hidden layer dimension in MLP heads (default: 4096)")
-
+    
     # Output configuration
     ap.add_argument("--output-dir", type=Path,
                     default=Path('./outputs'),
@@ -152,7 +139,7 @@ def parse_args():
     # Visualization
     ap.add_argument("--no-plot-history", action="store_true",
                     help="Disable training curve plots (enabled by default)")
-
+    
     # UMAP visualization
     ap.add_argument("--no-plot-umap", action="store_true",
                     help="Disable UMAP plots (enabled by default)")
@@ -179,11 +166,6 @@ def parse_args():
 # =============================================================================
 args = parse_args()
 
-if args.projector == 'mlp' and args.projection_dim is None:
-    import sys
-    print("ERROR: --projection-dim is required when --projector mlp", file=sys.stderr)
-    sys.exit(1)
-
 # Model hyperparameters
 BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.lr
@@ -200,7 +182,7 @@ DROPOUT = args.dropout
 LR_SCHEDULE = args.lr_schedule
 WARMUP_EPOCHS = args.warmup_epochs
 NUM_WORKERS = args.num_workers
-PROJECTOR = args.projector
+FEATURE_COMPRESSION_MODE = args.feature_compression_mode
 USE_COMPILE = args.compile
 # Dataset configuration
 DATASET_NAME = args.dataset
@@ -222,7 +204,7 @@ if torch.cuda.is_available():
     device = torch.device('cuda')
     torch.cuda.set_device(0)
 
-    print(f"Using device: {device}")
+    print(f"✓ Using device: {device}")
     print(f"  GPU: {torch.cuda.get_device_name(0)}")
     print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
@@ -230,7 +212,7 @@ if torch.cuda.is_available():
 
 else:
     device = torch.device('cpu')
-    print("CUDA not available, using CPU")
+    print("⚠ CUDA not available, using CPU")
     print("  This will be VERY slow and may crash with large batches")
 
 use_cuda = torch.cuda.is_available()
@@ -239,7 +221,7 @@ use_cuda = torch.cuda.is_available()
 OUTPUT_BASE = args.output_dir
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
-# Create run directory — include projector type to avoid collisions with train_byol.py
+# Create run directory
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     RUN_ID = f"{args.run_name}_{_timestamp}"
@@ -247,17 +229,17 @@ else:
     RUN_ID = _timestamp
     if DATASET_NAME != "LOTSS":
         RUN_ID += f"_{DATASET_NAME}"
-    RUN_ID += f"_{MODEL_TYPE}_proj{PROJECTOR}_w{args.weighting}_f{F_LABEL}"
-
+    RUN_ID += f"_{MODEL_TYPE}_w{args.weighting}_f{F_LABEL}"
+    
 # Truncate labels based on label type
 LABEL_RANGES = {
-    'full':        (0, 20),
-    'all':         (0, 20),
-    'classical':   (0, 2),
-    'initial':     (0, 5),
-    'morphology':  (5, 16),
-    'environment': (16, 20),
-    'derived':     (19, 24),
+    'full':        (0, 20),   # All labels
+    'all':         (0, 20),   # Alias for full
+    'classical':   (0, 2),    # FRI, FRII only
+    'initial':     (0, 5),    # FRI, FRII, Hybrids, Spirals, Relaxed doubles
+    'morphology':  (5, 16),   # C-curve through Restarted
+    'environment': (16, 20),  # Cluster, Merger, Diffuse emission, Unknown
+    'derived':     (19, 24),  # Compact+hybrids through Straight+multi hotspots
 }
 
 OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
@@ -278,11 +260,11 @@ class _Tee:
     def __init__(self, *files):
         self.files = files
     def write(self, obj):
-        for f in self.files:
+        for f in self.files: 
             f.write(obj)
             f.flush()
     def flush(self):
-        for f in self.files:
+        for f in self.files: 
             f.flush()
 _log_file = open(LOGS_DIR / 'byol.log', 'w')
 _sys.stdout = _Tee(_sys.__stdout__, _log_file)
@@ -304,14 +286,8 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
 print(f"{'='*70}")
 print(f"Model type:     {MODEL_TYPE}")
-print(f"Projector:      {PROJECTOR}")
-if PROJECTOR == 'pca':
-    if PROJECTION_DIM is not None:
-        print(f"PCA components: {PROJECTION_DIM} (fixed, re-fitted each epoch)")
-    else:
-        print(f"PCA components: 95% variance threshold (re-fitted each epoch)")
-elif PROJECTOR == 'mlp':
-    print(f"Projection dim: {PROJECTION_DIM}")
+print(f"Feature compression mode: {FEATURE_COMPRESSION_MODE}")
+print(f"Projection dim: {PROJECTION_DIM}")
 print(f"Hidden dim:     {HIDDEN_DIM}")
 print(f"Dataset:        {DATASET_NAME}")
 print(f"Data dir:       {args.data_dir}")
@@ -358,22 +334,22 @@ label_start, label_end = LABEL_RANGES[args.label_type]
 if args.label_type != 'full':
     labels = labels[:, label_start:label_end]
     n_labels = label_end - label_start
-    print(f"\nUsing {args.label_type} labels only (indices {label_start}-{label_end-1}, {n_labels} dimensions)")
+    print(f"\n✓ Using {args.label_type} labels only (indices {label_start}-{label_end-1}, {n_labels} dimensions)")
 
 # Validate
 assert len(images) == len(labels), f"Mismatch: {len(images)} images, {len(labels)} labels"
 assert images.ndim == 3, f"Expected 3D images, got {images.ndim}D: {images.shape}"
-assert images.shape[1] == images.shape[2] == 89, f"Expected 89x89, got {images.shape[1:3]}"
+assert images.shape[1] == images.shape[2] == 89, f"Expected 89×89, got {images.shape[1:3]}"
 
 # Subsample if requested
 if SUBSAMPLE_SIZE is not None and len(images) > SUBSAMPLE_SIZE:
-    print(f"\nSubsampling {SUBSAMPLE_SIZE}/{len(images)} samples")
+    print(f"\n⚠ Subsampling {SUBSAMPLE_SIZE}/{len(images)} samples")
     indices = np.random.choice(len(images), SUBSAMPLE_SIZE, replace=False)
     images = images[indices]
     labels = labels[indices]
     labels_full = labels_full[indices]
 
-print("\nData loaded")
+print("\n✓ Data loaded")
 print(f"  Images: {images.shape} ({images.dtype})")
 print(f"  Labels: {labels.shape} ({labels.dtype})")
 print(f"  Range: [{images.min():.2f}, {images.max():.2f}]")
@@ -430,51 +406,13 @@ def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
     return (loss_trans + loss_friend).item()
 
 
-def refit_pca(fold_model, extract_loader, device, hidden_dim, verbose=False):
-    """
-    Re-fit PCA projector after an epoch using the current online encoder's outputs.
-    Rebuilds the predictor if the PCA output dimension changes (variance-threshold mode).
-    """
-    fold_model.eval()
-    enc_outputs = []
-    with torch.no_grad():
-        for x1, _, _, _ in extract_loader:
-            enc_outputs.append(fold_model.online_encoder(x1.to(device)).float().cpu())
-    embeddings = torch.cat(enc_outputs, dim=0)
-
-    old_dim = fold_model.online_projector.out_dim if fold_model.online_projector._fitted else None
-    old_components = fold_model.online_projector.components_.cpu().clone() if fold_model.online_projector._fitted else None
-
-    fold_model.online_projector.fit(embeddings)
-    fold_model.online_projector.to(device)
-    fold_model.target_projector = copy.deepcopy(fold_model.online_projector).to(device)
-    for param in fold_model.target_projector.parameters():
-        param.requires_grad = False
-
-    new_dim = fold_model.online_projector.out_dim
-    if new_dim != old_dim:
-        fold_model.online_predictor = PredictionHead(
-            in_dim=new_dim, hidden_dim=hidden_dim,
-            out_dim=new_dim, bn_momentum=0.1,
-        ).to(device)
-
-    if verbose:
-        var_exp = fold_model.online_projector.variance_explained_
-        drift_str = ""
-        if old_components is not None and new_dim == old_dim:
-            drift = (fold_model.online_projector.components_.cpu() - old_components).norm().item()
-            drift_str = f"  drift: {drift:.4f}"
-        dim_str = f"  (dim: {old_dim} → {new_dim})" if new_dim != old_dim else ""
-        print(f"  [PCA] Re-fitted: {new_dim} components  "
-              f"var_explained: {var_exp:.1%}{drift_str}{dim_str}")
-
-    fold_model.train()
-
-
 def train_fold(train_loader, test_loader, extract_loader=None):
     """
     Train one model fold from scratch.
-    extract_loader: DataLoader used to fit/re-fit PCA when PROJECTOR='pca'.
+    When curriculum scheduling is active, model selection uses the monitoring val loss
+    (both mode, supervision_weight=1, curriculum-independent). Otherwise, the regular
+    val loss is used for model selection.
+    extract_loader: DataLoader used to fit PCA when FEATURE_COMPRESSION_MODE='pca'.
     Returns: (model, history, best_val_loss, best_epoch)
     """
     torch.manual_seed(SEED)
@@ -489,7 +427,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
             projection_dim=PROJECTION_DIM,
             hidden_dim=HIDDEN_DIM,
             bn_momentum=0.1,
-            feature_compression_mode=PROJECTOR,
+            feature_compression_mode=FEATURE_COMPRESSION_MODE,
             dropout_rate=DROPOUT,
         )
     elif MODEL_TYPE == "convnet":
@@ -498,7 +436,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
             projection_dim=PROJECTION_DIM,
             hidden_dim=HIDDEN_DIM,
             bn_momentum=0.1,
-            feature_compression_mode=PROJECTOR,
+            feature_compression_mode=FEATURE_COMPRESSION_MODE,
             dropout_rate=DROPOUT,
         )
     elif MODEL_TYPE == "resnet18":
@@ -506,68 +444,35 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         fold_model = BYOLPretrainedBackbone(
             backbone, encoder_dim=enc_dim,
             projection_dim=PROJECTION_DIM, hidden_dim=HIDDEN_DIM,
-            bn_momentum=0.1, feature_compression_mode=PROJECTOR,
+            bn_momentum=0.1, feature_compression_mode=FEATURE_COMPRESSION_MODE,
         )
     elif MODEL_TYPE == "resnet50":
         backbone, enc_dim = create_resnet50_backbone(dropout_rate=DROPOUT)
         fold_model = BYOLPretrainedBackbone(
             backbone, encoder_dim=enc_dim,
             projection_dim=PROJECTION_DIM, hidden_dim=HIDDEN_DIM,
-            bn_momentum=0.1, feature_compression_mode=PROJECTOR,
+            bn_momentum=0.1, feature_compression_mode=FEATURE_COMPRESSION_MODE,
         )
     elif MODEL_TYPE == "convnext-tiny":
         backbone, enc_dim = create_convnext_tiny_backbone(dropout_rate=DROPOUT)
         fold_model = BYOLPretrainedBackbone(
             backbone, encoder_dim=enc_dim,
             projection_dim=PROJECTION_DIM, hidden_dim=HIDDEN_DIM,
-            bn_momentum=0.1, feature_compression_mode=PROJECTOR,
+            bn_momentum=0.1, feature_compression_mode=FEATURE_COMPRESSION_MODE,
         )
     fold_model = fold_model.to(device)
 
-    # -------------------------------------------------------------------------
-    # PCA PROJECTOR SETUP (pca mode only)
-    # Do an initial fit and build the predictor. If --projection-dim is given,
-    # uses fixed n_components; otherwise falls back to 95% variance threshold.
-    # -------------------------------------------------------------------------
-    if PROJECTOR == 'pca':
-        assert extract_loader is not None, "extract_loader required for pca projector"
-
-        if PROJECTION_DIM is not None:
-            fold_model.online_projector = PCAProjection(n_components=PROJECTION_DIM)
-            fold_model.target_projector = PCAProjection(n_components=PROJECTION_DIM)
-        else:
-            fold_model.online_projector = PCAProjection(variance_threshold=0.95)
-            fold_model.target_projector = PCAProjection(variance_threshold=0.95)
-        fold_model = fold_model.to(device)
-
-        # Collect encoder outputs for initial fit
+    # Fit PCA projector before training (one pass through all training images)
+    if FEATURE_COMPRESSION_MODE == 'pca':
+        assert extract_loader is not None, "extract_loader required for PCA fitting"
         fold_model.eval()
         _enc_outputs = []
         with torch.no_grad():
             for _x1, _, _, _ in extract_loader:
                 _enc_outputs.append(fold_model.online_encoder(_x1.to(device)).float().cpu())
-        _embeddings = torch.cat(_enc_outputs, dim=0)
-
-        # Fit online projector and copy to target
-        fold_model.online_projector.fit(_embeddings)
-        fold_model.online_projector.to(device)
-        fold_model.target_projector = copy.deepcopy(fold_model.online_projector).to(device)
-        for param in fold_model.target_projector.parameters():
-            param.requires_grad = False
-
-        # Build predictor now that PCA output dim is known
-        pca_out_dim = fold_model.online_projector.out_dim
-        fold_model.online_predictor = PredictionHead(
-            in_dim=pca_out_dim, hidden_dim=HIDDEN_DIM,
-            out_dim=pca_out_dim, bn_momentum=0.1,
-        ).to(device)
-
-        fold_model.train()
-        if args.pca_verbose:
-            var_exp = fold_model.online_projector.variance_explained_
-            print(f"PCA fitted (initial): {pca_out_dim} components  var_explained: {var_exp:.1%}")
-        else:
-            print(f"PCA fitted (initial): {pca_out_dim} components")
+        fold_model.fit_pca(torch.cat(_enc_outputs, dim=0))
+        fold_model = fold_model.to(device)
+        print(f"✓ PCA fitted: {fold_model.online_projector.out_dim} components")
 
     if USE_COMPILE and MODEL_TYPE in ("efficientnet-b0", "resnet18", "resnet50", "convnext-tiny"):
         print("Compiling model with torch.compile() ...")
@@ -584,17 +489,14 @@ def train_fold(train_loader, test_loader, extract_loader=None):
     _enc_dim_map = {"efficientnet-b0": 1280, "resnet18": 512, "resnet50": 2048, "convnext-tiny": 768}
     _enc_dim = _enc_dim_map.get(MODEL_TYPE, 512)
     print(f"Encoder output:       {_enc_dim}-dim representation")
-    if PROJECTOR == 'mlp':
-        print(f"Projector:            MLP -> {PROJECTION_DIM}-dim projection")
+    if FEATURE_COMPRESSION_MODE == 'mlp':
+        print(f"Projector:            MLP → {PROJECTION_DIM}-dim projection")
         print(f"Predictor output:     {PROJECTION_DIM}-dim prediction")
-    elif PROJECTOR == 'pca':
-        if PROJECTION_DIM is not None:
-            print(f"Projector:            PCA (fixed {PROJECTION_DIM} components, re-fitted each epoch)")
-        else:
-            print(f"Projector:            PCA (95% variance threshold, re-fitted each epoch)")
-        print(f"Predictor output:     {pca_out_dim}-dim prediction (initial)")
+    elif FEATURE_COMPRESSION_MODE == 'pca':
+        print("Projector:            PCA (fitted, 95% variance)")
+        print("Predictor output:     PCA-dim prediction (set after fit_pca)")
     else:
-        print("Projector:            none (encoder -> predictor directly)")
+        print("Projector:            none (encoder → predictor directly)")
         print(f"Predictor output:     {_enc_dim}-dim prediction")
     print(f"{'='*70}\n")
 
@@ -615,18 +517,18 @@ def train_fold(train_loader, test_loader, extract_loader=None):
     else:
         scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
-    print(f"Optimizer: Adam (lr={LEARNING_RATE})")
+    print(f"✓ Optimizer: Adam (lr={LEARNING_RATE})")
     if LR_SCHEDULE == "step":
-        print(f"Scheduler: step (milestone={int(0.7*_sched_epochs)} epochs, gamma=0.2)")
+        print(f"✓ Scheduler: step (milestone={int(0.7*_sched_epochs)} epochs, gamma=0.2)")
     elif LR_SCHEDULE == "cosine":
-        print(f"Scheduler: cosine (T_max={_sched_epochs} epochs, eta_min=0)")
+        print(f"✓ Scheduler: cosine (T_max={_sched_epochs} epochs, eta_min=0)")
     else:
-        print(f"Scheduler: constant")
+        print(f"✓ Scheduler: constant")
     if WARMUP_EPOCHS > 0:
-        print(f"Warmup: {WARMUP_EPOCHS} epochs")
+        print(f"✓ Warmup: {WARMUP_EPOCHS} epochs")
     if GRAD_CLIP:
-        print(f"Gradient clipping: max_norm={GRAD_CLIP}")
-    print("Loss: BYOL symmetric MSE")
+        print(f"✓ Gradient clipping: max_norm={GRAD_CLIP}")
+    print("✓ Loss: BYOL symmetric MSE")
 
     _compute_val = test_loader is not None and F_LABEL > 0 and SUPERVISION_WEIGHT > 0
 
@@ -682,6 +584,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
         for x1, x1_aug, x2_friend, is_labelled in pbar:
             x1, x1_aug = x1.to(device), x1_aug.to(device)
+            # is_labelled stays on CPU for x2_friend indexing
 
             # L_aug: ALL samples
             pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_aug)
@@ -717,13 +620,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         avg_train_friend_loss = train_friend_loss / train_friend_batches if train_friend_batches > 0 else 0.0
 
         # -------------------------------------------------------------------
-        # PCA RE-FIT (pca mode only): update projector with current encoder
-        # -------------------------------------------------------------------
-        if PROJECTOR == 'pca':
-            refit_pca(fold_model, extract_loader, device, hidden_dim=HIDDEN_DIM, verbose=args.pca_verbose)
-
-        # -------------------------------------------------------------------
-        # VALIDATION
+        # VALIDATION: friend loss only (meaningful only when F_LABEL > 0 and sw > 0)
         # -------------------------------------------------------------------
         if _compute_val:
             fold_model.eval()
@@ -790,6 +687,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
 
 def evaluate_test(eval_model, test_loader_ref):
     """Evaluate eval_model on held-out test set. Returns avg test loss."""
+    # Use fully-ramped supervision weight (as at the final training epoch)
     final_sup_weight = get_supervision_weight(
         NUM_EPOCHS - 1, NUM_EPOCHS,
         schedule=SUPERVISION_WEIGHT_SCHEDULE,
@@ -838,7 +736,7 @@ else:
         sss = StratifiedShuffleSplit(n_splits=1, train_size=n_lab, random_state=DATA_SEED)
         lab_rel, _ = next(sss.split(train_images, strat_key))
     except ValueError:
-        print("Stratification failed, falling back to random selection")
+        print("⚠ Stratification failed, falling back to random selection")
         lab_rel = np.random.choice(len(train_idx), n_lab, replace=False)
     labelled_mask = np.zeros(len(train_idx), dtype=bool)
     labelled_mask[lab_rel] = True
@@ -876,6 +774,7 @@ else:
                                        collate_fn=byol_collate_fn)
 
 # Test images always enter the BYOL training pool regardless of F_LABEL or supervision_weight.
+# This is intentional: all images should have their representations learned.
 test_unlab_ds = UnlabelledBYOLDataset(test_images, transform=byol_strong_aug)
 _train_combined = ConcatDataset([_train_combined, test_unlab_ds])
 
@@ -898,20 +797,21 @@ unlabelled_train_idx = train_idx[~labelled_mask]
 np.save(DATA_DIR / 'unlabelled_train_idx.npy', unlabelled_train_idx)
 
 # Set train_labels / train_images for downstream to labelled-only
+# When f_label=0, keep the full training set so downstream plots don't crash
 if len(labelled_images) > 0:
     train_labels = labelled_labels
     train_images = labelled_images
     train_idx    = labelled_train_idx
 
 print(f"\n{'='*70}")
-print("DATA LOADED")
+print("✓ DATA LOADED")
 print(f"{'='*70}")
-print(f"Train: {len(train_loader)} batches x {BATCH_SIZE}")
-print(f"Test:  {len(test_loader)} batches x {BATCH_SIZE}")
+print(f"Train: {len(train_loader)} batches × {BATCH_SIZE}")
+print(f"Test:  {len(test_loader)} batches × {BATCH_SIZE}")
 print(f"{'='*70}\n")
 
 x1, x1_aug, x2_friend, is_labelled = next(iter(train_loader))
-print(f"Test batch: {x1.shape}, {x1_aug.shape}")
+print(f"✓ Test batch: {x1.shape}, {x1_aug.shape}")
 print(f"  Labelled fraction: {is_labelled.float().mean():.2f}")
 
 model, history, best_val_loss, best_epoch = train_fold(
@@ -963,6 +863,7 @@ for _item in _items:
     train_idx            = _item['train_idx']
     train_images         = _item['train_images']
 
+    # Add to history
     history['test_loss'] = avg_test_loss
 
     # =========================================================================
@@ -970,6 +871,7 @@ for _item in _items:
     # =========================================================================
     _chk_path = OUTPUT_DIR / f'byol_model_best{_suffix}.pt'
 
+    # Save model checkpoint
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': None,
@@ -993,16 +895,18 @@ for _item in _items:
             'data_seed': DATA_SEED,
             'supervision_weight': SUPERVISION_WEIGHT,
             'supervision_weight_schedule': SUPERVISION_WEIGHT_SCHEDULE,
-            'projector': PROJECTOR,
+            'feature_compression_mode': FEATURE_COMPRESSION_MODE,
             'label_type': args.label_type,
         }
     }, _chk_path)
 
-    print(f"Model checkpoint saved to {_chk_path}")
+    print(f"✓ Model checkpoint saved to {_chk_path}")
 
+    # Save training history
     np.save(DATA_DIR / f'training_history{_suffix}.npy', history)
-    print(f"Training history saved to {DATA_DIR / f'training_history{_suffix}.npy'}")
+    print(f"✓ Training history saved to {DATA_DIR / f'training_history{_suffix}.npy'}")
 
+    # Plot training history (default behavior unless disabled)
     if not args.no_plot_history:
         print(f"\nGenerating training curve plots{_label}...")
         plot_training_curves(history, best_val_loss, best_epoch, MODEL_TYPE, FIGURES_DIR,
@@ -1022,6 +926,7 @@ for _item in _items:
     )
     print(f"   Test set projections: {test_projections.shape}")
 
+    # Save projections (same filenames regardless of PCA mode)
     np.save(DATA_DIR / f'labelled_train_projections{_suffix}.npy', train_projections)
     np.save(DATA_DIR / f'train_labels{_suffix}.npy', train_labels[:len(train_projections)])
     np.save(DATA_DIR / f'test_projections{_suffix}.npy', test_projections)
@@ -1036,54 +941,9 @@ for _item in _items:
     else:
         unlab_projections = None
 
-    print(f"\nProjections saved to {DATA_DIR}/")
+    print(f"\n✓ Projections saved to {DATA_DIR}/")
 
-    # =========================================================================
-    # PCA VARIANCE ANALYSIS  (dimensionality collapse diagnostic)
-    # =========================================================================
-    print(f"\nComputing PCA variance analysis{_label}...")
-    _pca_all = np.concatenate(
-        [p for p in [unlab_projections, train_projections, test_projections] if p is not None]
-    )
-    _n_pca_components = min(128, _pca_all.shape[1])
-    _pca_diag = PCA(n_components=_n_pca_components, random_state=SEED)
-    _pca_diag.fit(_pca_all)
-
-    _cumvar   = np.cumsum(_pca_diag.explained_variance_ratio_)
-    _n_95     = int(np.searchsorted(_cumvar, 0.95)) + 1 if _cumvar[-1] >= 0.95 else f">{_n_pca_components}"
-    _n_99     = int(np.searchsorted(_cumvar, 0.99)) + 1 if _cumvar[-1] >= 0.99 else f">{_n_pca_components}"
-    print(f"  Projection dim : {_pca_all.shape[1]}d  ({len(_pca_all)} sources)")
-    print(f"  Dims for 95%% variance : {_n_95}")
-    print(f"  Dims for 99%% variance : {_n_99}")
-    print(f"  Variance in first {_n_pca_components} components : {_cumvar[-1]:.4f}")
-
-    fig, ax = plt.subplots(figsize=(max(6, _n_pca_components * 0.25), 4))
-    ax.bar(np.arange(1, _n_pca_components + 1),
-           _pca_diag.explained_variance_ratio_ * 100,
-           color="tab:blue", width=1.0)
-    if isinstance(_n_95, int):
-        ax.axvline(_n_95, color="tab:orange", linestyle="--", linewidth=1.5,
-                   label=f"95% variance ({_n_95}d)")
-    if isinstance(_n_99, int):
-        ax.axvline(_n_99, color="tab:red", linestyle=":", linewidth=1.5,
-                   label=f"99% variance ({_n_99}d)")
-    ax.set_xlabel("PCA component")
-    ax.set_ylabel("Explained variance (%)")
-    ax.set_title(
-        f"Latent space PCA variance  —  {_pca_all.shape[1]}d projection\n"
-        f"95% in {_n_95}d  |  99% in {_n_99}d  |  {_n_pca_components}-component coverage: {_cumvar[-1]:.3f}"
-    )
-    ax.legend()
-    ax.grid(True, axis="y", alpha=0.3)
-    plt.tight_layout()
-    _pca_fig_path = FIGURES_DIR / f"pca_variance{_suffix}.png"
-    fig.savefig(_pca_fig_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  PCA variance plot saved to {_pca_fig_path}")
-
-    # =========================================================================
-    # UMAP VISUALIZATIONS
-    # =========================================================================
+    # Generate UMAP plots (default behavior unless disabled)
     if not args.no_plot_umap:
         print(f"\nGenerating UMAP visualizations{_label}...")
 
@@ -1103,6 +963,7 @@ for _item in _items:
         _lf_train = labels_full[train_idx][:_n_tr]
         _lf_test  = labels_full[test_idx][:_n_te]
 
+        # ── "all" UMAP: unlabelled train (if any) + labelled train + test
         if unlab_projections is not None:
             _n_ul = len(unlab_projections)
             _lf_unlab = np.zeros((_n_ul, _lf_train.shape[1]), dtype=_lf_train.dtype)
@@ -1139,6 +1000,7 @@ for _item in _items:
                 split_masks=_split_masks_all,
             )
 
+        # ── Scalar colourings: brightness and label count ─────────────────────
         _img_parts = []
         if unlab_projections is not None:
             _img_parts.append(unlabelled_images[:_n_ul])
@@ -1155,6 +1017,7 @@ for _item in _items:
             cmap='plasma',
         )
 
+        # Interest score (1–4) from tier assignment, mirroring Protege config.
         _lf_b    = _all_lf.astype(bool)
         _interest = np.ones(len(_all_lf), dtype=float)
         for _score, _cols in TIERS:
@@ -1170,9 +1033,12 @@ for _item in _items:
             cbar_ticks=[1, 2, 3, 4],
         )
 
+        # ── "test" UMAP: test only ────────────────────────────────────────────
         _, _test_2d = fit_umap(test_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
         np.save(DATA_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
 
+
+        # ── Outlier plot: extremes from the train portion of the all-UMAP ─────
         plot_umap_outliers(
             _all_2d[:_n_tr],
             train_images[:_n_tr],
@@ -1181,15 +1047,18 @@ for _item in _items:
             save_prefix=f"umap_outliers{_suffix}",
         )
 
-        print(f"\nUMAP plots saved to {UMAP_DIR}/")
+        print(f"\n✓ UMAP plots saved to {UMAP_DIR}/")
 
-    # =========================================================================
-    # CLUSTERING METRICS
-    # =========================================================================
+    # Compute metrics (silhouette, Davies-Bouldin, Calinski-Harabasz) for test and train projections
     if not args.no_metrics:
+        # take the following cases :
+        # - only FRI vs only FRII;
+        # - all the base classes (FRI only, FRII only, all Hybrids, Spirals only, Relaxed doubles only) together
+
         metrics = {}
         _metric_splits = [('train', train_projections, train_labels[:len(train_projections)]),
                           ('test', test_projections, test_labels[:len(test_projections)])]
+        # "all" = unlabelled train (zero labels) + labelled train + test
         _all_m_projs  = []
         _all_m_labels = []
         if unlab_projections is not None:
@@ -1206,6 +1075,7 @@ for _item in _items:
             fri_only = (split_labels[:, 0] == 1) & (split_labels[:, 1] == 0)
             frii_only = (split_labels[:, 1] == 1) & (split_labels[:, 0] == 0)
             combined_fri_frii = fri_only | frii_only
+            #the labels are in the format of a one-hot encoding, so we need to convert them to a single label for each class
             labels_hot = np.argmax(split_labels[combined_fri_frii][:, :2], axis=1)
             metrics[split]['fri_vs_frii'] = {
                 'silhouette': float(silhouette_score(projections[combined_fri_frii], labels_hot)),
@@ -1220,16 +1090,17 @@ for _item in _items:
             combined = fri_only | frii_only | all_hybrids | spirals_only | relaxed_doubles_only
 
             labels_hot = np.argmax(split_labels[combined][:, :5], axis=1)
-            labels_hot[all_hybrids[combined]] = 2
+            labels_hot[all_hybrids[combined]] = 2  # assign hybrid label (index 2) to all hybrids, even if they also have spiral or relaxed double labels
             metrics[split]['base_classes'] = {
                 'silhouette': float(silhouette_score(projections[combined], labels_hot)),
                 'davies_bouldin': float(davies_bouldin_score(projections[combined], labels_hot)),
                 'calinski_harabasz': float(calinski_harabasz_score(projections[combined], labels_hot))
             }
 
+        # and save to a json file
         with open(OUTPUT_DIR / f'projection_metrics{_suffix}.json', 'w') as f:
             json.dump(metrics, f, indent=4)
-        print(f"Projection clustering metrics saved to {OUTPUT_DIR / f'projection_metrics{_suffix}.json'}")
+        print(f"✓ Projection clustering metrics saved to {OUTPUT_DIR / f'projection_metrics{_suffix}.json'}")
 
 print(f"\n{'='*70}")
 print("SCRIPT COMPLETE")
@@ -1253,6 +1124,7 @@ if args.run_protege:
     PROTEGE_DIR = OUTPUT_DIR / "protege"
     PROTEGE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # --- Load projections + indices ---
     lab_proj  = np.load(DATA_DIR / "labelled_train_projections.npy")
     lab_idx   = np.load(DATA_DIR / "labelled_train_idx.npy")
     unlab_proj_path = DATA_DIR / "unlabelled_train_projections.npy"
@@ -1267,24 +1139,28 @@ if args.run_protege:
     test_proj_prot   = np.load(DATA_DIR / "test_projections.npy")
     test_idx_prot    = np.load(DATA_DIR / "test_idx.npy")
 
+    # --- Source names from CSV ---
     _csv_df    = pd.read_csv("/users/mbredber/p3_SUPLAT/data/metadata/lotss_classifications_horton_et_al_2025_filtered.csv")
     _labels_all = np.load("/users/mbredber/p3_SUPLAT/data/preprocessed/lotss/labels_filtered.npy")
 
     train_source_names = _csv_df.iloc[cat_idx]["Source_Name"].values
     test_source_names  = _csv_df.iloc[test_idx_prot]["Source_Name"].values
 
+    # --- Build human_label for train ---
     _labels_train_df = pd.DataFrame(_labels_all[cat_idx].astype(bool), columns=LABEL_COLS)
     _human_train = np.ones(len(_labels_train_df), dtype=int)
     for _sv, _sc in TIERS:
         _human_train[_labels_train_df[_sc].any(axis=1).values] = _sv
     labels_df = pd.DataFrame({"human_label": _human_train}, index=train_source_names)
 
+    # --- Build human_label for test ---
     _labels_test_df = pd.DataFrame(_labels_all[test_idx_prot].astype(bool), columns=LABEL_COLS)
     _human_test = np.ones(len(_labels_test_df), dtype=int)
     for _sv, _sc in TIERS:
         _human_test[_labels_test_df[_sc].any(axis=1).values] = _sv
     test_labels_df = pd.DataFrame({"human_label": _human_test}, index=test_source_names)
 
+    # --- Standardise (+ optional PCA at 0.95 variance) — fit on train only ---
     np.random.seed(DATA_SEED)
     scaler      = StandardScaler()
     cat_scaled  = scaler.fit_transform(cat_proj)
@@ -1303,6 +1179,7 @@ if args.run_protege:
     features_test  = pd.DataFrame(test_pca, index=test_source_names)
     n_train = len(features_train)
 
+    # --- PCA-based seeding: sort by first PCA component, pick equally spaced ---
     _sorted_order   = np.argsort(cat_pca[:, 0])
     _seed_positions = np.linspace(0, n_train - 1, PROTEGE_INITIAL_STEPS, dtype=int)
     _seed_rows      = _sorted_order[_seed_positions]
@@ -1311,9 +1188,11 @@ if args.run_protege:
     anomaly_scores = pd.DataFrame({"score": np.zeros(n_train)}, index=features_train.index)
     anomaly_scores.loc[seed_names, "score"] = labels_df.loc[seed_names, "human_label"].values.astype(float)
 
+    # --- ScoreConverter ---
     score_converter = human_loop_learning.ScoreConverter(force_rerun=True, output_dir=str(PROTEGE_DIR))
     anomaly_scores  = score_converter.run(anomaly_scores)
 
+    # --- Active learning: exhaust all train sources ---
     def _run_GP_exhaustive(features, labels, input_anomaly_scores, output_dir, steps=10, initial_steps=None, epsilon=0.5):
         _as = input_anomaly_scores.copy()
         _as['human_label'] = [-1] * len(_as)
@@ -1347,6 +1226,7 @@ if args.run_protege:
         epsilon=0.0,
     )
 
+    # --- Eval on fixed test split ---
     test_scores = gp_pipeline.estimator.predict(features_test.values)
     test_output = pd.DataFrame({"trained_score": test_scores, "human_label": -2}, index=features_test.index)
 
@@ -1362,6 +1242,7 @@ if args.run_protege:
     auc = float(np.trapz(cum_found, x) / (n_eval * n_pos)) if n_pos > 0 else 0.0
     print(f"  Test-set AUC={auc:.4f}  ({n_pos} positives in {n_eval} eval sources)")
 
+    # --- Save recall_curve.png ---
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.plot(x, cum_found, label=f"Protege (AUC={auc:.4f})", linewidth=2)
     ax.plot(x, x * (n_pos / n_eval), "k--", label="Random baseline", linewidth=1.5, alpha=0.7)
@@ -1373,9 +1254,11 @@ if args.run_protege:
     fig.savefig(PROTEGE_DIR / "recall_curve.png", dpi=120)
     plt.close(fig)
 
+    # --- Save protege_scores.parquet ---
     combined_output = pd.concat([active_output, test_output])
     combined_output.to_parquet(PROTEGE_DIR / "protege_scores.parquet")
 
+    # --- Save protege_summary.json ---
     summary = {
         "run_dir":          str(OUTPUT_DIR),
         "data_seed":        DATA_SEED,
@@ -1391,6 +1274,7 @@ if args.run_protege:
     with open(PROTEGE_DIR / "protege_summary.json", "w") as _fh:
         json.dump(summary, _fh, indent=2)
 
+    # Move astronomaly.log → logs/protege.log
     import logging as _logging, shutil as _shutil
     for _h in list(_logging.getLogger().handlers):
         if isinstance(_h, _logging.FileHandler) and 'astronomaly.log' in _h.baseFilename:
@@ -1399,5 +1283,6 @@ if args.run_protege:
             _shutil.move(_h.baseFilename, LOGS_DIR / 'protege.log')
             break
 
-    print(f"\nProtege outputs saved to {PROTEGE_DIR}/")
+    print(f"\n✓ Protege outputs saved to {PROTEGE_DIR}/")
     print(f"  recall_curve.png, protege_scores.parquet, protege_summary.json")
+    print(f"  logs/protege.log")
