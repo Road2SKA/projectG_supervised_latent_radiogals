@@ -193,7 +193,7 @@ if args.projector == 'mlp' and args.projection_dim is None:
 BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.lr
 NUM_EPOCHS = args.epochs
-EMA_DECAY = 0.99
+EMA_DECAY = 0.99 # Standard BYOL decay; can be tuned if desired but generally works well across settings
 PROJECTION_DIM = args.projection_dim
 HIDDEN_DIM = args.hidden_dim
 MODEL_TYPE = args.model_type
@@ -701,11 +701,9 @@ def train_fold(train_loader, test_loader, extract_loader=None):
                 x2_lab = x2_friend[is_labelled].to(device)
                 pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1_lab, x2_lab)
                 loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
-                loss = loss + current_supervision_weight * loss_friend
+                loss = (loss_trans + current_supervision_weight * loss_friend) / (1 + current_supervision_weight)
                 train_friend_loss += loss_friend.item()
                 train_friend_batches += 1
-
-            loss = loss / (1 + current_supervision_weight)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -1069,8 +1067,9 @@ for _item in _items:
         model, train_extract_loader, MODEL_TYPE, device, max_batches=None
     )
     print(f"   Train set projections: {train_projections.shape}")
+    _test_extract_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=False)[1]
     test_projections = extract_embeddings_from_loader(
-        model, test_loader, MODEL_TYPE, device, max_batches=None
+        model, _test_extract_loader, MODEL_TYPE, device, max_batches=None
     )
     print(f"   Test set projections: {test_projections.shape}")
 

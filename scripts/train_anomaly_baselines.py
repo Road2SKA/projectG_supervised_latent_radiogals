@@ -85,9 +85,8 @@ def run_GP_active_learning(features, labels, input_anomaly_scores, output_dir,
                            checkpoint_path=None, checkpoint_interval=100):
     """Direct sklearn GP implementation.
 
-    Speedups vs. the astronomaly wrapper:
-    - Kernel hyperparameters are optimised only on the first fit; the fitted
-      kernel is reused for all subsequent iterations (skips L-BFGS each time).
+    - Kernel hyperparameters are re-optimised on every fit so the GP adapts
+      as more labels are collected.
     - Acquisition scores are computed only for still-unlabelled sources.
     - Final trained_score for all sources is computed in one pass at the end.
 
@@ -98,10 +97,9 @@ def run_GP_active_learning(features, labels, input_anomaly_scores, output_dir,
     n_total     = len(features)
     h_labels    = np.full(n_total, -1.0)   # -1 = unlabelled
     acq         = np.zeros(n_total)
-    fitted_kernel = None
-    gpr           = None
-    fit_times     = []   # list of (n_labelled, elapsed_s)
-    _iter_count   = 0
+    gpr         = None
+    fit_times   = []   # list of (n_labelled, elapsed_s)
+    _iter_count = 0
 
     # ── Resume from checkpoint if available ──────────────────────────────────
     if checkpoint_path is not None and Path(checkpoint_path).exists():
@@ -113,20 +111,19 @@ def run_GP_active_learning(features, labels, input_anomaly_scores, output_dir,
         _fit_and_acquire_bootstrap = False
 
     def _fit_and_acquire():
-        nonlocal fitted_kernel, gpr
+        nonlocal gpr
         labelled  = h_labels != -1
         X_train   = feature_arr[labelled]
         y_train   = h_labels[labelled]
 
-        # First call: optimise hyperparameters.  Subsequent calls: fixed kernel.
-        kernel = fitted_kernel if fitted_kernel is not None else Matern() + WhiteKernel()
+        # Re-optimise kernel hyperparameters on every fit so the GP adapts as
+        # the labelled set grows (freezing after the first fit locks in a
+        # degenerate kernel when early seeds are uninformative).
         gpr = GaussianProcessRegressor(
-            kernel=kernel,
-            optimizer=None if fitted_kernel is not None else 'fmin_l_bfgs_b',
+            kernel=Matern() + WhiteKernel(),
+            optimizer='fmin_l_bfgs_b',
         )
         gpr.fit(X_train, y_train)
-        if fitted_kernel is None:
-            fitted_kernel = gpr.kernel_
 
         # Acquisition only for unlabelled sources — no need to predict on known points.
         unlabelled = ~labelled
@@ -342,7 +339,7 @@ def run_complexity(base_dir, data_dir, csv_df, labels_all, images,
 # ---------------------------------------------------------------------------
 def run_ellipses_single(run_dir, csv_df, labels_all, images,
                         train_idx, test_idx, run_idx,
-                        epsilon, steps, max_queries):
+                        epsilon, steps):
     run_dir.mkdir(parents=True, exist_ok=True)
     summary_path = run_dir / "protege_summary.json"
 
@@ -360,29 +357,34 @@ def run_ellipses_single(run_dir, csv_df, labels_all, images,
     images_split = images[all_idx]
     dataset    = _NumpyImageDataset(images_split, output_dir=str(tmp_dir), force_rerun=True)
     extractor  = _sf.EllipseFitFeatures(
-        percentiles=[90, 70, 50, 0], channel=0,
+        percentiles=[90, 80, 70, 60, 50, 0], channel=0,
         output_dir=str(tmp_dir), force_rerun=True
     )
     ell_feats = extractor.run_on_dataset(dataset)
 
-    # IForest on train portion only (features_train index = 0..n_train-1 as strings)
-    train_str_idx = [str(i) for i in range(n_train)]
-    ell_feats_train = ell_feats.loc[train_str_idx]
+    # Drop sources whose ellipse features are all-NaN (fit failed)
+    nan_mask = ell_feats.isna().any(axis=1)
+    n_nan = int(nan_mask.sum())
+    if n_nan > 0:
+        print(f"    run {run_idx:02d}: dropping {n_nan}/{len(ell_feats)} NaN feature rows",
+              flush=True)
+        ell_feats = ell_feats[~nan_mask]
 
-    iforest_tmp = run_dir / "_iforest_tmp"
-    iforest_tmp.mkdir(exist_ok=True)
-    iforest = _isof.IforestAlgorithm(
-        random_state=run_idx, output_dir=str(iforest_tmp), force_rerun=True
-    )
-    iforest_scores = iforest.run(ell_feats_train)   # lower (more negative) = more anomalous
+    # Re-derive train/test membership from surviving string indices
+    surviving      = np.array([int(s) for s in ell_feats.index])
+    is_train       = surviving < n_train
+    surv_train_str = [str(i) for i in surviving[is_train]]
+    surv_test_str  = [str(i) for i in surviving[~is_train]]
 
-    # Map string indices → source names
-    str_to_name_train = {str(i): source_names[i] for i in range(n_train)}
-    str_to_name_all   = {str(i): source_names[i] for i in range(len(all_idx))}
+    # Rebuild source_names and labels_df for surviving sources only
+    surv_all_idx   = all_idx[surviving]
+    source_names   = csv_df.iloc[surv_all_idx]["Source_Name"].values
+    labels_df      = _build_labels_df(labels_all, surv_all_idx, source_names)
+    str_to_name    = {str(s): source_names[k] for k, s in enumerate(surviving)}
 
-    ell_feats_named = ell_feats.rename(index=str_to_name_all)
-    features_train  = ell_feats_named.iloc[:n_train]
-    features_test   = ell_feats_named.iloc[n_train:]
+    ell_feats_named = ell_feats.rename(index=str_to_name)
+    features_train  = ell_feats_named.loc[[str_to_name[s] for s in surv_train_str]]
+    features_test   = ell_feats_named.loc[[str_to_name[s] for s in surv_test_str]]
 
     # Scale
     scaler = StandardScaler()
@@ -397,12 +399,12 @@ def run_ellipses_single(run_dir, csv_df, labels_all, images,
         columns=features_test.columns,
     )
 
-    # Anomaly scores for seeding: negate IForest scores so largest = most anomalous
-    iforest_scores_named = iforest_scores.rename(index=str_to_name_train)
-    anomaly_scores = pd.DataFrame(
-        {"score": -iforest_scores_named["score"].values},
-        index=features_train.index,
-    )
+    # Random seeding: pick PROTEGE_INITIAL_STEPS sources uniformly at random.
+    # run_idx seeds the RNG so each run gets a different but reproducible seed set.
+    rng = np.random.default_rng(run_idx)
+    seed_mask = np.zeros(len(features_train))
+    seed_mask[rng.choice(len(features_train), size=PROTEGE_INITIAL_STEPS, replace=False)] = 1.0
+    anomaly_scores = pd.DataFrame({"score": seed_mask}, index=features_train.index)
 
     print(f"    run {run_idx:02d}: GP active learning  steps={steps}  epsilon={epsilon}", flush=True)
     ckpt_path = run_dir / "gp_checkpoint.npy"
@@ -412,7 +414,6 @@ def run_ellipses_single(run_dir, csv_df, labels_all, images,
         steps=steps,
         initial_steps=PROTEGE_INITIAL_STEPS,
         epsilon=epsilon,
-        max_queries=max_queries,
         checkpoint_path=str(ckpt_path),
     )
     ckpt_path.unlink(missing_ok=True)
@@ -459,7 +460,7 @@ def run_ellipses_single(run_dir, csv_df, labels_all, images,
 # Ellipses aggregate: mean±std plot + summary
 # ---------------------------------------------------------------------------
 def run_ellipses(base_dir, data_dir, csv_df, labels_all, images,
-                 train_idx, test_idx, epsilon, steps, max_queries, n_runs, force):
+                 train_idx, test_idx, epsilon, steps, n_runs, force):
     ell_dir = base_dir / "ellipses"
     agg_path = ell_dir / "aggregate_summary.json"
 
@@ -491,7 +492,7 @@ def run_ellipses(base_dir, data_dir, csv_df, labels_all, images,
             auc, cum_found, n_pos, n_eval = run_ellipses_single(
                 run_dir, csv_df, labels_all, images,
                 train_idx, test_idx, run_idx=i,
-                epsilon=epsilon, steps=steps, max_queries=max_queries,
+                epsilon=epsilon, steps=steps,
             )
             aucs.append(auc)
             cum_curves.append(cum_found)
@@ -755,7 +756,7 @@ def main():
                 base_dir, data_dir_out, csv_df, labels_all, images,
                 train_idx, test_idx,
                 epsilon=args.epsilon, steps=args.steps,
-                max_queries=args.max_queries, n_runs=args.n_runs, force=args.force,
+                n_runs=args.n_runs, force=args.force,
             )
 
     print("\nDone.", flush=True)
