@@ -270,11 +270,9 @@ def run_complexity(base_dir, data_dir, csv_df, labels_all, images,
     features_train = features_df.iloc[:n_train]
     features_test  = features_df.iloc[n_train:]
 
-    # Seed: 10 equally-spaced points along featurecount (ascending)
-    sorted_order   = np.argsort(features_train.values[:, 0])
+    # Seed: evenly-spaced positions in the train DataFrame (matches notebook)
     seed_positions = np.linspace(0, n_train - 1, PROTEGE_INITIAL_STEPS, dtype=int)
-    seed_rows      = sorted_order[seed_positions]
-    seed_names     = features_train.index[seed_rows]
+    seed_names     = features_train.index[seed_positions]
 
     anomaly_scores = pd.DataFrame(
         {"score": np.zeros(n_train)}, index=features_train.index
@@ -399,12 +397,11 @@ def run_ellipses_single(run_dir, csv_df, labels_all, images,
         columns=features_test.columns,
     )
 
-    # Random seeding: pick PROTEGE_INITIAL_STEPS sources uniformly at random.
-    # run_idx seeds the RNG so each run gets a different but reproducible seed set.
-    rng = np.random.default_rng(run_idx)
-    seed_mask = np.zeros(len(features_train))
-    seed_mask[rng.choice(len(features_train), size=PROTEGE_INITIAL_STEPS, replace=False)] = 1.0
-    anomaly_scores = pd.DataFrame({"score": seed_mask}, index=features_train.index)
+    # Seed: evenly-spaced positions in the train DataFrame (matches notebook)
+    seed_positions = np.linspace(0, len(features_train) - 1, PROTEGE_INITIAL_STEPS, dtype=int)
+    seed_names     = features_train.index[seed_positions]
+    anomaly_scores = pd.DataFrame({"score": np.zeros(len(features_train))}, index=features_train.index)
+    anomaly_scores.loc[seed_names, "score"] = labels_df.loc[seed_names, "human_label"].values.astype(float)
 
     print(f"    run {run_idx:02d}: GP active learning  steps={steps}  epsilon={epsilon}", flush=True)
     ckpt_path = run_dir / "gp_checkpoint.npy"

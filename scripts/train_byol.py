@@ -193,7 +193,7 @@ if args.projector == 'mlp' and args.projection_dim is None:
 BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.lr
 NUM_EPOCHS = args.epochs
-EMA_DECAY = 0.99 # Standard BYOL decay; can be tuned if desired but generally works well across settings
+EMA_DECAY = 0.996 # Standard BYOL decay; can be tuned if desired but generally works well across settings
 PROJECTION_DIM = args.projection_dim
 HIDDEN_DIM = args.hidden_dim
 MODEL_TYPE = args.model_type
