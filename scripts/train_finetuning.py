@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedShuffleSplit, train_test_split
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -38,6 +38,16 @@ from suplat.models.byol_models import (
     create_resnet18_backbone,
     create_resnet50_backbone,
 )
+
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("Expected a boolean value.")
 
 use_cuda = torch.cuda.is_available()
 if use_cuda:
@@ -71,6 +81,15 @@ def parse_args():
         help=(
             "Number of early encoder feature blocks to freeze. "
             "For EfficientNet-B0, 0 trains all blocks and 9 freezes all feature blocks."
+        ),
+    )
+    ap.add_argument(
+        "--finetune",
+        type=str_to_bool,
+        default=True,
+        help=(
+            "Whether to fine-tune the model."
+            "If False, load the given architecture but initializes with new weights and train from scratch."
         ),
     )
     ap.add_argument(
@@ -247,7 +266,11 @@ model = BYOLEfficientNetB0(
     dropout_rate=0.2,
 )
 
-model.load_state_dict(checkpoint["model_state_dict"])
+if args.finetune:
+    model.load_state_dict(checkpoint["model_state_dict"])
+else:
+    print("Training from scratch with checkpoint architecture and newly initialized weights")
+    FREEZE_LAYERS = 0
 model = model.to(device)
 
 num_classes = labels.shape[1]
@@ -346,6 +369,7 @@ torch.save(
         "optimizer_state_dict": optimizer.state_dict(),
         "config": {
             "pretrained_model_path": str(BYOL_PATH),
+            "finetune": args.finetune,
             "freeze_layers": FREEZE_LAYERS,
             "lr": LEARNING_RATE,
             "epochs": NUM_EPOCHS,
@@ -374,3 +398,78 @@ curve_path = OUTPUT_DIR / "learning_curve.png"
 fig.savefig(curve_path, dpi=150, bbox_inches="tight")
 plt.close(fig)
 print(f"Learning curve saved to {curve_path}")
+
+def compute_finetuning_metrics(dataset):
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=args.num_workers,
+        pin_memory=use_cuda,
+    )
+    labels_list = []
+    probs_list = []
+
+    finetune_model.eval()
+    with torch.inference_mode():
+        for _, x_aug, y in loader:
+            x_aug = x_aug.float().to(device, non_blocking=use_cuda)
+            y = y.float().to(device, non_blocking=use_cuda)
+
+            if y.ndim == 3 and y.shape[1] == 1:
+                y = y.squeeze(1)
+
+            probs_list.append(torch.sigmoid(finetune_model(x_aug)).cpu())
+            labels_list.append(y.cpu())
+
+    y_true = torch.cat(labels_list).to(torch.bool)
+    y_prob = torch.cat(probs_list)
+    y_pred = y_prob >= 0.5
+
+    tp = (y_pred & y_true).sum(dim=0).float()
+    fp = (y_pred & ~y_true).sum(dim=0).float()
+    fn = (~y_pred & y_true).sum(dim=0).float()
+    tn = (~y_pred & ~y_true).sum(dim=0).float()
+
+    precision = torch.where(tp + fp > 0, tp / (tp + fp), torch.zeros_like(tp))
+    recall = torch.where(tp + fn > 0, tp / (tp + fn), torch.zeros_like(tp))
+    f1 = torch.where(
+        precision + recall > 0,
+        2 * precision * recall / (precision + recall),
+        torch.zeros_like(precision),
+    )
+    accuracy = (tp + tn) / y_true.shape[0]
+
+    y_true_np = y_true.numpy()
+    y_prob_np = y_prob.numpy()
+    auc = []
+    for i in range(num_classes):
+        if np.unique(y_true_np[:, i]).size < 2:
+            auc.append(None)
+        else:
+            auc.append(float(roc_auc_score(y_true_np[:, i], y_prob_np[:, i])))
+
+    print(f'shape of y_true: {y_true.shape[0]}')
+
+    return {
+        "precision": precision.tolist(),
+        "recall": recall.tolist(),
+        "f1": f1.tolist(),
+        "accuracy": accuracy.tolist(),
+        "auc": auc,
+        "macro_f1": [float(f1.mean().item())],
+    }
+
+
+train_metrics = compute_finetuning_metrics(lab_ds)
+test_metrics = compute_finetuning_metrics(test_lab_ds)
+metrics = {
+    key: {"train": train_metrics[key], "test": test_metrics[key]}
+    for key in train_metrics
+}
+
+metrics_path = OUTPUT_DIR / "finetuning_metrics.json"
+with open(metrics_path, "w") as f:
+    json.dump(metrics, f, indent=2)
+print(f"Finetuning metrics saved to {metrics_path}")
