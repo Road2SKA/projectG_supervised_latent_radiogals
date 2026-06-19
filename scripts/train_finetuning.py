@@ -39,15 +39,18 @@ from suplat.models.byol_models import (
     create_resnet50_backbone,
 )
 
-def str_to_bool(value):
-    if isinstance(value, bool):
-        return value
-    value = value.lower()
-    if value in {"true", "1", "yes", "y"}:
-        return True
-    if value in {"false", "0", "no", "n"}:
-        return False
-    raise argparse.ArgumentTypeError("Expected a boolean value.")
+TRAINING_MODE_DESCRIPTIONS = {
+    1: "Freeze embeddings: frozen encoder and projector; train linear classifier only.",
+    2: "Freeze features: frozen encoder; fine-tune projector and train linear classifier.",
+    3: "No freeze: fine-tune encoder and projector; train linear classifier.",
+    4: "Supervised: initialize from scratch and train encoder, projector, and linear classifier.",
+}
+
+def positive_int(value):
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError("Expected an integer >= 1.")
+    return value
 
 use_cuda = torch.cuda.is_available()
 if use_cuda:
@@ -64,7 +67,15 @@ else:
 def parse_args():
     """Parse command-line arguments for BYOL encoder fine-tuning."""
     ap = argparse.ArgumentParser(
-        description="Fine-tune a BYOL-pretrained model for multi-label classification."
+        description="Fine-tune a BYOL-pretrained model for multi-label classification.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Training modes:\n"
+            + "\n".join(
+                f"  {mode}: {description}"
+                for mode, description in TRAINING_MODE_DESCRIPTIONS.items()
+            )
+        ),
     )
 
     # Required fine-tuning configuration
@@ -75,22 +86,11 @@ def parse_args():
         help="Path to the pretrained BYOL checkpoint to fine-tune.",
     )
     ap.add_argument(
-        "--freeze-layers",
+        "--training-mode",
         type=int,
-        default=5,
-        help=(
-            "Number of early encoder feature blocks to freeze. "
-            "For EfficientNet-B0, 0 trains all blocks and 9 freezes all feature blocks."
-        ),
-    )
-    ap.add_argument(
-        "--finetune",
-        type=str_to_bool,
-        default=True,
-        help=(
-            "Whether to fine-tune the model."
-            "If False, load the given architecture but initializes with new weights and train from scratch."
-        ),
+        default=3,
+        choices=tuple(TRAINING_MODE_DESCRIPTIONS),
+        help="Training strategy. See descriptions below.",
     )
     ap.add_argument(
         "--lr",
@@ -103,6 +103,12 @@ def parse_args():
         type=int,
         default=10,
         help="Number of fine-tuning epochs.",
+    )
+    ap.add_argument(
+        "--n-models",
+        type=positive_int,
+        default=1,
+        help="Number of models to train with different initializations.",
     )
     # Data and run configuration
     ap.add_argument(
@@ -149,38 +155,49 @@ def parse_args():
 
 
 class BYOLFineTuner(nn.Module):
-    def __init__(self, byol_model, num_classes=21, freeze_until_feature_idx=0):
+    def __init__(self, byol_model, num_classes=21, training_mode=3):
         super().__init__()
 
         self.encoder = byol_model.online_encoder
         self.projector = byol_model.online_projector
+        self.training_mode = training_mode
 
         # BYOL projection_dim = 128 in your case
         self.classifier = nn.Linear(128, num_classes)
 
-        self.freeze_encoder_until(freeze_until_feature_idx)
+        self.apply_training_mode(training_mode)
 
-    def freeze_encoder_until(self, freeze_until_feature_idx):
+    def apply_training_mode(self, training_mode):
         """
-        freeze_until_feature_idx:
-            0 = train all encoder
-            5 = freeze encoder.features[0] ... encoder.features[4]
-            9 = freeze all EfficientNet features
+        training_mode:
+            1 = freeze encoder + projector, train classifier only
+            2 = freeze encoder, train projector + classifier
+            3 = train encoder + projector + classifier
+            4 = train encoder + projector + classifier from scratch
         """
+        if training_mode not in TRAINING_MODE_DESCRIPTIONS:
+            raise ValueError(
+                f"Unknown training_mode={training_mode}. "
+                f"Expected one of {sorted(TRAINING_MODE_DESCRIPTIONS)}."
+            )
 
-        # First train everything
         for p in self.encoder.parameters():
-            p.requires_grad = True
+            p.requires_grad = training_mode in {3, 4}
         for p in self.projector.parameters():
-            p.requires_grad = True
+            p.requires_grad = training_mode in {2, 3, 4}
         for p in self.classifier.parameters():
             p.requires_grad = True
 
-        # Then freeze early EfficientNet blocks
-        for idx, block in enumerate(self.encoder.features):
-            if idx < freeze_until_feature_idx:
-                for p in block.parameters():
-                    p.requires_grad = False
+    def train(self, mode=True):
+        super().train(mode)
+
+        if mode:
+            if self.training_mode in {1, 2}:
+                self.encoder.eval()
+            if self.training_mode == 1:
+                self.projector.eval()
+
+        return self
 
     def forward(self, x):
         z = self.encoder(x)
@@ -209,8 +226,9 @@ print(labels.shape)
 
 DATA_SEED = checkpoint["config"]['data_seed']
 F_LABEL = checkpoint["config"]['f_label']
-FREEZE_LAYERS = args.freeze_layers
+TRAINING_MODE = args.training_mode
 LEARNING_RATE = args.lr
+N_MODELS = args.n_models
 
 TRAIN_RATIO, TEST_RATIO = 0.70, 0.30
 
@@ -258,87 +276,81 @@ labelled_test_loader = DataLoader(test_lab_ds, batch_size=256, shuffle=True, dro
 
 print(f"With current settings, Train/Test sizes are {len(lab_ds)}/{len(test_lab_ds)}")
 
-model = BYOLEfficientNetB0(
-    projection_dim=checkpoint["config"]['projection_dim'],
-    hidden_dim=checkpoint["config"]['hidden_dim'],
-    bn_momentum=0.1,
-    feature_compression_mode=checkpoint["config"]['projector'],
-    dropout_rate=0.2,
-)
-
-if args.finetune:
-    model.load_state_dict(checkpoint["model_state_dict"])
-else:
-    print("Training from scratch with checkpoint architecture and newly initialized weights")
-    FREEZE_LAYERS = 0
-model = model.to(device)
+print(f"Training mode {TRAINING_MODE}: {TRAINING_MODE_DESCRIPTIONS[TRAINING_MODE]}")
+print(f"Training {N_MODELS} model(s) with different initializations")
 
 num_classes = labels.shape[1]
-
-finetune_model = BYOLFineTuner(
-    byol_model=model,
-    num_classes=num_classes,
-    freeze_until_feature_idx=FREEZE_LAYERS,
-)
-
-finetune_model = finetune_model.to(device)
-
-optimizer = torch.optim.AdamW(
-    filter(lambda p: p.requires_grad, finetune_model.parameters()),
-    lr=LEARNING_RATE,
-    weight_decay=1e-4,
-)
-
 criterion = nn.BCEWithLogitsLoss()
 
 NUM_EPOCHS = args.epochs
 
-train_losses = []
-test_losses = []
 
-for epoch in range(NUM_EPOCHS):
+def seed_model_initialization(model_idx):
+    seed = DATA_SEED + model_idx
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if use_cuda:
+        torch.cuda.manual_seed_all(seed)
+    return seed
 
-    # ======================
-    # TRAIN
-    # ======================
-    finetune_model.train()
 
-    train_loss = 0.0
-    train_batches = 0
+def seed_training_randomness():
+    random.seed(DATA_SEED)
+    np.random.seed(DATA_SEED)
+    torch.manual_seed(DATA_SEED)
+    if use_cuda:
+        torch.cuda.manual_seed_all(DATA_SEED)
 
-    for batch in labelled_train_loader:
-        x1, x1_aug, x1_lab = batch
 
-        x1_aug = x1_aug.float().to(device)
-        y = x1_lab.float().to(device)
+def build_finetune_model(model_idx):
+    run_seed = seed_model_initialization(model_idx)
 
-        if y.ndim == 3 and y.shape[1] == 1:
-            y = y.squeeze(1)
+    model = BYOLEfficientNetB0(
+        projection_dim=checkpoint["config"]['projection_dim'],
+        hidden_dim=checkpoint["config"]['hidden_dim'],
+        bn_momentum=0.1,
+        feature_compression_mode=checkpoint["config"]['projector'],
+        dropout_rate=0.2,
+    )
 
-        optimizer.zero_grad()
+    if TRAINING_MODE == 4:
+        print(
+            "Training from scratch with checkpoint architecture and newly initialized weights"
+        )
+    else:
+        model.load_state_dict(checkpoint["model_state_dict"])
 
-        logits = finetune_model(x1_aug)
-        loss = criterion(logits, y)
+    finetune_model = BYOLFineTuner(
+        byol_model=model,
+        num_classes=num_classes,
+        training_mode=TRAINING_MODE,
+    )
 
-        loss.backward()
-        optimizer.step()
+    return finetune_model.to(device), run_seed
 
-        train_loss += loss.detach().item()
-        train_batches += 1
 
-    avg_train_loss = train_loss / train_batches
-    train_losses.append(avg_train_loss)
+def train_one_model(finetune_model):
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, finetune_model.parameters()),
+        lr=LEARNING_RATE,
+        weight_decay=args.weight_decay,
+    )
 
-    # ======================
-    # TEST
-    # ======================
-    finetune_model.eval()
+    train_losses = []
+    test_losses = []
 
-    test_loss = 0.0
-    test_batches = 0
+    for epoch in range(NUM_EPOCHS):
 
-    with torch.no_grad():
-        for batch in labelled_test_loader:
+        # ======================
+        # TRAIN
+        # ======================
+        finetune_model.train()
+
+        train_loss = 0.0
+        train_batches = 0
+
+        for batch in labelled_train_loader:
             x1, x1_aug, x1_lab = batch
 
             x1_aug = x1_aug.float().to(device)
@@ -347,59 +359,57 @@ for epoch in range(NUM_EPOCHS):
             if y.ndim == 3 and y.shape[1] == 1:
                 y = y.squeeze(1)
 
+            optimizer.zero_grad()
+
             logits = finetune_model(x1_aug)
             loss = criterion(logits, y)
 
-            test_loss += loss.detach().item()
-            test_batches += 1
+            loss.backward()
+            optimizer.step()
 
-    avg_test_loss = test_loss / test_batches
-    test_losses.append(avg_test_loss)
+            train_loss += loss.detach().item()
+            train_batches += 1
 
-    print(
-        f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
-        f"| Train: {avg_train_loss:.4f} "
-        f"| Test: {avg_test_loss:.4f}"
-    )
+        avg_train_loss = train_loss / train_batches
+        train_losses.append(avg_train_loss)
 
-checkpoint_path = OUTPUT_DIR / "finetuned_model.pt"
-torch.save(
-    {
-        "model_state_dict": finetune_model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config": {
-            "pretrained_model_path": str(BYOL_PATH),
-            "finetune": args.finetune,
-            "freeze_layers": FREEZE_LAYERS,
-            "lr": LEARNING_RATE,
-            "epochs": NUM_EPOCHS,
-            "num_classes": num_classes,
-            "data_seed": DATA_SEED,
-            "f_label": F_LABEL,
-        },
-        "train_losses": train_losses,
-        "test_losses": test_losses,
-    },
-    checkpoint_path,
-)
-print(f"Finetuned model checkpoint saved to {checkpoint_path}")
+        # ======================
+        # TEST
+        # ======================
+        finetune_model.eval()
 
-fig, ax = plt.subplots(figsize=(6, 4))
-ax.plot(train_losses, 'b-', label="train")
-ax.plot(test_losses, 'r--', label="test")
-ax.set_xlabel("Epoch")
-ax.set_ylabel("Loss")
-ax.set_title("Finetuning")
-ax.set_yscale("log")
-ax.legend()
-ax.grid(True)
-fig.tight_layout()
-curve_path = OUTPUT_DIR / "learning_curve.png"
-fig.savefig(curve_path, dpi=150, bbox_inches="tight")
-plt.close(fig)
-print(f"Learning curve saved to {curve_path}")
+        test_loss = 0.0
+        test_batches = 0
 
-def compute_finetuning_metrics(dataset):
+        with torch.no_grad():
+            for batch in labelled_test_loader:
+                x1, x1_aug, x1_lab = batch
+
+                x1_aug = x1_aug.float().to(device)
+                y = x1_lab.float().to(device)
+
+                if y.ndim == 3 and y.shape[1] == 1:
+                    y = y.squeeze(1)
+
+                logits = finetune_model(x1_aug)
+                loss = criterion(logits, y)
+
+                test_loss += loss.detach().item()
+                test_batches += 1
+
+        avg_test_loss = test_loss / test_batches
+        test_losses.append(avg_test_loss)
+
+        print(
+            f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
+            f"| Train: {avg_train_loss:.4f} "
+            f"| Test: {avg_test_loss:.4f}"
+        )
+
+    return train_losses, test_losses, optimizer
+
+
+def compute_finetuning_metrics(finetune_model, dataset):
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -426,6 +436,7 @@ def compute_finetuning_metrics(dataset):
     y_true = torch.cat(labels_list).to(torch.bool)
     y_prob = torch.cat(probs_list)
     y_pred = y_prob >= 0.5
+    n_members = y_true.sum(dim=0)
 
     tp = (y_pred & y_true).sum(dim=0).float()
     fp = (y_pred & ~y_true).sum(dim=0).float()
@@ -459,14 +470,96 @@ def compute_finetuning_metrics(dataset):
         "accuracy": accuracy.tolist(),
         "auc": auc,
         "macro_f1": [float(f1.mean().item())],
+        "n_members": n_members.tolist(),
     }
 
 
-train_metrics = compute_finetuning_metrics(lab_ds)
-test_metrics = compute_finetuning_metrics(test_lab_ds)
+all_train_losses = []
+all_test_losses = []
+all_train_metrics = []
+all_test_metrics = []
+
+for model_idx in range(N_MODELS):
+    run_number = model_idx + 1
+    print(f"Starting model {run_number}/{N_MODELS}")
+
+    finetune_model, run_seed = build_finetune_model(model_idx)
+    seed_training_randomness()
+    train_losses, test_losses, optimizer = train_one_model(finetune_model)
+
+    all_train_losses.append(train_losses)
+    all_test_losses.append(test_losses)
+
+    checkpoint_path = OUTPUT_DIR / f"finetuned_model_{run_number}.pt"
+    torch.save(
+        {
+            "model_state_dict": finetune_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": {
+                "pretrained_model_path": str(BYOL_PATH),
+                "training_mode": TRAINING_MODE,
+                "training_mode_description": TRAINING_MODE_DESCRIPTIONS[TRAINING_MODE],
+                "lr": LEARNING_RATE,
+                "weight_decay": args.weight_decay,
+                "epochs": NUM_EPOCHS,
+                "num_classes": num_classes,
+                "data_seed": DATA_SEED,
+                "initialization_seed": run_seed,
+                "f_label": F_LABEL,
+                "model_index": run_number,
+                "n_models": N_MODELS,
+            },
+            "train_losses": train_losses,
+            "test_losses": test_losses,
+        },
+        checkpoint_path,
+    )
+    print(f"Finetuned model checkpoint saved to {checkpoint_path}")
+
+    train_metrics = compute_finetuning_metrics(finetune_model, lab_ds)
+    test_metrics = compute_finetuning_metrics(finetune_model, test_lab_ds)
+    all_train_metrics.append(train_metrics)
+    all_test_metrics.append(test_metrics)
+
+    del finetune_model
+    if use_cuda:
+        torch.cuda.empty_cache()
+
+fig, ax = plt.subplots(figsize=(6, 4))
+curve_alpha = 0.45 if N_MODELS > 1 else 1.0
+for model_idx, (train_losses, test_losses) in enumerate(
+    zip(all_train_losses, all_test_losses)
+):
+    ax.plot(
+        train_losses,
+        'b-',
+        alpha=curve_alpha,
+        label="train" if model_idx == 0 else None,
+    )
+    ax.plot(
+        test_losses,
+        'r--',
+        alpha=curve_alpha,
+        label="test" if model_idx == 0 else None,
+    )
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Loss")
+ax.set_title("Finetuning")
+ax.set_yscale("log")
+ax.legend()
+ax.grid(True)
+fig.tight_layout()
+curve_path = OUTPUT_DIR / "learning_curve.png"
+fig.savefig(curve_path, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"Learning curve saved to {curve_path}")
+
 metrics = {
-    key: {"train": train_metrics[key], "test": test_metrics[key]}
-    for key in train_metrics
+    key: {
+        "train": [run_metrics[key] for run_metrics in all_train_metrics],
+        "test": [run_metrics[key] for run_metrics in all_test_metrics],
+    }
+    for key in all_train_metrics[0]
 }
 
 metrics_path = OUTPUT_DIR / "finetuning_metrics.json"
