@@ -233,10 +233,13 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
     test_idx_path = data_dir / "test_idx.npy"
     test_hash = hashlib.sha256(open(test_idx_path, "rb").read()).hexdigest()
 
+    BASELINES_VERSION = 2   # bump when ellipse computation changes
+
     if out_path.exists() and not force:
         with open(out_path) as fh:
             cached = json.load(fh)
-        if cached.get("test_idx_hash") == test_hash:
+        if (cached.get("test_idx_hash") == test_hash
+                and cached.get("version", 1) >= BASELINES_VERSION):
             needs_train = train_idx is not None and "complexity_train" not in cached
             if not needs_train:
                 print(f"  baselines: loaded from cache (seed={data_seed})", flush=True)
@@ -263,28 +266,42 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
     print(f"  baselines: complexity AUC={auc_comp:.4f}", flush=True)
 
     # ── Baseline 2: Ellipses + IsolationForest on all images ─────────────────
+    # Matches notebook cell 30 exactly: percentiles=[90,80,70,60,50,0],
+    # drop NaN rows before fitting, assign nanmin-1 to failed sources.
     images    = np.load(IMAGES_PATH).astype(np.float32) / 255.0
     ell_cache = outputs_root / "anomaly_baselines" / f"_ell_cache_{data_seed}"
     ell_cache.mkdir(parents=True, exist_ok=True)
 
     ds  = _NumpyImageDataset(images, output_dir=str(ell_cache), force_rerun=False)
-    ext = _sf.EllipseFitFeatures(percentiles=[90, 70, 50, 0], channel=0,
+    ext = _sf.EllipseFitFeatures(percentiles=[90, 80, 70, 60, 50, 0], channel=0,
                                   output_dir=str(ell_cache), force_rerun=False)
     all_ell = ext.run_on_dataset(ds)   # shape (N_all, n_features), string int index
 
-    iforest = IsolationForest(n_estimators=200, random_state=data_seed)
-    iforest.fit(all_ell.values)
+    # Drop NaN rows before fitting (sources whose ellipse fit failed)
+    ell_nan_mask  = all_ell.isna().any(axis=1)
+    n_ell_nan     = int(ell_nan_mask.sum())
+    if n_ell_nan > 0:
+        print(f"  baselines: dropping {n_ell_nan}/{len(all_ell)} NaN ellipse rows before IsoForest fit", flush=True)
+    all_ell_clean = all_ell[~ell_nan_mask]
 
-    # Score test sources (negate: higher = more anomalous)
-    test_ell   = all_ell.iloc[test_idx]
-    ell_scores = -iforest.decision_function(test_ell.values)
+    iforest = IsolationForest(n_estimators=200, random_state=data_seed)
+    iforest.fit(all_ell_clean.values)
+
+    # Score test sources — NaN sources get nanmin - 1 (ranked last)
+    test_ell      = all_ell.iloc[test_idx]
+    test_nan_mask = test_ell.isna().any(axis=1).values
+    ell_scores    = np.full(n_eval, np.nan)
+    if (~test_nan_mask).any():
+        ell_scores[~test_nan_mask] = -iforest.decision_function(
+            test_ell.values[~test_nan_mask])
+    ell_scores[test_nan_mask] = np.nanmin(ell_scores) - 1.0
     ell_order  = np.argsort(ell_scores)[::-1]
     cum_ell    = np.cumsum((test_hl[ell_order] >= 3).astype(int))
     auc_ell    = float(np.trapezoid(cum_ell, x) / (n_eval * n_pos)) if n_pos > 0 else 0.0
     print(f"  baselines: ellipses  AUC={auc_ell:.4f}", flush=True)
 
     result = {
-        "test_idx_hash": test_hash, "data_seed": data_seed,
+        "test_idx_hash": test_hash, "data_seed": data_seed, "version": BASELINES_VERSION,
         "n_eval": n_eval, "n_pos": n_pos,
         "complexity": {"recall": cum_comp.tolist(), "x": x.tolist(), "auc": auc_comp},
         "ellipses":   {"recall": cum_ell.tolist(),  "x": x.tolist(), "auc": auc_ell},
@@ -307,8 +324,13 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
         cum_comp_tr = np.cumsum((train_hl[comp_tr] >= 3).astype(int))
         auc_comp_tr = float(np.trapezoid(cum_comp_tr, x_tr) / (n_train * n_pos_tr)) if n_pos_tr > 0 else 0.0
 
-        train_ell   = all_ell.iloc[train_idx]
-        ell_sc_tr   = -iforest.decision_function(train_ell.values)
+        train_ell      = all_ell.iloc[train_idx]
+        tr_nan_mask    = train_ell.isna().any(axis=1).values
+        ell_sc_tr      = np.full(n_train, np.nan)
+        if (~tr_nan_mask).any():
+            ell_sc_tr[~tr_nan_mask] = -iforest.decision_function(
+                train_ell.values[~tr_nan_mask])
+        ell_sc_tr[tr_nan_mask] = np.nanmin(ell_sc_tr) - 1.0
         ell_tr      = np.argsort(ell_sc_tr)[::-1]
         cum_ell_tr  = np.cumsum((train_hl[ell_tr] >= 3).astype(int))
         auc_ell_tr  = float(np.trapezoid(cum_ell_tr, x_tr) / (n_train * n_pos_tr)) if n_pos_tr > 0 else 0.0
@@ -332,8 +354,7 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
 def process_run(run_dir: Path, epsilon: float,
                 steps: int, suffix: str, csv_df: pd.DataFrame, labels_all: np.ndarray,
                 use_pca: bool = False, max_queries: int = None, timing_plot: bool = False,
-                pca_components: int = None, outputs_root: Path = None, force: bool = False,
-                force_plot: bool = False):
+                pca_components: int = None, outputs_root: Path = None, force: bool = False):
     # Incorporate pca/nopca into the output suffix so all saved files are tagged
     _pca_tag = "pca" if use_pca else "nopca"
     suffix = f"{suffix}_{_pca_tag}"
@@ -346,7 +367,7 @@ def process_run(run_dir: Path, epsilon: float,
     print(f"  data_seed={data_seed}  latent={latent_type}", flush=True)
 
     data_dir     = run_dir / "data"
-    protege_dir  = run_dir / "protege"
+    protege_dir  = data_dir / "protege"
     protege_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Load projections and indices ---
@@ -374,7 +395,7 @@ def process_run(run_dir: Path, epsilon: float,
     all_idx  = np.concatenate([train_idx, test_idx])
 
     # --- PCA variance plot (always, regardless of use_pca flag) ---
-    generate_pca_variance_plot(run_dir, all_proj, force=force_plot)
+    generate_pca_variance_plot(run_dir, all_proj, force=force)
 
     baselines = None
     if outputs_root is not None:
@@ -437,8 +458,8 @@ def process_run(run_dir: Path, epsilon: float,
     anomaly_scores = score_converter.run(anomaly_scores)
 
     parquet_path = protege_dir / f"protege_scores{suffix}.parquet"
-    if force_plot and parquet_path.exists():
-        print(f"  force-plot: loading saved scores from {parquet_path.name}", flush=True)
+    if parquet_path.exists() and not force:
+        print(f"  loading saved scores from {parquet_path.name}", flush=True)
         active_output = pd.read_parquet(parquet_path)
         fit_times = []
     else:
@@ -463,6 +484,22 @@ def process_run(run_dir: Path, epsilon: float,
     # active_output has rows for ALL sources (train + test)
     train_active = active_output.iloc[:n_train_rows]
     test_output  = active_output.iloc[n_train_rows:]
+
+    # --- Load notebook Ellipses GP scores (saved by rare_object_detection.ipynb) ---
+    _ell_gp_paths = sorted(protege_dir.glob("ellipses_gp_nb_q*.parquet"))
+    ell_gp_nb_train = None
+    ell_gp_nb_test  = None
+    if _ell_gp_paths:
+        try:
+            _ell_df = pd.read_parquet(_ell_gp_paths[-1])
+            ell_gp_nb_train = _ell_df[_ell_df["split"] == "train"]["trained_score"]
+            ell_gp_nb_test  = _ell_df[_ell_df["split"] == "test"]["trained_score"]
+            print(f"  ellipses GP: loaded {_ell_gp_paths[-1].name} "
+                  f"(train={len(ell_gp_nb_train)}, test={len(ell_gp_nb_test)})", flush=True)
+        except Exception as _e:
+            print(f"  ellipses GP: could not load ({_e})", flush=True)
+    else:
+        print(f"  ellipses GP: no parquet found in {protege_dir}", flush=True)
 
     # --- Recall curve (eval = fixed test split) ---
     eval_sources = test_output.index
@@ -507,9 +544,9 @@ def process_run(run_dir: Path, epsilon: float,
     figures_dir.mkdir(parents=True, exist_ok=True)
     fig, (ax_tr, ax_te) = plt.subplots(1, 2, figsize=(12, 5))
 
-    byol_label_tr = f"BYOL ({latent_type}) \u03b5={epsilon} (AUC={train_auc:.4f})"
+    byol_label_tr = f"BYOL ({latent_type}) (AUC={train_auc:.4f})"
     auc_str_te    = f"{auc:.4f}" if (isinstance(auc, float) and auc == auc) else "N/A"
-    byol_label_te = f"BYOL ({latent_type}) \u03b5={epsilon} (AUC={auc_str_te})"
+    byol_label_te = f"BYOL ({latent_type}) (AUC={auc_str_te})"
 
     # Left: train
     if cum_train is not None:
@@ -518,6 +555,16 @@ def process_run(run_dir: Path, epsilon: float,
             ax_tr.plot(baselines["complexity_train"]["x"], baselines["complexity_train"]["recall"],
                        color="steelblue", linewidth=1.5, linestyle="--",
                        label=f"Complexity (AUC={baselines['complexity_train']['auc']:.3f})")
+        if ell_gp_nb_train is not None:
+            _nb_ranked = ell_gp_nb_train.reindex(train_active.index, fill_value=0.0).sort_values(ascending=False)
+            _nb_tl     = labels_df.loc[_nb_ranked.index, "human_label"]
+            _nb_npos   = int((_nb_tl >= 3).sum())
+            _nb_cum    = np.cumsum((_nb_tl >= 3).astype(int).values)
+            _nb_x      = np.arange(1, len(_nb_cum) + 1)
+            _nb_auc    = float(np.trapezoid(_nb_cum, _nb_x) / (len(_nb_cum) * _nb_npos)) if _nb_npos > 0 else 0.0
+            ax_tr.plot(_nb_x, _nb_cum, color="green", linewidth=1.5, linestyle=":",
+                       label=f"Ellipses (AUC={_nb_auc:.3f})")
+        elif baselines and "ellipses_train" in baselines:
             ax_tr.plot(baselines["ellipses_train"]["x"], baselines["ellipses_train"]["recall"],
                        color="green", linewidth=1.5, linestyle=":",
                        label=f"Ellipses (AUC={baselines['ellipses_train']['auc']:.3f})")
@@ -536,6 +583,16 @@ def process_run(run_dir: Path, epsilon: float,
             ax_te.plot(baselines["complexity"]["x"], baselines["complexity"]["recall"],
                        color="steelblue", linewidth=1.5, linestyle="--",
                        label=f"Complexity (AUC={baselines['complexity']['auc']:.3f})")
+        if ell_gp_nb_test is not None:
+            _nb_t_ranked = ell_gp_nb_test.reindex(test_output.index, fill_value=0.0).sort_values(ascending=False)
+            _nb_t_tl     = labels_df.loc[_nb_t_ranked.index, "human_label"]
+            _nb_t_npos   = int((_nb_t_tl >= 3).sum())
+            _nb_t_cum    = np.cumsum((_nb_t_tl >= 3).astype(int).values)
+            _nb_t_x      = np.arange(1, len(_nb_t_cum) + 1)
+            _nb_t_auc    = float(np.trapezoid(_nb_t_cum, _nb_t_x) / (len(_nb_t_cum) * _nb_t_npos)) if _nb_t_npos > 0 else 0.0
+            ax_te.plot(_nb_t_x, _nb_t_cum, color="green", linewidth=1.5, linestyle=":",
+                       label=f"Ellipses (AUC={_nb_t_auc:.3f})")
+        elif baselines:
             ax_te.plot(baselines["ellipses"]["x"], baselines["ellipses"]["recall"],
                        color="green", linewidth=1.5, linestyle=":",
                        label=f"Ellipses (AUC={baselines['ellipses']['auc']:.3f})")
@@ -548,8 +605,8 @@ def process_run(run_dir: Path, epsilon: float,
     ax_te.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    fig.suptitle("Recall curves", fontsize=13)
-    fig.savefig(figures_dir / f"recall_curves{suffix}.png", dpi=150, bbox_inches="tight")
+    _eps_str = str(epsilon).rstrip('0').rstrip('.')
+    fig.savefig(figures_dir / f"recall_curves_{latent_type}_eps{_eps_str}{suffix}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     # --- Timing plot ---
@@ -565,15 +622,17 @@ def process_run(run_dir: Path, epsilon: float,
         fig.savefig(protege_dir / f"timing_plot{suffix}.png", dpi=120)
         plt.close(fig)
 
-    # --- Move astronomaly.log → logs/protege.log ---
-    import logging as _logging, shutil as _shutil
-    _logs_dir = run_dir / "logs"
-    _logs_dir.mkdir(parents=True, exist_ok=True)
+    # --- Discard astronomaly.log (large, machine-generated, not useful) ---
+    import logging as _logging, os as _os
     for _h in list(_logging.getLogger().handlers):
         if isinstance(_h, _logging.FileHandler) and 'astronomaly.log' in _h.baseFilename:
+            _log_path = _h.baseFilename
             _h.close()
             _logging.getLogger().removeHandler(_h)
-            _shutil.move(_h.baseFilename, _logs_dir / f"protege{suffix}.log")
+            try:
+                _os.remove(_log_path)
+            except OSError:
+                pass
             break
 
     # --- Save scores and summary ---
@@ -604,7 +663,7 @@ def process_run(run_dir: Path, epsilon: float,
 # Multiprocessing worker (must be top-level for pickling)
 # ---------------------------------------------------------------------------
 def _worker_process_run(args):
-    rd, epsilon, steps, suffix, csv_df, labels_all, use_pca, max_queries, timing_plot, pca_components, outputs_root, force, force_plot = args
+    rd, epsilon, steps, suffix, csv_df, labels_all, use_pca, max_queries, timing_plot, pca_components, outputs_root, force = args
     m      = re.search(r'_f([\d.]+)_sw([\d.]+)', rd.name)
     f_val  = float(m.group(1)) if m else float('nan')
     sw_val = float(m.group(2)) if m else float('nan')
@@ -613,8 +672,7 @@ def _worker_process_run(args):
         auc, train_auc, n_eval, n_pos = process_run(rd, epsilon, steps, suffix, csv_df, labels_all,
                                                      use_pca=use_pca, max_queries=max_queries,
                                                      timing_plot=timing_plot, pca_components=pca_components,
-                                                     outputs_root=outputs_root, force=force,
-                                                     force_plot=force_plot)
+                                                     outputs_root=outputs_root, force=force)
         return dict(name=rd.name, f=f_val, sw=sw_val, auc=auc, train_auc=train_auc,
                     n_eval=n_eval, n_pos=n_pos)
     except FileNotFoundError as exc:
@@ -652,9 +710,7 @@ def main():
     parser.add_argument("--pca",               action="store_true", dest="pca",
                         help="Enable PCA dimensionality reduction before Protege GP (off by default).")
     parser.add_argument("--force",             action="store_true",
-                        help="Re-run even if protege_summary already exists.")
-    parser.add_argument("--force-plot",        action="store_true", dest="force_plot",
-                        help="Regenerate plots from saved scores without re-running the GP.")
+                        help="Re-run GP even if saved scores already exist.")
     parser.add_argument("--workers",           type=int, default=1,
                         help="Number of parallel worker processes (default: 1).")
     parser.add_argument("--max-queries",       type=int, default=None,
@@ -694,10 +750,10 @@ def main():
         m      = re.search(r'_f([\d.]+)_sw([\d.]+)', rd.name)
         f_val  = float(m.group(1)) if m else float('nan')
         sw_val = float(m.group(2)) if m else float('nan')
-        summary_path = rd / "protege" / f"protege_summary{_full_suffix}.json"
+        summary_path = rd / "data" / "protege" / f"protege_summary{_full_suffix}.json"
         pca_var_path = rd / "figures" / "pca_variance.png"
-        if summary_path.exists() and pca_var_path.exists() and not args.force and not args.force_plot:
-            print(f"[{rd.name}]  skipping (already done — use --force to rerun, --force-plot to replot)", flush=True)
+        if summary_path.exists() and pca_var_path.exists() and not args.force:
+            print(f"[{rd.name}]  skipping (already done — use --force to rerun)", flush=True)
             with open(summary_path) as fh:
                 s = json.load(fh)
             results.append(dict(name=rd.name, f=f_val, sw=sw_val,
@@ -709,7 +765,7 @@ def main():
         else:
             worker_args.append((rd, args.epsilon, args.steps, suffix, csv_df, labels_all,
                                 args.pca, args.max_queries, args.timing_plot, args.pca_components,
-                                outputs_root, args.force, args.force_plot))
+                                outputs_root, args.force))
 
     if worker_args:
         n_workers = min(args.workers, len(worker_args))
