@@ -42,7 +42,11 @@ from suplat.models.byol_models import (
     create_resnet50_backbone,
     create_convnext_tiny_backbone,
 )
-from suplat.trainer.trainer import byol_loss, get_warmup_lr, get_supervision_weight, extract_embeddings_from_loader
+from suplat.trainer.trainer import (byol_loss, get_warmup_lr, get_supervision_weight,
+                                    extract_embeddings_from_loader,
+                                    extract_raw_embeddings_from_loader,
+                                    vicreg_var_cov_loss, effective_rank,  # [VICReg]
+                                    byol_loss_weighted)                   # [TierW]
 from suplat.utils.plotting import fit_umap, plot_umap_single, plot_umap_outliers, plot_training_curves, plot_umap_scalar
 
 # Check device availability
@@ -85,11 +89,14 @@ def parse_args():
     ap.add_argument("--weighting", type=str, default="closest",
                     choices=["closest", "ponderate"],
                     help="Weight function for sampling pairs: 'closest' or 'ponderate' (default: closest)")
-    ap.add_argument("--class-weighting", type=str, default=None,
+    ap.add_argument("--class-weight-mode", type=str, default=None,
                     choices=["score", "label"],
-                    help="Oversample rare classes: 'score' (by interest tier 1-4) "
+                    help="Upweight rare classes in L_friend: 'score' (by interest tier 1-4) "
                          "or 'label' (by inverse frequency of each binary label). "
-                         "Default: None (uniform shuffle).")
+                         "Default: None (uniform).")
+    ap.add_argument("--class-weight-strength", type=float, default=0.0,
+                    help="Magnitude of class upweighting: 0=uniform (default), 1=full tier/freq weighting. "
+                         "Controls spread via w = 1 + strength*(raw_normalized - 1).")
     ap.add_argument("--f-label", type=float, default=1.0,
                     help="Fraction of training split that receives labels (default: 1.0 = fully supervised)")
     ap.add_argument("--supervision-weight", type=float, default=1.0,
@@ -177,6 +184,15 @@ def parse_args():
     ap.add_argument("--no-protege-pca", action="store_false", dest="protege_pca",
                     help="Disable PCA dimensionality reduction before Protege GP (on by default)")
 
+    # [VICReg] anti-collapse regularisation (default 0.0 = off; behaviour unchanged)
+    ap.add_argument("--vicreg-var-weight", type=float, default=0.0,
+                    help="Weight on VICReg variance hinge (try ~25 for mlp/none projector).")
+    ap.add_argument("--vicreg-cov-weight", type=float, default=0.0,
+                    help="Weight on VICReg covariance penalty (try ~1 for mlp/none projector).")
+    ap.add_argument("--vicreg-gamma", type=float, default=1.0,
+                    help="Target per-dimension std for the VICReg variance hinge (default 1.0).")
+
+
     return ap.parse_args()
 
 # =============================================================================
@@ -193,7 +209,7 @@ if args.projector == 'mlp' and args.projection_dim is None:
 BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.lr
 NUM_EPOCHS = args.epochs
-EMA_DECAY = 0.99 # Standard BYOL decay; can be tuned if desired but generally works well across settings
+EMA_DECAY = 0.996 # Standard BYOL decay; can be tuned if desired but generally works well across settings
 PROJECTION_DIM = args.projection_dim
 HIDDEN_DIM = args.hidden_dim
 MODEL_TYPE = args.model_type
@@ -210,7 +226,8 @@ USE_COMPILE = args.compile
 # Dataset configuration
 DATASET_NAME = args.dataset
 F_LABEL = args.f_label
-CLASS_WEIGHTING = args.class_weighting
+CLASS_WEIGHT_MODE     = args.class_weight_mode
+CLASS_WEIGHT_STRENGTH = args.class_weight_strength
 
 # Data subsampling
 SUBSAMPLE_SIZE = args.subsample
@@ -254,6 +271,10 @@ else:
     if DATASET_NAME != "LOTSS":
         RUN_ID += f"_{DATASET_NAME}"
     RUN_ID += f"_{MODEL_TYPE}_proj{PROJECTOR}_w{args.weighting}_f{F_LABEL}"
+    if args.vicreg_var_weight > 0 or args.vicreg_cov_weight > 0:  # [VICReg]
+        RUN_ID += f"_vic{args.vicreg_var_weight}-{args.vicreg_cov_weight}"
+    if args.class_weight_mode is not None:
+        RUN_ID += f"_cw{args.class_weight_mode}{args.class_weight_strength}"
 
 # Truncate labels based on label type
 LABEL_RANGES = {
@@ -329,7 +350,7 @@ print(f"Warmup epochs:  {WARMUP_EPOCHS}")
 print(f"Grad clip:      {GRAD_CLIP if GRAD_CLIP else 'None'}")
 print(f"EMA decay:      {EMA_DECAY}")
 print(f"Weighting:      {args.weighting}")
-print(f"Class weighting:{CLASS_WEIGHTING if CLASS_WEIGHTING else 'None (uniform)'}")
+print(f"Class weight:   {f'mode={CLASS_WEIGHT_MODE} strength={CLASS_WEIGHT_STRENGTH}' if CLASS_WEIGHT_MODE else 'None (uniform)'}")
 print(f"F_label:        {F_LABEL}")
 print(f"Num workers:    {NUM_WORKERS}")
 print(f"Compile:        {'enabled' if USE_COMPILE else 'disabled'}")
@@ -393,6 +414,14 @@ SUPERVISION_WEIGHT_SCHEDULE = args.supervision_weight_schedule
 SUPERVISION_WEIGHT_START = args.supervision_weight_start
 SUPERVISION_WEIGHT_END = args.supervision_weight_end
 USE_CURRICULUM = SUPERVISION_WEIGHT_SCHEDULE != "constant"
+# [VICReg] anti-collapse weights
+VICREG_VAR_WEIGHT = args.vicreg_var_weight
+VICREG_COV_WEIGHT = args.vicreg_cov_weight
+VICREG_GAMMA      = args.vicreg_gamma
+if (VICREG_VAR_WEIGHT > 0 or VICREG_COV_WEIGHT > 0) and PROJECTOR == 'pca':
+    print("WARNING: VICReg weights > 0 with --projector pca. PCA outputs are already "
+          "decorrelated and have descending variances; VICReg is intended for "
+          "mlp/none projectors. Proceeding anyway.")
 
 # =============================================================================
 # WEIGHTING, AUGMENTATION, AND HELPER FUNCTIONS
@@ -420,12 +449,13 @@ def byol_collate_fn(batch):
     x1     = torch.stack([b[0] for b in batch])
     x1_aug = torch.stack([b[1] for b in batch])
     is_labelled = torch.tensor([b[2] is not None for b in batch], dtype=torch.bool)
+    sample_weights = torch.tensor([b[3] for b in batch], dtype=torch.float32)
     if is_labelled.any():
         dummy = torch.zeros_like(batch[0][0])
         x2_friend = torch.stack([b[2] if b[2] is not None else dummy for b in batch])
     else:
         x2_friend = None
-    return x1, x1_aug, x2_friend, is_labelled
+    return x1, x1_aug, x2_friend, is_labelled, sample_weights
 
 
 def _monitor_loss_batch(fold_model, x1, x1_trans, x2_friend):
@@ -641,6 +671,9 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         'train_loss': [],
         'train_aug_loss': [],
         'train_friend_loss': [],
+        'train_vic_var': [],          # [VICReg]
+        'train_vic_cov': [],          # [VICReg]
+        'effective_rank': [],         # [VICReg] RankMe diagnostic
         'monitor_val_loss': [],
         'lr': [],
         'supervision_schedule': [],
@@ -685,13 +718,18 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         train_aug_loss = 0.0
         train_friend_loss = 0.0
         train_friend_batches = 0
+        train_vic_var = 0.0           # [VICReg]
+        train_vic_cov = 0.0           # [VICReg]
+        _rank_buffer = []             # [VICReg] accumulate online projections for RankMe
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        for x1, x1_aug, x2_friend, is_labelled in pbar:
+        for x1, x1_aug, x2_friend, is_labelled, sample_weights_batch in pbar:
             x1, x1_aug = x1.to(device), x1_aug.to(device)
 
             # L_aug: ALL samples
-            pred1_t, pred2_t, proj1_t, proj2_t = fold_model(x1, x1_aug)
+            # [VICReg] also retrieve the online projections (oproj*) for regularisation
+            pred1_t, pred2_t, proj1_t, proj2_t, oproj1_t, oproj2_t = fold_model(
+                x1, x1_aug, return_online_proj=True)
             loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
             loss = loss_trans
 
@@ -700,10 +738,30 @@ def train_fold(train_loader, test_loader, extract_loader=None):
                 x1_lab = x1[is_labelled.to(device)]
                 x2_lab = x2_friend[is_labelled].to(device)
                 pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1_lab, x2_lab)
-                loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
+                if CLASS_WEIGHT_MODE is not None:
+                    _tw = sample_weights_batch[is_labelled].to(device)
+                    _tw = _tw / _tw.mean().clamp(min=1e-6)  # re-normalise per batch: E[w]=1
+                    loss_friend = byol_loss_weighted(pred1_f, pred2_f, proj1_f, proj2_f, _tw)
+                else:
+                    loss_friend = byol_loss(pred1_f, pred2_f, proj1_f, proj2_f)
                 loss = (loss_trans + current_supervision_weight * loss_friend) / (1 + current_supervision_weight)
                 train_friend_loss += loss_friend.item()
                 train_friend_batches += 1
+
+            # [VICReg] anti-collapse term, added OUTSIDE the (1+sw) normalisation so
+            # its strength does not shrink as the supervision weight grows.
+            if VICREG_VAR_WEIGHT > 0 or VICREG_COV_WEIGHT > 0:
+                _v1, _c1 = vicreg_var_cov_loss(oproj1_t, gamma=VICREG_GAMMA)
+                _v2, _c2 = vicreg_var_cov_loss(oproj2_t, gamma=VICREG_GAMMA)
+                _vic_var = 0.5 * (_v1 + _v2)
+                _vic_cov = 0.5 * (_c1 + _c2)
+                loss = loss + VICREG_VAR_WEIGHT * _vic_var + VICREG_COV_WEIGHT * _vic_cov
+                train_vic_var += _vic_var.item()
+                train_vic_cov += _vic_cov.item()
+
+            # [VICReg] accumulate projections for the per-epoch RankMe metric
+            if len(_rank_buffer) * x1.size(0) < 4096:
+                _rank_buffer.append(oproj1_t.detach().float().cpu())
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -720,6 +778,11 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         avg_train_loss = train_loss / len(train_loader)
         avg_train_aug_loss = train_aug_loss / len(train_loader)
         avg_train_friend_loss = train_friend_loss / train_friend_batches if train_friend_batches > 0 else 0.0
+        # [VICReg] epoch means + RankMe effective rank of the online projections
+        avg_vic_var = train_vic_var / len(train_loader)
+        avg_vic_cov = train_vic_cov / len(train_loader)
+        epoch_rank = (effective_rank(torch.cat(_rank_buffer, dim=0))
+                      if _rank_buffer else float('nan'))
 
         # -------------------------------------------------------------------
         # PCA RE-FIT (pca mode only): update projector with current encoder
@@ -766,6 +829,9 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         history['train_loss'].append(avg_train_loss)
         history['train_aug_loss'].append(avg_train_aug_loss)
         history['train_friend_loss'].append(avg_train_friend_loss)
+        history['train_vic_var'].append(avg_vic_var)              # [VICReg]
+        history['train_vic_cov'].append(avg_vic_cov)              # [VICReg]
+        history['effective_rank'].append(epoch_rank)             # [VICReg]
         history['monitor_val_loss'].append(avg_monitor_loss)
         history['lr'].append(current_lr)
         history['supervision_schedule'].append(current_supervision_weight)
@@ -777,7 +843,11 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         _loss_str = f"t_aug: {avg_train_aug_loss:.4f}"
         if avg_train_friend_loss > 0 and _compute_val:
             _loss_str += f"  t_fri: {avg_train_friend_loss:.4f}  v_fri: {avg_val_friend_loss:.4f}"
-        print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | {_loss_str}{mon_str} | lr: {current_lr:.2e}{sup_str}")
+        # [VICReg] append VICReg means + RankMe to the per-epoch log line
+        _vic_str = (f" | vic_var: {avg_vic_var:.4f} vic_cov: {avg_vic_cov:.4f}"
+                    if (VICREG_VAR_WEIGHT > 0 or VICREG_COV_WEIGHT > 0) else "")
+        _rank_str = f" | rank: {epoch_rank:.1f}" if epoch_rank == epoch_rank else ""
+        print(f"Epoch {epoch+1:>4}/{NUM_EPOCHS} | {_loss_str}{mon_str} | lr: {current_lr:.2e}{sup_str}{_vic_str}{_rank_str}")
 
         if epoch >= WARMUP_EPOCHS:
             scheduler.step()
@@ -877,8 +947,7 @@ else:
     train_lab_ds = None
     _train_combined = train_unlab_ds
     train_extract_loader = DataLoader(train_unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
-                                       num_workers=_nw, pin_memory=use_cuda,
-                                       collate_fn=byol_collate_fn)
+                                       num_workers=_nw, pin_memory=use_cuda)
 
 # Test images always enter the BYOL training pool regardless of F_LABEL or supervision_weight.
 test_unlab_ds = UnlabelledBYOLDataset(test_images, transform=byol_strong_aug)
@@ -901,57 +970,44 @@ TIERS   = [(4, SCORE_4), (3, SCORE_3), (2, SCORE_2), (1, SCORE_1)]
 POSITIVE_THRESHOLD   = 3
 PROTEGE_INITIAL_STEPS = 10
 
-# Warn and disable class-weighting when there are no labelled samples
-if CLASS_WEIGHTING is not None and F_LABEL == 0.0:
-    print("WARNING: --class-weighting has no effect when F_LABEL=0 (no labelled samples). "
-          "Falling back to uniform sampling.")
-    CLASS_WEIGHTING = None
+# [TierW] precompute per-sample tier scores and attach to the labelled dataset
+# Per-sample L_friend loss weights based on class rarity
+if CLASS_WEIGHT_MODE is not None and train_lab_ds is not None and F_LABEL > 0:
+    _lab_col_idx = {c: i for i, c in enumerate(LABEL_COLS)}
+    n_lab = len(labelled_labels)
 
-if CLASS_WEIGHTING is not None:
-    n_lab   = len(labelled_images)
-    n_unlab = len(unlabelled_images)
-    n_test  = len(test_images)
-
-    if CLASS_WEIGHTING == "score":
-        lab_col_idx = {c: i for i, c in enumerate(LABEL_COLS)}
-        scores = np.ones(n_lab, dtype=float)
-        for tier_score, tier_cols in reversed(TIERS):
-            col_indices = [lab_col_idx[c] for c in tier_cols]
-            scores[labelled_labels[:, col_indices].any(axis=1)] = tier_score
-        score_counts = {s: max((scores == s).sum(), 1) for s in [1, 2, 3, 4]}
-        lab_weights = np.array([1.0 / score_counts[s] for s in scores])
-
+    if CLASS_WEIGHT_MODE == "score":
+        _raw = np.ones(n_lab, dtype=np.float32)
+        for _sv, _cols in reversed(TIERS):
+            _ci = [_lab_col_idx[c] for c in _cols]
+            _raw[labelled_labels[:, _ci].any(axis=1)] = float(_sv)
     else:  # "label"
-        label_freq = labelled_labels.mean(axis=0).clip(min=1e-6)
-        inv_freq = 1.0 / label_freq
-        pos_counts = labelled_labels.sum(axis=1)
-        lab_weights = np.where(
-            pos_counts > 0,
-            (labelled_labels * inv_freq).sum(axis=1) / pos_counts.clip(min=1),
+        _label_freq = labelled_labels.mean(axis=0).clip(min=1e-6)
+        _inv_freq   = 1.0 / _label_freq
+        _pos_counts = labelled_labels.sum(axis=1)
+        _raw = np.where(
+            _pos_counts > 0,
+            (labelled_labels * _inv_freq).sum(axis=1) / _pos_counts.clip(min=1),
             1.0,
-        )
+        ).astype(np.float32)
 
-    lab_weights = lab_weights / lab_weights.mean()
-    sample_weights = np.concatenate([
-        lab_weights,
-        np.ones(n_unlab + n_test),  # unlabelled/test: neutral weight
-    ])
-    _sampler = WeightedRandomSampler(
-        weights=torch.from_numpy(sample_weights).float(),
-        num_samples=len(_train_combined),
-        replacement=True,
-    )
-    train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE,
-                              sampler=_sampler, drop_last=True,
-                              num_workers=_nw, pin_memory=use_cuda,
-                              collate_fn=byol_collate_fn)
-else:
-    train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE, shuffle=True,
-                              drop_last=True, num_workers=_nw, pin_memory=use_cuda,
-                              collate_fn=byol_collate_fn)
+    _raw_norm = _raw / _raw.mean()
+    _sw = (1.0 + CLASS_WEIGHT_STRENGTH * (_raw_norm - 1.0)).clip(min=0.0).astype(np.float32)
+    train_lab_ds.sample_weights = _sw
+    print(f'  Class-weight mode={CLASS_WEIGHT_MODE} strength={CLASS_WEIGHT_STRENGTH}')
+    if CLASS_WEIGHT_MODE == "score":
+        for _sv in [1, 2, 3, 4]:
+            _n = int((_raw == _sv).sum())
+            _w = float((1.0 + CLASS_WEIGHT_STRENGTH * (_sv / _raw.mean() - 1.0)))
+            print(f'    tier{_sv}: n={_n}  effective_weight={_w:.3f}')
+elif CLASS_WEIGHT_MODE is not None and F_LABEL == 0.0:
+    print("WARNING: --class-weight-mode has no effect when F_LABEL=0 (no labelled samples).")
+
+train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE, shuffle=True,
+                          drop_last=True, num_workers=_nw, pin_memory=use_cuda,
+                          collate_fn=byol_collate_fn)
 unlab_extract_loader = DataLoader(train_unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
-                                   num_workers=_nw, pin_memory=use_cuda,
-                                   collate_fn=byol_collate_fn)
+                                   num_workers=_nw, pin_memory=use_cuda)
 pca_fit_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE,
                              shuffle=False, num_workers=_nw, pin_memory=use_cuda,
                              collate_fn=byol_collate_fn)
@@ -977,7 +1033,7 @@ print(f"Train: {len(train_loader)} batches x {BATCH_SIZE}")
 print(f"Test:  {len(test_loader)} batches x {BATCH_SIZE}")
 print(f"{'='*70}\n")
 
-x1, x1_aug, x2_friend, is_labelled = next(iter(train_loader))
+x1, x1_aug, x2_friend, is_labelled, _ = next(iter(train_loader))  # [TierW]
 print(f"Test batch: {x1.shape}, {x1_aug.shape}")
 print(f"  Labelled fraction: {is_labelled.float().mean():.2f}")
 
@@ -1044,6 +1100,11 @@ for _item in _items:
             'supervision_weight': SUPERVISION_WEIGHT,
             'supervision_weight_schedule': SUPERVISION_WEIGHT_SCHEDULE,
             'projector': PROJECTOR,
+            'vicreg_var_weight': VICREG_VAR_WEIGHT,   # [VICReg]
+            'vicreg_cov_weight': VICREG_COV_WEIGHT,   # [VICReg]
+            'vicreg_gamma': VICREG_GAMMA,             # [VICReg]
+            'class_weight_mode': CLASS_WEIGHT_MODE,
+            'class_weight_strength': CLASS_WEIGHT_STRENGTH,
             'label_type': args.label_type,
         }
     }, _chk_path)
@@ -1074,20 +1135,52 @@ for _item in _items:
     print(f"   Test set projections: {test_projections.shape}")
 
     np.save(DATA_DIR / f'labelled_train_projections{_suffix}.npy', train_projections)
-    np.save(DATA_DIR / f'train_labels{_suffix}.npy', train_labels[:len(train_projections)])
+    np.save(DATA_DIR / f'labelled_train_labels{_suffix}.npy', train_labels[:len(train_projections)])
     np.save(DATA_DIR / f'test_projections{_suffix}.npy', test_projections)
     np.save(DATA_DIR / f'test_labels{_suffix}.npy', test_labels[:len(test_projections)])
 
-    if len(unlabelled_images) > 0 and len(labelled_images) > 0:
+    if len(unlabelled_images) > 0:
         unlab_projections = extract_embeddings_from_loader(
             model, unlab_extract_loader, MODEL_TYPE, device, max_batches=None
         )
         print(f"   Unlabelled train set projections: {unlab_projections.shape}")
         np.save(DATA_DIR / f'unlabelled_train_projections{_suffix}.npy', unlab_projections)
+        np.save(DATA_DIR / f'unlabelled_train_labels{_suffix}.npy', labels[unlabelled_train_idx])
     else:
         unlab_projections = None
 
     print(f"\nProjections saved to {DATA_DIR}/")
+
+    # =========================================================================
+    # EXTRACT ENCODINGS (encoder output, before projector)
+    # =========================================================================
+    print(f"\nExtracting encodings{_label}...")
+    train_encodings = extract_raw_embeddings_from_loader(
+        model, train_extract_loader, device, max_batches=None
+    )
+    print(f"   Train set encodings: {train_encodings.shape}")
+    test_encodings = extract_raw_embeddings_from_loader(
+        model, _test_extract_loader, device, max_batches=None
+    )
+    print(f"   Test set encodings: {test_encodings.shape}")
+
+    assert len(train_encodings) == len(train_projections), \
+        f"Encoding/projection count mismatch (train): {len(train_encodings)} vs {len(train_projections)}"
+    assert len(test_encodings) == len(test_projections), \
+        f"Encoding/projection count mismatch (test): {len(test_encodings)} vs {len(test_projections)}"
+    np.save(DATA_DIR / f'labelled_train_encodings{_suffix}.npy', train_encodings)
+    np.save(DATA_DIR / f'test_encodings{_suffix}.npy', test_encodings)
+
+    if unlab_projections is not None:
+        unlab_encodings = extract_raw_embeddings_from_loader(
+            model, unlab_extract_loader, device, max_batches=None
+        )
+        print(f"   Unlabelled train set encodings: {unlab_encodings.shape}")
+        np.save(DATA_DIR / f'unlabelled_train_encodings{_suffix}.npy', unlab_encodings)
+    else:
+        unlab_encodings = None
+
+    print(f"Encodings saved to {DATA_DIR}/")
 
     # =========================================================================
     # PCA VARIANCE ANALYSIS  (dimensionality collapse diagnostic)
@@ -1154,16 +1247,16 @@ for _item in _items:
         _lf_train = labels_full[train_idx][:_n_tr]
         _lf_test  = labels_full[test_idx][:_n_te]
 
-        if unlab_projections is not None:
-            _n_ul = len(unlab_projections)
+        if unlab_encodings is not None:
+            _n_ul = len(unlab_encodings)
             _lf_unlab = np.zeros((_n_ul, _lf_train.shape[1]), dtype=_lf_train.dtype)
-            _parts = [unlab_projections, train_projections]
+            _parts = [unlab_encodings, train_encodings]
             _lf_parts = [_lf_unlab, _lf_train]
         else:
             _n_ul = 0
-            _parts = [train_projections]
+            _parts = [train_encodings]
             _lf_parts = [_lf_train]
-        _parts.append(test_projections)
+        _parts.append(test_encodings)
         _lf_parts.append(_lf_test)
         _all_proj = np.concatenate(_parts)
         _all_lf   = np.concatenate(_lf_parts)
@@ -1174,7 +1267,6 @@ for _item in _items:
         _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul+_n_tr:] = True
 
         _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
-        np.save(DATA_DIR / f'umap_all_coords{_suffix}.npy', _all_2d)
 
         _split_masks_all = {}
         if _n_ul > 0:
@@ -1190,8 +1282,19 @@ for _item in _items:
                 split_masks=_split_masks_all,
             )
 
+        # UMAP on projections — initial labels only
+        _proj_parts = ([unlab_projections] if unlab_encodings is not None else []) + [train_projections, test_projections]
+        _all_projections = np.concatenate(_proj_parts)
+        _, _proj_2d = fit_umap(_all_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
+        plot_umap_single(
+            _proj_2d, _all_lf, 'initial', CLASS_NAMES, LABEL_RANGES,
+            title='All (projections) — initial',
+            save_path=UMAP_DIR / f'umap_proj_initial{_suffix}.png',
+            split_masks=_split_masks_all,
+        )
+
         _img_parts = []
-        if unlab_projections is not None:
+        if unlab_encodings is not None:
             _img_parts.append(unlabelled_images[:_n_ul])
         _img_parts.append(train_images[:_n_tr])
         _img_parts.append(test_images[:_n_te])
@@ -1221,8 +1324,33 @@ for _item in _items:
             cbar_ticks=[1, 2, 3, 4],
         )
 
-        _, _test_2d = fit_umap(test_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
-        np.save(DATA_DIR / f'umap_test_coords{_suffix}.npy', _test_2d)
+        # Save UMAP metadata so plots can be regenerated without refitting
+        _split_col = np.array(
+            (['unlabelled_train'] * _n_ul if _n_ul > 0 else []) +
+            ['labelled_train'] * _n_tr +
+            ['test'] * _n_te
+        )
+        _lf_true = np.concatenate(
+            ([labels_full[unlabelled_train_idx][:_n_ul]] if _n_ul > 0 else []) +
+            [_lf_train, _lf_test]
+        )
+        _umap_meta = pd.DataFrame({'split': _split_col})
+        for _ci, _cn in enumerate(LABEL_COLS):
+            _umap_meta[_cn] = _lf_true[:, _ci].astype(int)
+        _umap_meta['pixel_sum'] = _all_pixel_sum
+        _umap_meta['interest_score'] = _interest.astype(int)
+
+        _enc_df = _umap_meta.copy()
+        _enc_df['umap_x'] = _all_2d[:, 0]
+        _enc_df['umap_y'] = _all_2d[:, 1]
+        _enc_df.to_parquet(DATA_DIR / f'umap_encodings{_suffix}.parquet', index=False)
+
+        _proj_df = _umap_meta.copy()
+        _proj_df['umap_x'] = _proj_2d[:, 0]
+        _proj_df['umap_y'] = _proj_2d[:, 1]
+        _proj_df.to_parquet(DATA_DIR / f'umap_projections{_suffix}.parquet', index=False)
+
+        print(f"UMAP metadata saved to {DATA_DIR}/")
 
         plot_umap_outliers(
             _all_2d[:_n_tr],

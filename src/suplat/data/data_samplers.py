@@ -35,6 +35,7 @@ class BYOLSupDataset(Dataset):
         self.friend_transform = friend_transform
         self.weightfunc = weightfunc
         self.p_pair_from_class = p_pair_from_class
+        self.sample_weights = None  # set externally after construction to enable per-sample loss weighting
         # build the distance matrix once for efficiency
         self.label_distances = cdist(self.all_labels.values, self.all_labels.values, metric="cityblock")
     
@@ -65,7 +66,9 @@ class BYOLSupDataset(Dataset):
         if self.friend_transform:
             img_friend = self.friend_transform(img_friend)
         
-        return img, img_transformed, img_friend, mdist
+        # 4th element: per-sample loss weight if set, else mdist (unused when no weighting)
+        weight_val = float(self.sample_weights[idx]) if self.sample_weights is not None else mdist
+        return img, img_transformed, img_friend, weight_val
 
 
 class UnlabelledBYOLDataset(Dataset):
@@ -80,4 +83,4 @@ class UnlabelledBYOLDataset(Dataset):
         img = self.img_data[idx]
         img = torch.from_numpy(img).unsqueeze(0).float()
         img_aug = self.transform(img) if self.transform else img.clone()
-        return img, img_aug, None, 0.0
+        return img, img_aug, torch.zeros_like(img), 0.0

@@ -254,6 +254,14 @@ def parse_args():
     p.add_argument("--seed",         type=int, default=42)
     p.add_argument("--run-name",     default="",
                    help="Override output directory suffix (default: <type>_<label>)")
+    p.add_argument("--catalogue",    default=None,
+                   help="Path to catalogue split sidecar JSON (e.g. "
+                        "catalogues/lotss_initial_all_split.json).  When "
+                        "provided (or auto-detected), projections are loaded "
+                        "from <base-dir>/projections/lotss_*.npy using the "
+                        "catalogue 64/16/20 train/val/test split — matching "
+                        "classification.ipynb.  Falls back to legacy "
+                        "train/val_projections.npy if not found.")
     p.add_argument("--skip-decoder", action="store_true",
                    help="Skip decoder training")
     p.add_argument("--skip-nsf",     action="store_true",
@@ -263,21 +271,121 @@ def parse_args():
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
+def _find_catalogue_sidecar(base_dir: Path, catalogue_arg=None):
+    """Return path to a catalogue split sidecar JSON, or None if not found.
+
+    Search order:
+      1. Explicit --catalogue argument (YAML or JSON accepted).
+      2. Auto-detect: look for *_split.json next to known YAML files in
+         <root>/catalogues/, where root is derived from base_dir.
+    """
+    import json as _json
+
+    if catalogue_arg is not None:
+        p = Path(catalogue_arg)
+        if p.suffix == ".yaml":
+            # Derive sidecar path from YAML name
+            sidecar = p.parent / (p.stem + "_split.json")
+        else:
+            sidecar = p
+        if sidecar.exists():
+            return sidecar
+        print(f"  WARNING: --catalogue path not found: {sidecar}")
+        return None
+
+    # Auto-detect: walk up from base_dir to find catalogues/ directory
+    for parent in [base_dir] + list(base_dir.parents):
+        cat_dir = parent / "catalogues"
+        if cat_dir.is_dir():
+            # Prefer lotss_initial_all_split.json if present
+            preferred = cat_dir / "lotss_initial_all_split.json"
+            if preferred.exists():
+                return preferred
+            # Fall back to any *_split.json
+            sidecars = sorted(cat_dir.glob("*_split.json"))
+            if sidecars:
+                return sidecars[0]
+    return None
+
+
 def load_data(args):
+    import json as _json
+
     base_dir = Path(args.base_dir)
-    proj_dir = (base_dir / "data"       if (base_dir / "data").is_dir()
-                else base_dir / "embeddings" if (base_dir / "embeddings").is_dir()
-                else base_dir)
 
-    print("Loading projections…")
-    print(f"  Projections dir: {proj_dir}")
-    train_z = np.load(proj_dir / "train_projections.npy").astype(np.float32)
-    val_z   = np.load(proj_dir / "val_projections.npy").astype(np.float32)
+    # ── Try catalogue-based projections first ─────────────────────────────────
+    cat_proj_dir = base_dir / "projections"
+    cat_proj_file = cat_proj_dir / "lotss_projections.npy"
+    cat_split_file = cat_proj_dir / "lotss_splits.npy"
+    sidecar_path = _find_catalogue_sidecar(base_dir, getattr(args, "catalogue", None))
 
-    train_lbl = np.load(proj_dir / "train_labels.npy").astype(np.float32)
-    val_lbl   = np.load(proj_dir / "val_labels.npy").astype(np.float32)
+    use_catalogue = (cat_proj_file.exists() and cat_split_file.exists()
+                     and sidecar_path is not None)
 
-    # Label subset
+    if use_catalogue:
+        print(f"Loading catalogue-aligned projections…")
+        print(f"  Projections : {cat_proj_file}")
+        print(f"  Sidecar     : {sidecar_path}")
+
+        _all_z     = np.load(cat_proj_file).astype(np.float32)
+        _split_ids = np.load(cat_split_file)
+
+        with open(sidecar_path) as _f:
+            _sidecar = _json.load(_f)
+        # Dataset key is the first non-seed key
+        _ds_key  = next(k for k in _sidecar if k != "dataset_seed")
+        train_idx = np.array(_sidecar[_ds_key]["train"])
+        val_idx   = np.array(_sidecar[_ds_key]["val"])
+        print(f"  Catalogue split: train={len(train_idx)} | "
+              f"val={len(np.array(_sidecar[_ds_key]['val']))} | "
+              f"test={len(np.array(_sidecar[_ds_key]['test']))}")
+
+        train_z = _all_z[_split_ids == 0]
+        val_z   = _all_z[_split_ids == 1]
+
+        # Full 20-dim labels from images_path directory
+        lbl_path = Path(args.images_path).parent / "labels_filtered.npy"
+        if not lbl_path.exists():
+            raise FileNotFoundError(
+                f"labels_filtered.npy not found next to images_filtered.npy: {lbl_path}"
+            )
+        _all_lbl = np.load(lbl_path).astype(np.float32)
+        train_lbl = _all_lbl[train_idx]
+        val_lbl   = _all_lbl[val_idx]
+
+    else:
+        # ── Legacy fallback: train/val_projections.npy ────────────────────────
+        proj_dir = (base_dir / "data"       if (base_dir / "data").is_dir()
+                    else base_dir / "embeddings" if (base_dir / "embeddings").is_dir()
+                    else base_dir)
+        print("Loading projections (legacy path)…")
+        print(f"  Projections dir: {proj_dir}")
+        train_z   = np.load(proj_dir / "train_projections.npy").astype(np.float32)
+        val_z     = np.load(proj_dir / "val_projections.npy").astype(np.float32)
+        train_lbl = np.load(proj_dir / "train_labels.npy").astype(np.float32)
+        val_lbl   = np.load(proj_dir / "val_labels.npy").astype(np.float32)
+
+        def _find_idx_dir(*dirs):
+            for d in dirs:
+                if d is not None and d.exists() and all(
+                    (d / f).exists() for f in ("train_idx.npy", "val_idx.npy")
+                ):
+                    return d
+            return None
+
+        idx_dir = _find_idx_dir(proj_dir)
+        if idx_dir is not None:
+            train_idx = np.load(idx_dir / "train_idx.npy")
+            val_idx   = np.load(idx_dir / "val_idx.npy")
+            print(f"  Loaded split indices from {idx_dir.name}/")
+        else:
+            from sklearn.model_selection import train_test_split as _tts
+            print("  Index files not found — replicating 70/15/15 split")
+            _all_idx = np.arange(np.load(args.images_path, mmap_mode="r").shape[0])
+            train_idx, temp_idx = _tts(_all_idx, test_size=0.30, random_state=args.seed)
+            val_idx, _          = _tts(temp_idx, test_size=0.50, random_state=args.seed)
+
+    # ── Label subset ──────────────────────────────────────────────────────────
     label_subset = args.label_subset
     if label_subset == "derived":
         train_y     = _make_derived(train_lbl)
@@ -289,7 +397,7 @@ def load_data(args):
         val_y       = val_lbl[:, label_idx]
         label_names = [ALL_CLASS_NAMES[i] for i in label_idx]
 
-    # Pure filtering
+    # ── Pure filtering ────────────────────────────────────────────────────────
     keep_train = np.ones(len(train_lbl), dtype=bool)
     keep_val   = np.ones(len(val_lbl),   dtype=bool)
     if label_subset == "pure":
@@ -299,31 +407,10 @@ def load_data(args):
         keep_train = train_lbl[:, 0:5].sum(axis=1) == 1
         keep_val   = val_lbl[:, 0:5].sum(axis=1)   == 1
 
-    # Image tensors
+    # ── Image tensors ─────────────────────────────────────────────────────────
     print("Loading images…")
     all_images = np.load(args.images_path)  # (N, 89, 89) uint8
 
-    def _find_idx_dir(*dirs):
-        for d in dirs:
-            if d is not None and d.exists() and all(
-                (d / f).exists() for f in ("train_idx.npy", "val_idx.npy", "test_idx.npy")
-            ):
-                return d
-        return None
-
-    idx_dir = _find_idx_dir(proj_dir)
-    if idx_dir is not None:
-        train_idx = np.load(idx_dir / "train_idx.npy")
-        val_idx   = np.load(idx_dir / "val_idx.npy")
-        print(f"  Loaded split indices from {idx_dir.name}/")
-    else:
-        from sklearn.model_selection import train_test_split
-        print("  Index files not found — replicating 70/15/15 split")
-        all_idx = np.arange(len(all_images))
-        train_idx, temp_idx = train_test_split(all_idx, test_size=0.30, random_state=args.seed)
-        val_idx, _          = train_test_split(temp_idx, test_size=0.50, random_state=args.seed)
-
-    nt, nv = keep_train.sum(), keep_val.sum()
     train_imgs = torch.from_numpy(
         all_images[train_idx[:len(keep_train)]].astype(np.float32) / 255.0
     ).unsqueeze(1)
