@@ -64,6 +64,56 @@ PROTEGE_INITIAL_STEPS = 200
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight check: detect BYOL runs that need re-training before GP dispatch
+# ---------------------------------------------------------------------------
+def _check_run_data(rd: Path):
+    """Return (error_type, detail) if the run has data issues, else None."""
+    ckpt = rd / "byol_model_best.pt"
+    if not ckpt.exists():
+        return ("missing_checkpoint", f"Missing checkpoint: '{ckpt}'")
+
+    data_dir = rd / "data"
+    required = [
+        data_dir / "labelled_train_idx.npy",
+        data_dir / "unlabelled_train_idx.npy",
+        data_dir / "test_idx.npy",
+        data_dir / "labelled_train_projections.npy",
+        data_dir / "test_projections.npy",
+    ]
+    for p in required:
+        if not p.exists():
+            return ("missing_data", f"Missing data file: '{p}'")
+
+    lab_idx   = np.load(data_dir / "labelled_train_idx.npy")
+    unlab_idx = np.load(data_dir / "unlabelled_train_idx.npy")
+    test_idx  = np.load(data_dir / "test_idx.npy")
+
+    lab_proj_n  = np.load(data_dir / "labelled_train_projections.npy",  mmap_mode='r').shape[0]
+    test_proj_n = np.load(data_dir / "test_projections.npy", mmap_mode='r').shape[0]
+
+    unlab_proj_path = data_dir / "unlabelled_train_projections.npy"
+    if unlab_proj_path.exists() and len(lab_idx) > 0 and len(unlab_idx) > 0:
+        unlab_proj_n  = np.load(unlab_proj_path, mmap_mode='r').shape[0]
+        train_n_proj  = lab_proj_n + unlab_proj_n
+        train_n_idx   = len(lab_idx) + len(unlab_idx)
+    elif len(lab_idx) == 0:
+        train_n_proj  = lab_proj_n
+        train_n_idx   = len(unlab_idx)
+    else:
+        train_n_proj  = lab_proj_n
+        train_n_idx   = len(lab_idx)
+
+    if train_n_proj != train_n_idx:
+        return ("shape_mismatch",
+                f"Train projections ({train_n_proj}) != train indices ({train_n_idx})")
+    if test_proj_n != len(test_idx):
+        return ("shape_mismatch",
+                f"Test projections ({test_proj_n}) != test indices ({len(test_idx)})")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # PCA variance plot (mirrors notebook cell 26)
 # ---------------------------------------------------------------------------
 def generate_pca_variance_plot(run_dir: Path, all_proj: np.ndarray, force: bool = False):
@@ -763,9 +813,15 @@ def main():
                                 n_pos=s.get("n_eval_positives", 0)))
             print()
         else:
-            worker_args.append((rd, args.epsilon, args.steps, suffix, csv_df, labels_all,
-                                args.pca, args.max_queries, args.timing_plot, args.pca_components,
-                                outputs_root, args.force))
+            issue = _check_run_data(rd)
+            if issue is not None:
+                err_type, detail = issue
+                failures.append(dict(name=rd.name, f=f_val, sw=sw_val,
+                                     error=err_type, detail=detail))
+            else:
+                worker_args.append((rd, args.epsilon, args.steps, suffix, csv_df, labels_all,
+                                    args.pca, args.max_queries, args.timing_plot, args.pca_components,
+                                    outputs_root, args.force))
 
     if worker_args:
         n_workers = min(args.workers, len(worker_args))
@@ -801,10 +857,16 @@ def main():
         by_type = {}
         for f in failures:
             by_type.setdefault(f["error"], []).append(f)
-        print(f"\n{len(failures)} run(s) failed:")
+        byol_error_types = {"missing_checkpoint", "shape_mismatch", "missing_data"}
+        n_byol = sum(len(g) for et, g in by_type.items() if et in byol_error_types)
+        n_other = len(failures) - n_byol
+        print(f"\n{len(failures)} run(s) could not be processed:")
+        if n_byol:
+            print(f"  {n_byol} need BYOL re-training (re-run train_byol.py for these):")
         for err_type, group in by_type.items():
             label = {"missing_checkpoint": "Missing checkpoint (byol_model_best.pt)",
-                     "shape_mismatch":     "Shape mismatch (projection array vs source names)",
+                     "shape_mismatch":     "Truncated projections (test_projections.npy incomplete)",
+                     "missing_data":       "Missing data files",
                      "other":              "Other error"}.get(err_type, err_type)
             print(f"\n  {label} ({len(group)}):")
             for f in group:

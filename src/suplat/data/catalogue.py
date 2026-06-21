@@ -79,10 +79,9 @@ UNLABELLED_DATASETS = {"mgcls_20k", "mgcls_5k", "mightee", "mightee_fr"}
 # CSV-based datasets (use EvalDataset / labels.csv)
 CSV_DATASETS = {"mirabest", "first", "mightee_fr"}
 
-# Split ratios
-TRAIN_RATIO = 0.64
-VAL_RATIO   = 0.16
-# TEST_RATIO  = 0.20  (remainder)
+# Split ratios — match train_byol.py: 70/30 train/test, then 80/20 of train for val
+TEST_RATIO = 0.30   # same as train_byol
+VAL_RATIO  = 0.20   # fraction of the non-test remainder
 
 
 # ---------------------------------------------------------------------------
@@ -124,11 +123,16 @@ def compute_split(
     existing_val:  Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute 64/16/20 train/val/test index split for n items.
+    Compute train/val/test index split for n items.
 
-    If existing_test is provided (e.g. canonical test split from a CSV),
-    those indices become the test set. The remainder is split 80/20 for
-    train/val from the remaining data.
+    Test split uses sklearn's train_test_split with test_size=TEST_RATIO (0.30)
+    and random_state=seed — identical to the logic in train_byol.py so that
+    test indices are shared across training and evaluation.
+
+    Val is 20% of the remaining (non-test) data, selected via numpy default_rng.
+
+    If existing_test / existing_val are provided (e.g. canonical CSV splits),
+    those override the random selection.
 
     Parameters
     ----------
@@ -141,25 +145,26 @@ def compute_split(
     -------
     train_idx, val_idx, test_idx : np.ndarray of int indices
     """
-    rng = np.random.default_rng(seed)
+    from sklearn.model_selection import train_test_split as _sklearn_split
+
     all_idx = np.arange(n)
 
     if existing_test is not None:
         test_idx      = np.asarray(existing_test)
         remaining_idx = np.setdiff1d(all_idx, test_idx)
     else:
-        # Random 20% test split
-        n_test    = max(1, round(n * (1 - TRAIN_RATIO - VAL_RATIO)))
-        test_idx  = rng.choice(all_idx, size=n_test, replace=False)
-        remaining_idx = np.setdiff1d(all_idx, test_idx)
+        # Matches train_byol.py: sklearn 70/30, same random_state
+        remaining_idx, test_idx = _sklearn_split(
+            all_idx, test_size=TEST_RATIO, random_state=seed
+        )
 
     if existing_val is not None:
         val_idx   = np.asarray(existing_val)
         train_idx = np.setdiff1d(remaining_idx, val_idx)
     else:
-        # From remaining, 80% train / 20% val  (= 64% / 16% overall)
-        n_val     = max(1, round(len(remaining_idx) * VAL_RATIO /
-                                 (TRAIN_RATIO + VAL_RATIO)))
+        # 20% of the non-test remainder for val
+        rng   = np.random.default_rng(seed)
+        n_val = max(1, round(len(remaining_idx) * VAL_RATIO))
         val_idx   = rng.choice(remaining_idx, size=n_val, replace=False)
         train_idx = np.setdiff1d(remaining_idx, val_idx)
 

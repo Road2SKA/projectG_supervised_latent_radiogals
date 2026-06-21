@@ -277,10 +277,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_dir',    required=True, type=Path)
     parser.add_argument('--data_dir',   required=True, type=Path)
-    parser.add_argument('--model',      required=True,
+    parser.add_argument('--model',      default='enb0',
                         choices=['cnn', 'scatternet', 'simplescatternet',
                                  'vit', 'dualssn', 'enb0'])
-    parser.add_argument('--label_set',  default='classical',
+    parser.add_argument('--label_set',  default='initial_pure',
                         choices=list(LABEL_SETS.keys()))
     parser.add_argument('--eval_fri_frii_pure', action='store_true',
                         help='(with --label_set full) evaluate on FRI/FRII-pure sources only')
@@ -292,6 +292,10 @@ def main():
     parser.add_argument('--cv_folds',   type=int, default=1)
     parser.add_argument('--run_name',   type=str, default=None,
                         help="Custom run name prefix (default: run_dir basename + timestamp)")
+    parser.add_argument('--byol_run_dir', type=Path, default=None,
+                        help="BYOL run directory whose data/train_idx.npy + data/test_idx.npy "
+                             "define the train/test split. When set, overrides the internal "
+                             "70/15/15 random split.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -338,10 +342,21 @@ def main():
     n_classes   = len(class_names)
     print(f"Label set: {args.label_set} ({n_classes} classes: {class_names})")
 
-    # ── 70/15/15 split — same logic as create_embeddings.py ──────────────
-    all_idx = np.arange(len(images))
-    trainval_idx, test_idx = train_test_split(all_idx,      test_size=0.30, random_state=args.seed)
-    train_idx,    val_idx  = train_test_split(trainval_idx, test_size=0.50, random_state=args.seed)
+    # ── Train/test split ──────────────────────────────────────────────────
+    if args.byol_run_dir is not None:
+        byol_data    = args.byol_run_dir / "data"
+        trainval_idx = np.load(byol_data / "train_idx.npy")
+        test_idx     = np.load(byol_data / "test_idx.npy")
+        train_idx, val_idx = train_test_split(
+            trainval_idx, test_size=VAL_FRAC, random_state=args.seed
+        )
+        print(f"Using BYOL split from: {args.byol_run_dir.name}")
+        print(f"  train+val: {len(trainval_idx)}  test: {len(test_idx)}")
+    else:
+        # 70/15/15 split — same logic as create_embeddings.py
+        all_idx = np.arange(len(images))
+        trainval_idx, test_idx = train_test_split(all_idx,      test_size=0.30, random_state=args.seed)
+        train_idx,    val_idx  = train_test_split(trainval_idx, test_size=0.50, random_state=args.seed)
 
     test_images = images[test_idx]
     if args.label_set == "derived":

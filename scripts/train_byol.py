@@ -266,6 +266,11 @@ OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     RUN_ID = f"{args.run_name}_{_timestamp}"
+    # Skip if a run with this name already exists (any timestamp)
+    _existing = sorted(OUTPUT_BASE.glob(f"run_{args.run_name}_*"))
+    if _existing:
+        print(f"[SKIP] Run '{args.run_name}' already exists: {_existing[0].name}")
+        import sys; sys.exit(0)
 else:
     RUN_ID = _timestamp
     if DATASET_NAME != "LOTSS":
