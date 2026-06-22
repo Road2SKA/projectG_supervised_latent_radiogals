@@ -1272,6 +1272,9 @@ for _item in _items:
         _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul+_n_tr:] = True
 
         _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
+        _umap_cache_dir = DATA_DIR / 'umap'
+        _umap_cache_dir.mkdir(exist_ok=True)
+        np.save(_umap_cache_dir / f'umap_encodings_coords{_suffix}.npy', _all_2d)
 
         _split_masks_all = {}
         if _n_ul > 0:
@@ -1291,6 +1294,7 @@ for _item in _items:
         _proj_parts = ([unlab_projections] if unlab_encodings is not None else []) + [train_projections, test_projections]
         _all_projections = np.concatenate(_proj_parts)
         _, _proj_2d = fit_umap(_all_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
+        np.save(_umap_cache_dir / f'umap_projections_coords{_suffix}.npy', _proj_2d)
         plot_umap_single(
             _proj_2d, _all_lf, 'initial', CLASS_NAMES, LABEL_RANGES,
             title='All (projections) — initial',
