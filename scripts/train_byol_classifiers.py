@@ -161,7 +161,7 @@ def _fit_and_eval(clf, X_train, y_train, X_test, y_test, class_names,
     else:
         y_pred = clf.predict(X_test)
         y_prob = clf.predict_proba(X_test)
-    return evaluate_metrics(y_test, y_pred, y_prob, class_names)
+    return evaluate_metrics(y_test, y_pred, y_prob, class_names), y_pred
 
 
 def process_run(run_dir: Path, feature_type: str, label_set: str,
@@ -193,11 +193,12 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         return out
 
     print(f"  [{run_dir.name}] processing...", flush=True)
-    data_dir = run_dir / "data"
+    splits_dir = run_dir / "../data_splits/42/"
+    feat_dir   = run_dir / "data" / "byol"
 
     # ── Load features ────────────────────────────────────────────────────────
-    train_feat_path = data_dir / f"labelled_train_{feature_type}.npy"
-    test_feat_path  = data_dir / f"test_{feature_type}.npy"
+    train_feat_path = feat_dir / f"labelled_train_{feature_type}.npy"
+    test_feat_path  = feat_dir / f"test_{feature_type}.npy"
 
     if not train_feat_path.exists():
         return dict(name=run_dir.name, error="missing_data",
@@ -210,26 +211,50 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     X_test_raw  = np.load(test_feat_path).astype(np.float32)
 
     # ── Load labels ──────────────────────────────────────────────────────────
-    lab_labels_path = data_dir / "labelled_train_labels.npy"
-    if lab_labels_path.exists():
-        y_train_full = np.load(lab_labels_path)
-    else:
-        train_labels_path = data_dir / "train_labels.npy"
-        lab_idx_path      = data_dir / "labelled_train_idx.npy"
-        if not train_labels_path.exists():
-            return dict(name=run_dir.name, error="missing_data",
-                        detail=f"Missing: {train_labels_path}")
-        if not lab_idx_path.exists():
-            return dict(name=run_dir.name, error="missing_data",
-                        detail=f"Missing: {lab_idx_path}")
-        all_train_labels = np.load(train_labels_path)
-        lab_idx          = np.load(lab_idx_path)
-        if len(all_train_labels) == len(X_train_raw):
-            y_train_full = all_train_labels
-        else:
-            y_train_full = all_train_labels[lab_idx]
+    # Prefer per-run labels saved alongside projections (avoids shared splits_dir
+    # being overwritten by a different run with a different f_label).
+    run_lab_labels_path = feat_dir / "labelled_train_labels.npy"
+    lab_labels_path     = splits_dir / "labelled_train_labels.npy"
 
-    test_labels_path = data_dir / "test_labels.npy"
+    if run_lab_labels_path.exists():
+        y_train_full = np.load(run_lab_labels_path)
+    elif lab_labels_path.exists():
+        y_train_full = np.load(lab_labels_path)
+        # If sizes don't match, try to reconstruct full train labels from splits.
+        if len(y_train_full) != len(X_train_raw):
+            train_idx_path   = splits_dir / "train_idx.npy"
+            lab_idx_path     = splits_dir / "labelled_train_idx.npy"
+            unlab_idx_path   = splits_dir / "unlabelled_train_idx.npy"
+            unlab_labels_path = splits_dir / "unlabelled_train_labels.npy"
+            if (train_idx_path.exists() and lab_idx_path.exists()
+                    and unlab_idx_path.exists() and unlab_labels_path.exists()):
+                train_idx   = np.load(train_idx_path)
+                lab_idx     = np.load(lab_idx_path)
+                unlab_idx   = np.load(unlab_idx_path)
+                unlab_labels = np.load(unlab_labels_path)
+                lab_labels   = y_train_full  # already loaded (from splits_dir)
+                # Reconstruct labels ordered by train_idx
+                if len(X_train_raw) == len(train_idx):
+                    idx_map = {}
+                    for i, idx in enumerate(lab_idx):
+                        idx_map[idx] = lab_labels[i]
+                    for i, idx in enumerate(unlab_idx):
+                        idx_map[idx] = unlab_labels[i]
+                    y_train_full = np.stack([idx_map[idx] for idx in train_idx])
+                else:
+                    return dict(name=run_dir.name, error="label_size_mismatch",
+                                detail=f"X_train has {len(X_train_raw)} rows but labels "
+                                       f"have {len(y_train_full)}; cannot reconstruct "
+                                       f"without per-run labelled_train_labels.npy")
+            else:
+                return dict(name=run_dir.name, error="label_size_mismatch",
+                            detail=f"X_train has {len(X_train_raw)} rows but labels "
+                                   f"have {len(y_train_full)}; missing splits files for reconstruction")
+    else:
+        return dict(name=run_dir.name, error="missing_data",
+                    detail=f"Missing: {lab_labels_path}")
+
+    test_labels_path = splits_dir / "test_labels.npy"
     if not test_labels_path.exists():
         return dict(name=run_dir.name, error="missing_data",
                     detail=f"Missing: {test_labels_path}")
@@ -300,8 +325,8 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
             continue
 
         is_mo = not is_multiclass and clf_name == "rf"
-        metrics = _fit_and_eval(clf, X_train, y_train, X_test, y_test,
-                                class_names, label_set, is_multi_output=is_mo)
+        metrics, y_pred_test = _fit_and_eval(clf, X_train, y_train, X_test, y_test,
+                                             class_names, label_set, is_multi_output=is_mo)
         print(f"    {clf_name.upper()}: F1={metrics['f1_macro']:.4f}  "
               f"AUC={metrics['auc_macro']:.4f}  Acc={metrics['accuracy']:.4f}", flush=True)
 
@@ -316,6 +341,11 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         }
         with open(path, "w") as fh:
             json.dump(payload, fh, indent=2)
+
+        np.save(clf_dir / f"{clf_name}_{label_set}_{feature_type}_test_preds.npy", y_pred_test)
+        _lbl_path = clf_dir / f"{label_set}_{feature_type}_test_labels.npy"
+        if not _lbl_path.exists():
+            np.save(_lbl_path, y_test)
 
         out[clf_name] = {
             "f1_macro":     metrics["f1_macro"],
@@ -353,8 +383,8 @@ def main():
     )
     parser.add_argument("--outputs-root", default="outputs",
                         help="Root directory containing run subdirectories (default: outputs).")
-    parser.add_argument("--run-glob",     default="run_enb0_*",
-                        help="Glob pattern for run directories (default: run_enb0_*).")
+    parser.add_argument("--run-glob",     default="enb0_*",
+                        help="Glob pattern for run directories (default: enb0_*).")
     parser.add_argument("--feature-type", default="projections",
                         choices=["projections", "encodings"],
                         help="Feature vectors to use (default: projections).")

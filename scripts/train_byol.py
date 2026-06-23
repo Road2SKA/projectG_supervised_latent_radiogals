@@ -262,12 +262,15 @@ use_cuda = torch.cuda.is_available()
 OUTPUT_BASE = args.output_dir
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
+SPLITS_DIR = OUTPUT_BASE / 'data_splits' / str(DATA_SEED)
+SPLITS_DIR.mkdir(parents=True, exist_ok=True)
+
 # Create run directory — include projector type to avoid collisions with train_byol.py
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     RUN_ID = f"{args.run_name}_{_timestamp}"
     # Skip if a run with this name already exists (any timestamp)
-    _existing = sorted(OUTPUT_BASE.glob(f"run_{args.run_name}_*"))
+    _existing = sorted(OUTPUT_BASE.glob(f"{args.run_name}_*"))
     if _existing:
         print(f"[SKIP] Run '{args.run_name}' already exists: {_existing[0].name}")
         import sys; sys.exit(0)
@@ -292,7 +295,7 @@ LABEL_RANGES = {
     'derived':     (19, 24),
 }
 
-OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
+OUTPUT_DIR = OUTPUT_BASE / RUN_ID
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Create subfolders
@@ -300,7 +303,8 @@ FIGURES_DIR = OUTPUT_DIR / 'figures'
 UMAP_DIR    = FIGURES_DIR / 'umap'
 LOGS_DIR    = OUTPUT_DIR / 'logs'
 DATA_DIR    = OUTPUT_DIR / 'data'
-for _d in [FIGURES_DIR, UMAP_DIR, LOGS_DIR, DATA_DIR]:
+BYOL_DIR    = DATA_DIR / 'byol'
+for _d in [FIGURES_DIR, UMAP_DIR, LOGS_DIR, DATA_DIR, BYOL_DIR]:
     _d.mkdir(exist_ok=True)
 
 checkpoint_path = OUTPUT_DIR / 'byol_model_best.pt'
@@ -1019,11 +1023,12 @@ pca_fit_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE,
 
 _, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=USE_COMPILE)
 
-np.save(DATA_DIR / 'train_idx.npy',          train_idx)
-np.save(DATA_DIR / 'labelled_train_idx.npy', labelled_train_idx)
-np.save(DATA_DIR / 'test_idx.npy', test_idx)
+np.save(SPLITS_DIR / 'train_idx.npy', train_idx)
+np.save(SPLITS_DIR / 'test_idx.npy',  test_idx)
 unlabelled_train_idx = train_idx[~labelled_mask]
-np.save(DATA_DIR / 'unlabelled_train_idx.npy', unlabelled_train_idx)
+_f_str = str(F_LABEL).rstrip('0').rstrip('.') if '.' in str(F_LABEL) else str(int(F_LABEL))
+np.save(SPLITS_DIR / f'labelled_train_idx_f{_f_str}.npy',   labelled_train_idx)
+np.save(SPLITS_DIR / f'unlabelled_train_idx_f{_f_str}.npy', unlabelled_train_idx)
 
 # Set train_labels / train_images for downstream to labelled-only
 if len(labelled_images) > 0:
@@ -1116,8 +1121,8 @@ for _item in _items:
 
     print(f"Model checkpoint saved to {_chk_path}")
 
-    np.save(DATA_DIR / f'training_history{_suffix}.npy', history)
-    print(f"Training history saved to {DATA_DIR / f'training_history{_suffix}.npy'}")
+    np.save(BYOL_DIR / f'training_history{_suffix}.npy', history)
+    print(f"Training history saved to {BYOL_DIR / f'training_history{_suffix}.npy'}")
 
     if not args.no_plot_history:
         print(f"\nGenerating training curve plots{_label}...")
@@ -1139,22 +1144,22 @@ for _item in _items:
     )
     print(f"   Test set projections: {test_projections.shape}")
 
-    np.save(DATA_DIR / f'labelled_train_projections{_suffix}.npy', train_projections)
-    np.save(DATA_DIR / f'labelled_train_labels{_suffix}.npy', train_labels[:len(train_projections)])
-    np.save(DATA_DIR / f'test_projections{_suffix}.npy', test_projections)
-    np.save(DATA_DIR / f'test_labels{_suffix}.npy', test_labels[:len(test_projections)])
+    np.save(BYOL_DIR / f'labelled_train_projections{_suffix}.npy', train_projections)
+    np.save(BYOL_DIR / f'test_projections{_suffix}.npy', test_projections)
+    np.save(SPLITS_DIR / f'labelled_train_labels_f{_f_str}{_suffix}.npy', train_labels[:len(train_projections)])
+    np.save(SPLITS_DIR / f'test_labels{_suffix}.npy', test_labels[:len(test_projections)])
 
     if len(unlabelled_images) > 0:
         unlab_projections = extract_embeddings_from_loader(
             model, unlab_extract_loader, MODEL_TYPE, device, max_batches=None
         )
         print(f"   Unlabelled train set projections: {unlab_projections.shape}")
-        np.save(DATA_DIR / f'unlabelled_train_projections{_suffix}.npy', unlab_projections)
-        np.save(DATA_DIR / f'unlabelled_train_labels{_suffix}.npy', labels[unlabelled_train_idx])
+        np.save(BYOL_DIR / f'unlabelled_train_projections{_suffix}.npy', unlab_projections)
+        np.save(SPLITS_DIR / f'unlabelled_train_labels_f{_f_str}{_suffix}.npy', labels[unlabelled_train_idx])
     else:
         unlab_projections = None
 
-    print(f"\nProjections saved to {DATA_DIR}/")
+    print(f"\nProjections saved to {BYOL_DIR}/")
 
     # =========================================================================
     # EXTRACT ENCODINGS (encoder output, before projector)
@@ -1173,19 +1178,19 @@ for _item in _items:
         f"Encoding/projection count mismatch (train): {len(train_encodings)} vs {len(train_projections)}"
     assert len(test_encodings) == len(test_projections), \
         f"Encoding/projection count mismatch (test): {len(test_encodings)} vs {len(test_projections)}"
-    np.save(DATA_DIR / f'labelled_train_encodings{_suffix}.npy', train_encodings)
-    np.save(DATA_DIR / f'test_encodings{_suffix}.npy', test_encodings)
+    np.save(BYOL_DIR / f'labelled_train_encodings{_suffix}.npy', train_encodings)
+    np.save(BYOL_DIR / f'test_encodings{_suffix}.npy', test_encodings)
 
     if unlab_projections is not None:
         unlab_encodings = extract_raw_embeddings_from_loader(
             model, unlab_extract_loader, device, max_batches=None
         )
         print(f"   Unlabelled train set encodings: {unlab_encodings.shape}")
-        np.save(DATA_DIR / f'unlabelled_train_encodings{_suffix}.npy', unlab_encodings)
+        np.save(BYOL_DIR / f'unlabelled_train_encodings{_suffix}.npy', unlab_encodings)
     else:
         unlab_encodings = None
 
-    print(f"Encodings saved to {DATA_DIR}/")
+    print(f"Encodings saved to {BYOL_DIR}/")
 
     # =========================================================================
     # PCA VARIANCE ANALYSIS  (dimensionality collapse diagnostic)
@@ -1441,19 +1446,19 @@ if args.run_protege:
     PROTEGE_DIR = OUTPUT_DIR / "protege"
     PROTEGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    lab_proj  = np.load(DATA_DIR / "labelled_train_projections.npy")
-    lab_idx   = np.load(DATA_DIR / "labelled_train_idx.npy")
-    unlab_proj_path = DATA_DIR / "unlabelled_train_projections.npy"
+    lab_proj  = np.load(BYOL_DIR / "labelled_train_projections.npy")
+    lab_idx   = np.load(SPLITS_DIR / "labelled_train_idx.npy")
+    unlab_proj_path = BYOL_DIR / "unlabelled_train_projections.npy"
     if unlab_proj_path.exists():
         unlab_proj = np.load(unlab_proj_path)
-        unlab_idx  = np.load(DATA_DIR / "unlabelled_train_idx.npy")
+        unlab_idx  = np.load(SPLITS_DIR / "unlabelled_train_idx.npy")
         cat_proj   = np.concatenate([lab_proj, unlab_proj], axis=0)
         cat_idx    = np.concatenate([lab_idx, unlab_idx])
     else:
         cat_proj = lab_proj
         cat_idx  = lab_idx
-    test_proj_prot   = np.load(DATA_DIR / "test_projections.npy")
-    test_idx_prot    = np.load(DATA_DIR / "test_idx.npy")
+    test_proj_prot   = np.load(BYOL_DIR / "test_projections.npy")
+    test_idx_prot    = np.load(SPLITS_DIR / "test_idx.npy")
 
     _csv_df    = pd.read_csv("/users/mbredber/p3_SUPLAT/data/metadata/lotss_classifications_horton_et_al_2025_filtered.csv")
     _labels_all = np.load("/users/mbredber/p3_SUPLAT/data/preprocessed/lotss/labels_filtered.npy")

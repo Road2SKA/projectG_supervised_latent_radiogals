@@ -38,7 +38,7 @@ import torch.nn.functional as F
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+from sklearn.metrics import f1_score, roc_auc_score, accuracy_score, recall_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -142,18 +142,22 @@ def evaluate_metrics(y_true, y_pred, y_prob, class_names):
         else:
             aucs.append(roc_auc_score(y_true[:, i], y_prob[:, i]))
 
-    f1_per = f1_score(y_true, y_pred, average=None, zero_division=0).tolist()
-    f1_mac = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    acc    = accuracy_score(y_true.reshape(-1), y_pred.reshape(-1))
+    f1_per  = f1_score(y_true, y_pred, average=None, zero_division=0).tolist()
+    f1_mac  = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    rec_per = recall_score(y_true, y_pred, average=None, zero_division=0).tolist()
+    rec_mac = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    acc     = accuracy_score(y_true.reshape(-1), y_pred.reshape(-1))
     mac_auc = float(np.nanmean(aucs))
 
     return {
-        'f1_macro':      float(f1_mac),
-        'auc_macro':     mac_auc,
-        'accuracy':      float(acc),
-        'f1_per_class':  f1_per,
-        'auc_per_class': [float(a) if not np.isnan(a) else None for a in aucs],
-        'class_names':   class_names,
+        'f1_macro':         float(f1_mac),
+        'auc_macro':        mac_auc,
+        'accuracy':         float(acc),
+        'recall_macro':     float(rec_mac),
+        'f1_per_class':     f1_per,
+        'auc_per_class':    [float(a) if not np.isnan(a) else None for a in aucs],
+        'recall_per_class': rec_per,
+        'class_names':      class_names,
     }
 
 
@@ -175,6 +179,28 @@ def forward_model(model, batch, model_name, device):
         imgs, labels = imgs.to(device), labels.to(device)
         logits = model(imgs)
         return logits, labels
+
+
+class MultiLabelWrapper(nn.Module):
+    def __init__(self, inner, n_cl):
+        super().__init__()
+        self.inner = inner
+        self.n_cl  = n_cl
+
+    def forward(self, *args):
+        out = self.inner(*args)       # (B, n_classes * 2)
+        return out.view(out.size(0), self.n_cl, 2)
+
+
+class DualWrapper(nn.Module):
+    def __init__(self, inner, n_cl):
+        super().__init__()
+        self.inner = inner
+        self.n_cl  = n_cl
+
+    def forward(self, img, scat):
+        out = self.inner(img, scat)
+        return out.view(out.size(0), self.n_cl, 2)
 
 
 # ── Build model ───────────────────────────────────────────────────────────────
@@ -217,28 +243,7 @@ def build_model(model_name, n_classes, img_shape, scat_shape=None):
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    # Wrap output as (B, n_classes, 2)
-    class MultiLabelWrapper(nn.Module):
-        def __init__(self, inner, n_cl):
-            super().__init__()
-            self.inner = inner
-            self.n_cl  = n_cl
-
-        def forward(self, *args):
-            out = self.inner(*args)       # (B, n_classes * 2)
-            return out.view(out.size(0), self.n_cl, 2)
-
-    # DualSSN already has its own forward; wrap appropriately
     if model_name == 'dualssn':
-        class DualWrapper(nn.Module):
-            def __init__(self, inner, n_cl):
-                super().__init__()
-                self.inner = inner
-                self.n_cl  = n_cl
-
-            def forward(self, img, scat):
-                out = self.inner(img, scat)
-                return out.view(out.size(0), self.n_cl, 2)
         return DualWrapper(base, n_classes)
 
     return MultiLabelWrapper(base, n_classes)
@@ -294,9 +299,14 @@ def main():
                         help="Custom run name prefix (default: run_dir basename + timestamp)")
     parser.add_argument('--byol_run_dir', type=Path, default=None,
                         help="BYOL run directory whose data/train_idx.npy + data/test_idx.npy "
-                             "define the train/test split. When set, overrides the internal "
-                             "70/15/15 random split.")
+                             "define the train/test split (default: --run_dir itself).")
+    parser.add_argument('--data_seed', type=int, default=None,
+                        help="Data seed used to locate data_splits/<seed>/ directly, "
+                             "without needing a BYOL checkpoint. Overrides --byol_run_dir "
+                             "split resolution if provided.")
     args = parser.parse_args()
+    if args.byol_run_dir is None:
+        args.byol_run_dir = args.run_dir
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -306,7 +316,7 @@ def main():
     # ── Output directory ──────────────────────────────────────────────────
     _ts = datetime.now().strftime('%Y%m%d_%H%M')
     _prefix = args.run_name if args.run_name else args.run_dir.name
-    out_dir = args.run_dir / 'baselines' / f'{_prefix}_{args.model}_{_ts}'
+    out_dir = args.run_dir / f'{_prefix}_{args.model}_{_ts}'
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir}")
 
@@ -343,20 +353,29 @@ def main():
     print(f"Label set: {args.label_set} ({n_classes} classes: {class_names})")
 
     # ── Train/test split ──────────────────────────────────────────────────
-    if args.byol_run_dir is not None:
-        byol_data    = args.byol_run_dir / "data"
-        trainval_idx = np.load(byol_data / "train_idx.npy")
-        test_idx     = np.load(byol_data / "test_idx.npy")
-        train_idx, val_idx = train_test_split(
-            trainval_idx, test_size=VAL_FRAC, random_state=args.seed
-        )
-        print(f"Using BYOL split from: {args.byol_run_dir.name}")
-        print(f"  train+val: {len(trainval_idx)}  test: {len(test_idx)}")
+    if args.data_seed is not None:
+        _splits_dir = args.byol_run_dir.parent / "data_splits" / str(args.data_seed)
+        split_label = f"data_seed={args.data_seed}"
     else:
-        # 70/15/15 split — same logic as create_embeddings.py
-        all_idx = np.arange(len(images))
-        trainval_idx, test_idx = train_test_split(all_idx,      test_size=0.30, random_state=args.seed)
-        train_idx,    val_idx  = train_test_split(trainval_idx, test_size=0.50, random_state=args.seed)
+        byol_data = args.byol_run_dir / "data"
+        _ckpt_raw = torch.load(args.byol_run_dir / "byol_model_best.pt",
+                               map_location="cpu", weights_only=False)
+        _data_seed  = int(_ckpt_raw["config"]["data_seed"])
+        _splits_dir = args.byol_run_dir.parent / "data_splits" / str(_data_seed)
+        byol_data   = args.byol_run_dir / "data"
+        split_label = args.byol_run_dir.name
+    def _load_idx(name):
+        p = _splits_dir / name
+        if args.data_seed is None:
+            return np.load(p if p.exists() else byol_data / name)
+        return np.load(p)
+    trainval_idx = _load_idx("train_idx.npy")
+    test_idx     = _load_idx("test_idx.npy")
+    train_idx, val_idx = train_test_split(
+        trainval_idx, test_size=VAL_FRAC, random_state=args.seed
+    )
+    print(f"Using split from: {split_label}")
+    print(f"  train+val: {len(trainval_idx)}  test: {len(test_idx)}")
 
     test_images = images[test_idx]
     if args.label_set == "derived":
@@ -616,14 +635,16 @@ def main():
 
         # ── Metrics ───────────────────────────────────────────────────────
         results = evaluate_metrics(test_labels_arr, test_preds, test_probs, class_names)
-        print(f"\nMacro F1:  {results['f1_macro']:.4f}")
-        print(f"Macro AUC: {results['auc_macro']:.4f}")
-        print(f"Accuracy:  {results['accuracy']:.4f}")
+        print(f"\nMacro F1:     {results['f1_macro']:.4f}")
+        print(f"Macro AUC:    {results['auc_macro']:.4f}")
+        print(f"Macro Recall: {results['recall_macro']:.4f}")
+        print(f"Accuracy:     {results['accuracy']:.4f}")
 
         # ── Save outputs ──────────────────────────────────────────────────
-        np.save(fold_out / 'test_probs.npy',  test_probs)
-        np.save(fold_out / 'test_preds.npy',  test_preds)
-        np.save(fold_out / 'test_labels.npy', test_labels_arr)
+        np.save(fold_out / 'test_probs.npy',      test_probs)
+        np.save(fold_out / 'test_preds.npy',      test_preds)
+        np.save(fold_out / 'test_labels.npy',     test_labels_arr)
+        np.save(fold_out / 'test_source_idx.npy', test_idx)
 
         torch.save({
             'state_dict':  best_state,
@@ -635,6 +656,7 @@ def main():
             'img_shape':   img_shape,
             'seed':        args.seed,
         }, fold_out / 'model_best.pt')
+        torch.save(model, fold_out / 'model_best_full.pt')
 
         results['label_set']        = args.label_set
         results['eval_fri_frii_pure'] = args.eval_fri_frii_pure
@@ -645,23 +667,27 @@ def main():
         fold_results_list.append(results)
 
     if args.cv_folds > 1:
-        f1s  = [r['f1_macro']  for r in fold_results_list]
-        aucs = [r['auc_macro'] for r in fold_results_list]
-        accs = [r['accuracy']  for r in fold_results_list]
+        f1s  = [r['f1_macro']     for r in fold_results_list]
+        aucs = [r['auc_macro']    for r in fold_results_list]
+        accs = [r['accuracy']     for r in fold_results_list]
+        recs = [r['recall_macro'] for r in fold_results_list]
         agg = {
-            'cv_folds':       args.cv_folds,
-            'f1_macro_mean':  float(np.mean(f1s)),
-            'f1_macro_std':   float(np.std(f1s)),
-            'auc_macro_mean': float(np.mean(aucs)),
-            'auc_macro_std':  float(np.std(aucs)),
-            'accuracy_mean':  float(np.mean(accs)),
-            'accuracy_std':   float(np.std(accs)),
-            'per_fold':       fold_results_list,
+            'cv_folds':          args.cv_folds,
+            'f1_macro_mean':     float(np.mean(f1s)),
+            'f1_macro_std':      float(np.std(f1s)),
+            'auc_macro_mean':    float(np.mean(aucs)),
+            'auc_macro_std':     float(np.std(aucs)),
+            'accuracy_mean':     float(np.mean(accs)),
+            'accuracy_std':      float(np.std(accs)),
+            'recall_macro_mean': float(np.mean(recs)),
+            'recall_macro_std':  float(np.std(recs)),
+            'per_fold':          fold_results_list,
         }
         print(f"\nK-fold summary ({args.cv_folds} folds):")
-        print(f"  Macro F1:  {agg['f1_macro_mean']:.4f} ± {agg['f1_macro_std']:.4f}")
-        print(f"  Macro AUC: {agg['auc_macro_mean']:.4f} ± {agg['auc_macro_std']:.4f}")
-        print(f"  Accuracy:  {agg['accuracy_mean']:.4f} ± {agg['accuracy_std']:.4f}")
+        print(f"  Macro F1:     {agg['f1_macro_mean']:.4f} ± {agg['f1_macro_std']:.4f}")
+        print(f"  Macro AUC:    {agg['auc_macro_mean']:.4f} ± {agg['auc_macro_std']:.4f}")
+        print(f"  Macro Recall: {agg['recall_macro_mean']:.4f} ± {agg['recall_macro_std']:.4f}")
+        print(f"  Accuracy:     {agg['accuracy_mean']:.4f} ± {agg['accuracy_std']:.4f}")
         with open(out_dir / 'cv_results.json', 'w') as f:
             json.dump(agg, f, indent=2)
 

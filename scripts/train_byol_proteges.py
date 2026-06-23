@@ -64,51 +64,89 @@ PROTEGE_INITIAL_STEPS = 200
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers for the shared data_splits/ directory
+# ---------------------------------------------------------------------------
+def _get_splits_dir(run_dir: Path) -> Path:
+    ckpt = torch.load(run_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
+    seed = int(ckpt["config"]["data_seed"])
+    return run_dir.parent / "data_splits" / str(seed)
+
+
+def _load_split(splits_dir: Path, data_dir: Path, filename: str) -> np.ndarray:
+    p = splits_dir / filename
+    return np.load(p if p.exists() else data_dir / filename)
+
+
+# ---------------------------------------------------------------------------
 # Pre-flight check: detect BYOL runs that need re-training before GP dispatch
 # ---------------------------------------------------------------------------
-def _check_run_data(rd: Path):
-    """Return (error_type, detail) if the run has data issues, else None."""
+def _check_run_data(rd: Path, latent: str = "proj"):
+    """Return (error_type, detail) if the run has data issues, else None.
+
+    For latent="enc", missing encoding files return ("missing_enc_data", ...)
+    which main() treats as a silent skip rather than a BYOL failure.
+    """
     ckpt = rd / "byol_model_best.pt"
     if not ckpt.exists():
         return ("missing_checkpoint", f"Missing checkpoint: '{ckpt}'")
 
-    data_dir = rd / "data"
-    required = [
-        data_dir / "labelled_train_idx.npy",
-        data_dir / "unlabelled_train_idx.npy",
-        data_dir / "test_idx.npy",
-        data_dir / "labelled_train_projections.npy",
-        data_dir / "test_projections.npy",
+    data_dir   = rd / "data"
+    byol_dir   = data_dir / "byol"
+    splits_dir = _get_splits_dir(rd)
+
+    def _idx_path(name):
+        p = splits_dir / name
+        return p if p.exists() else data_dir / name
+
+    required_idx = [
+        _idx_path("labelled_train_idx.npy"),
+        _idx_path("unlabelled_train_idx.npy"),
+        _idx_path("test_idx.npy"),
     ]
-    for p in required:
-        if not p.exists():
-            return ("missing_data", f"Missing data file: '{p}'")
-
-    lab_idx   = np.load(data_dir / "labelled_train_idx.npy")
-    unlab_idx = np.load(data_dir / "unlabelled_train_idx.npy")
-    test_idx  = np.load(data_dir / "test_idx.npy")
-
-    lab_proj_n  = np.load(data_dir / "labelled_train_projections.npy",  mmap_mode='r').shape[0]
-    test_proj_n = np.load(data_dir / "test_projections.npy", mmap_mode='r').shape[0]
-
-    unlab_proj_path = data_dir / "unlabelled_train_projections.npy"
-    if unlab_proj_path.exists() and len(lab_idx) > 0 and len(unlab_idx) > 0:
-        unlab_proj_n  = np.load(unlab_proj_path, mmap_mode='r').shape[0]
-        train_n_proj  = lab_proj_n + unlab_proj_n
-        train_n_idx   = len(lab_idx) + len(unlab_idx)
-    elif len(lab_idx) == 0:
-        train_n_proj  = lab_proj_n
-        train_n_idx   = len(unlab_idx)
+    if latent == "proj":
+        required_feat = [byol_dir / "labelled_train_projections.npy",
+                         byol_dir / "test_projections.npy"]
+        feat_label = "projections"
     else:
-        train_n_proj  = lab_proj_n
-        train_n_idx   = len(lab_idx)
+        required_feat = [byol_dir / "labelled_train_encodings.npy",
+                         byol_dir / "test_encodings.npy"]
+        feat_label = "encodings"
 
-    if train_n_proj != train_n_idx:
+    for p in required_idx + required_feat:
+        if not p.exists():
+            err_type = "missing_enc_data" if latent == "enc" else "missing_data"
+            return (err_type, f"Missing data file: '{p}'")
+
+    lab_idx   = _load_split(splits_dir, data_dir, "labelled_train_idx.npy")
+    unlab_idx = _load_split(splits_dir, data_dir, "unlabelled_train_idx.npy")
+    test_idx  = _load_split(splits_dir, data_dir, "test_idx.npy")
+
+    if latent == "proj":
+        lab_n    = np.load(byol_dir / "labelled_train_projections.npy", mmap_mode='r').shape[0]
+        test_n   = np.load(byol_dir / "test_projections.npy",           mmap_mode='r').shape[0]
+        unlab_path = byol_dir / "unlabelled_train_projections.npy"
+    else:
+        lab_n    = np.load(byol_dir / "labelled_train_encodings.npy",   mmap_mode='r').shape[0]
+        test_n   = np.load(byol_dir / "test_encodings.npy",             mmap_mode='r').shape[0]
+        unlab_path = byol_dir / "unlabelled_train_encodings.npy"
+
+    if unlab_path.exists() and len(lab_idx) > 0 and len(unlab_idx) > 0:
+        unlab_n     = np.load(unlab_path, mmap_mode='r').shape[0]
+        train_n     = lab_n + unlab_n
+        train_n_idx = len(lab_idx) + len(unlab_idx)
+    elif len(lab_idx) == 0:
+        train_n     = lab_n
+        train_n_idx = len(unlab_idx)
+    else:
+        train_n     = lab_n
+        train_n_idx = len(lab_idx)
+
+    if train_n != train_n_idx:
         return ("shape_mismatch",
-                f"Train projections ({train_n_proj}) != train indices ({train_n_idx})")
-    if test_proj_n != len(test_idx):
+                f"Train {feat_label} ({train_n}) != train indices ({train_n_idx})")
+    if test_n != len(test_idx):
         return ("shape_mismatch",
-                f"Test projections ({test_proj_n}) != test indices ({len(test_idx)})")
+                f"Test {feat_label} ({test_n}) != test indices ({len(test_idx)})")
 
     return None
 
@@ -280,7 +318,9 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
     ellipses_train) using the same fitted IsoForest.
     """
     out_path = outputs_root / "anomaly_baselines" / f"baselines_{data_seed}.json"
-    test_idx_path = data_dir / "test_idx.npy"
+    _splits_dir_bl = outputs_root / "data_splits" / str(data_seed)
+    _test_idx_in_splits = _splits_dir_bl / "test_idx.npy"
+    test_idx_path = _test_idx_in_splits if _test_idx_in_splits.exists() else data_dir / "test_idx.npy"
     test_hash = hashlib.sha256(open(test_idx_path, "rb").read()).hexdigest()
 
     BASELINES_VERSION = 2   # bump when ellipse computation changes
@@ -403,49 +443,59 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
 # ---------------------------------------------------------------------------
 def process_run(run_dir: Path, epsilon: float,
                 steps: int, suffix: str, csv_df: pd.DataFrame, labels_all: np.ndarray,
+                latent: str = "proj",
                 use_pca: bool = False, max_queries: int = None, timing_plot: bool = False,
                 pca_components: int = None, outputs_root: Path = None, force: bool = False):
-    # Incorporate pca/nopca into the output suffix so all saved files are tagged
+    # Encoder features are 1280-dim: always apply PCA to keep GP tractable.
+    if latent == "enc":
+        use_pca = True
+
     _pca_tag = "pca" if use_pca else "nopca"
-    suffix = f"{suffix}_{_pca_tag}"
+    suffix = f"{suffix}_{latent}_{_pca_tag}"
 
     # --- Load data_seed from BYOL checkpoint ---
     ckpt = torch.load(run_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
-    data_seed   = int(ckpt["config"]["data_seed"])
-    latent_type = "proj" if ckpt["config"].get("projector") else "enc"
+    data_seed = int(ckpt["config"]["data_seed"])
     np.random.seed(data_seed)
-    print(f"  data_seed={data_seed}  latent={latent_type}", flush=True)
+    print(f"  data_seed={data_seed}  latent={latent}", flush=True)
 
     data_dir     = run_dir / "data"
+    byol_dir     = data_dir / "byol"
+    splits_dir   = run_dir.parent / "data_splits" / str(data_seed)
     protege_dir  = data_dir / "protege"
     protege_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Load projections and indices ---
-    lab_proj  = np.load(data_dir / "labelled_train_projections.npy")
-    lab_idx   = np.load(data_dir / "labelled_train_idx.npy")
-    unlab_idx = np.load(data_dir / "unlabelled_train_idx.npy")
-    test_idx  = np.load(data_dir / "test_idx.npy")
-    test_proj = np.load(data_dir / "test_projections.npy")
+    # --- Load features and indices (proj or enc) ---
+    lab_idx   = _load_split(splits_dir, data_dir, "labelled_train_idx.npy")
+    unlab_idx = _load_split(splits_dir, data_dir, "unlabelled_train_idx.npy")
+    test_idx  = _load_split(splits_dir, data_dir, "test_idx.npy")
 
-    unlab_proj_path = data_dir / "unlabelled_train_projections.npy"
-    if unlab_proj_path.exists() and len(lab_idx) > 0 and len(unlab_idx) > 0:
-        unlab_proj  = np.load(unlab_proj_path)
-        train_proj  = np.concatenate([lab_proj, unlab_proj], axis=0)
-        train_idx   = np.concatenate([lab_idx, unlab_idx])
+    if latent == "proj":
+        lab_feat  = np.load(byol_dir / "labelled_train_projections.npy")
+        test_feat = np.load(byol_dir / "test_projections.npy")
+        unlab_feat_path = byol_dir / "unlabelled_train_projections.npy"
+    else:
+        lab_feat  = np.load(byol_dir / "labelled_train_encodings.npy")
+        test_feat = np.load(byol_dir / "test_encodings.npy")
+        unlab_feat_path = byol_dir / "unlabelled_train_encodings.npy"
+
+    if unlab_feat_path.exists() and len(lab_idx) > 0 and len(unlab_idx) > 0:
+        unlab_feat = np.load(unlab_feat_path)
+        train_feat = np.concatenate([lab_feat, unlab_feat], axis=0)
+        train_idx  = np.concatenate([lab_idx, unlab_idx])
     elif len(lab_idx) == 0:
-        # f=0: train_projections.npy is the full (unlabelled) set
-        train_proj = lab_proj
+        train_feat = lab_feat
         train_idx  = unlab_idx
     else:
-        # f=1: train_projections.npy is the full (labelled) set
-        train_proj = lab_proj
+        train_feat = lab_feat
         train_idx  = lab_idx
 
-    all_proj = np.concatenate([train_proj, test_proj], axis=0)
+    all_proj = np.concatenate([train_feat, test_feat], axis=0)
     all_idx  = np.concatenate([train_idx, test_idx])
 
-    # --- PCA variance plot (always, regardless of use_pca flag) ---
-    generate_pca_variance_plot(run_dir, all_proj, force=force)
+    # --- PCA variance plot (proj only — enc is too high-dim for a meaningful plot here) ---
+    if latent == "proj":
+        generate_pca_variance_plot(run_dir, all_proj, force=force)
 
     baselines = None
     if outputs_root is not None:
@@ -594,9 +644,9 @@ def process_run(run_dir: Path, epsilon: float,
     figures_dir.mkdir(parents=True, exist_ok=True)
     fig, (ax_tr, ax_te) = plt.subplots(1, 2, figsize=(12, 5))
 
-    byol_label_tr = f"BYOL ({latent_type}) (AUC={train_auc:.4f})"
+    byol_label_tr = f"BYOL ({latent}) (AUC={train_auc:.4f})"
     auc_str_te    = f"{auc:.4f}" if (isinstance(auc, float) and auc == auc) else "N/A"
-    byol_label_te = f"BYOL ({latent_type}) (AUC={auc_str_te})"
+    byol_label_te = f"BYOL ({latent}) (AUC={auc_str_te})"
 
     # Left: train
     if cum_train is not None:
@@ -656,7 +706,7 @@ def process_run(run_dir: Path, epsilon: float,
 
     plt.tight_layout()
     _eps_str = str(epsilon).rstrip('0').rstrip('.')
-    fig.savefig(figures_dir / f"recall_curves_{latent_type}_eps{_eps_str}{suffix}.png", dpi=150, bbox_inches="tight")
+    fig.savefig(figures_dir / f"recall_curves_eps{_eps_str}{suffix}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     # --- Timing plot ---
@@ -691,6 +741,7 @@ def process_run(run_dir: Path, epsilon: float,
     summary = {
         "run_dir":          str(run_dir),
         "data_seed":        data_seed,
+        "latent":           latent,
         "n_labelled_seed":  PROTEGE_INITIAL_STEPS,
         "pca_seeded":       False,
         "steps":            steps,
@@ -713,31 +764,32 @@ def process_run(run_dir: Path, epsilon: float,
 # Multiprocessing worker (must be top-level for pickling)
 # ---------------------------------------------------------------------------
 def _worker_process_run(args):
-    rd, epsilon, steps, suffix, csv_df, labels_all, use_pca, max_queries, timing_plot, pca_components, outputs_root, force = args
+    rd, epsilon, steps, suffix, csv_df, labels_all, latent, use_pca, max_queries, timing_plot, pca_components, outputs_root, force = args
     m      = re.search(r'_f([\d.]+)_sw([\d.]+)', rd.name)
     f_val  = float(m.group(1)) if m else float('nan')
     sw_val = float(m.group(2)) if m else float('nan')
-    print(f"[{rd.name}]  f={f_val}  sw={sw_val}", flush=True)
+    print(f"[{rd.name}]  latent={latent}  f={f_val}  sw={sw_val}", flush=True)
     try:
         auc, train_auc, n_eval, n_pos = process_run(rd, epsilon, steps, suffix, csv_df, labels_all,
+                                                     latent=latent,
                                                      use_pca=use_pca, max_queries=max_queries,
                                                      timing_plot=timing_plot, pca_components=pca_components,
                                                      outputs_root=outputs_root, force=force)
-        return dict(name=rd.name, f=f_val, sw=sw_val, auc=auc, train_auc=train_auc,
+        return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, auc=auc, train_auc=train_auc,
                     n_eval=n_eval, n_pos=n_pos)
     except FileNotFoundError as exc:
-        print(f"  ERROR in {rd.name}: {exc}", file=sys.stderr, flush=True)
-        return dict(name=rd.name, f=f_val, sw=sw_val, error="missing_checkpoint", detail=str(exc))
+        print(f"  ERROR in {rd.name} ({latent}): {exc}", file=sys.stderr, flush=True)
+        return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, error="missing_checkpoint", detail=str(exc))
     except ValueError as exc:
         import traceback
-        print(f"  ERROR in {rd.name}: {exc}", file=sys.stderr, flush=True)
+        print(f"  ERROR in {rd.name} ({latent}): {exc}", file=sys.stderr, flush=True)
         traceback.print_exc()
-        return dict(name=rd.name, f=f_val, sw=sw_val, error="shape_mismatch", detail=str(exc))
+        return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, error="shape_mismatch", detail=str(exc))
     except Exception as exc:
         import traceback
-        print(f"  ERROR in {rd.name}: {exc}", file=sys.stderr, flush=True)
+        print(f"  ERROR in {rd.name} ({latent}): {exc}", file=sys.stderr, flush=True)
         traceback.print_exc()
-        return dict(name=rd.name, f=f_val, sw=sw_val, error="other", detail=str(exc))
+        return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, error="other", detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -749,7 +801,7 @@ def main():
     )
     parser.add_argument("--outputs-root",      default="outputs",
                         help="Root directory containing run subdirectories.")
-    parser.add_argument("--run-glob",          default="run_enb0_*",
+    parser.add_argument("--run-glob",          default="enb0_*",
                         help="Glob pattern for run directories.")
     parser.add_argument("--epsilon",           type=float, default=2.0,
                         help="GP acquisition epsilon: exploration-exploitation trade-off (0=exploit, 3=paper default).")
@@ -775,10 +827,6 @@ def main():
     outputs_root = Path(args.outputs_root)
     suffix       = f"_{args.output_suffix}" if args.output_suffix else ""
 
-    # Pre-compute pca_tag and full suffix for skip check
-    _pca_tag     = "pca" if args.pca else "nopca"
-    _full_suffix = suffix + f"_{_pca_tag}"
-
     # Pre-load shared data once
     csv_df     = pd.read_csv(CSV_PATH)
     labels_all = np.load(LABELS_PATH)
@@ -792,7 +840,12 @@ def main():
         sys.exit(1)
     print(f"Found {len(run_dirs)} run directories.\n")
 
-    # Separate already-done runs (load cached results) from runs that need processing.
+    def _pca_tag_for(latent):
+        # enc is always PCA-reduced (1280-dim is too large for GP kernel)
+        return "pca" if (latent == "enc" or args.pca) else "nopca"
+
+    # Separate already-done (load cached) from runs that need processing.
+    # Each run is processed for both latents (proj and enc).
     results      = []
     failures     = []
     worker_args  = []
@@ -800,28 +853,36 @@ def main():
         m      = re.search(r'_f([\d.]+)_sw([\d.]+)', rd.name)
         f_val  = float(m.group(1)) if m else float('nan')
         sw_val = float(m.group(2)) if m else float('nan')
-        summary_path = rd / "data" / "protege" / f"protege_summary{_full_suffix}.json"
-        pca_var_path = rd / "figures" / "pca_variance.png"
-        if summary_path.exists() and pca_var_path.exists() and not args.force:
-            print(f"[{rd.name}]  skipping (already done — use --force to rerun)", flush=True)
-            with open(summary_path) as fh:
-                s = json.load(fh)
-            results.append(dict(name=rd.name, f=f_val, sw=sw_val,
-                                auc=s.get("test_auc", s.get("auc")),
-                                train_auc=s.get("train_auc"),
-                                n_eval=s.get("n_eval", 0),
-                                n_pos=s.get("n_eval_positives", 0)))
-            print()
-        else:
-            issue = _check_run_data(rd)
-            if issue is not None:
-                err_type, detail = issue
-                failures.append(dict(name=rd.name, f=f_val, sw=sw_val,
-                                     error=err_type, detail=detail))
+
+        for latent in ["proj", "enc"]:
+            _ftag        = _pca_tag_for(latent)
+            _full_suffix = suffix + f"_{latent}_{_ftag}"
+            summary_path = rd / "data" / "protege" / f"protege_summary{_full_suffix}.json"
+            pca_var_path = rd / "figures" / "pca_variance.png"
+
+            if summary_path.exists() and (latent == "enc" or pca_var_path.exists()) and not args.force:
+                print(f"[{rd.name}]  latent={latent}  skipping (already done — use --force to rerun)", flush=True)
+                with open(summary_path) as fh:
+                    s = json.load(fh)
+                results.append(dict(name=rd.name, latent=latent, f=f_val, sw=sw_val,
+                                    auc=s.get("test_auc", s.get("auc")),
+                                    train_auc=s.get("train_auc"),
+                                    n_eval=s.get("n_eval", 0),
+                                    n_pos=s.get("n_eval_positives", 0)))
             else:
-                worker_args.append((rd, args.epsilon, args.steps, suffix, csv_df, labels_all,
-                                    args.pca, args.max_queries, args.timing_plot, args.pca_components,
-                                    outputs_root, args.force))
+                issue = _check_run_data(rd, latent=latent)
+                if issue is not None:
+                    err_type, detail = issue
+                    if err_type == "missing_enc_data":
+                        # enc files simply weren't saved for this run — skip silently
+                        print(f"[{rd.name}]  latent=enc  skipping (no encoding files)", flush=True)
+                    else:
+                        failures.append(dict(name=rd.name, latent=latent, f=f_val, sw=sw_val,
+                                             error=err_type, detail=detail))
+                else:
+                    worker_args.append((rd, args.epsilon, args.steps, suffix, csv_df, labels_all,
+                                        latent, args.pca, args.max_queries, args.timing_plot,
+                                        args.pca_components, outputs_root, args.force))
 
     if worker_args:
         n_workers = min(args.workers, len(worker_args))
@@ -840,7 +901,7 @@ def main():
             reverse=True,
         )
         w = max(len(r["name"]) for r in results)
-        hdr = f"{'Rank':>4}  {'test_AUC':>8}  {'train_AUC':>9}  {'Run':<{w}}"
+        hdr = f"{'Rank':>4}  {'lat':>4}  {'test_AUC':>8}  {'train_AUC':>9}  {'Run':<{w}}"
         print("\n" + "=" * len(hdr))
         print("Protege GP — ranked by test AUC")
         print("=" * len(hdr))
@@ -849,7 +910,7 @@ def main():
         for i, r in enumerate(results, 1):
             test_s  = f"{r['auc']:>8.4f}"      if (isinstance(r.get('auc'),       float) and r['auc']       == r['auc'])       else "     N/A"
             train_s = f"{r['train_auc']:>9.4f}" if (isinstance(r.get('train_auc'), float) and r['train_auc'] == r['train_auc']) else "      N/A"
-            print(f"{i:>4}  {test_s}  {train_s}  {r['name']:<{w}}")
+            print(f"{i:>4}  {r.get('latent', '?'):>4}  {test_s}  {train_s}  {r['name']:<{w}}")
         print("=" * len(hdr))
 
     # Failure summary
