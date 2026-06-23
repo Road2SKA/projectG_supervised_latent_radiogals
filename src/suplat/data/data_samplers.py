@@ -84,3 +84,37 @@ class UnlabelledBYOLDataset(Dataset):
         img = torch.from_numpy(img).unsqueeze(0).float()
         img_aug = self.transform(img) if self.transform else img.clone()
         return img, img_aug, torch.zeros_like(img), 0.0
+
+
+class ImagesAndLabelsDataset(Dataset):
+    """
+    Dataset for image-labels pairs, used for supervised learning and evaluation.
+    Returns :
+    - img: original image, with augmentations applied
+    - label_vec: vector of labels for the image
+    """
+    def __init__(self,
+                 tags_data,
+                 img_data,
+                 transform=None):
+        self.all_labels = tags_data
+        self.img_data = img_data
+        self.transform = transform
+
+    def __len__(self):
+        return self.all_labels.shape[0]
+
+    def __getitem__(self, idx):
+        # Fetch numpy array from storage
+        img = self.img_data[idx]
+        label_vec = self.all_labels.iloc[idx, :].values.reshape(1, -1)
+
+        # Convert numpy arrays to tensors BEFORE transforms
+        img = torch.from_numpy(img).unsqueeze(0).float()  # Shape: (1, H, W)
+        label_vec = torch.from_numpy(label_vec).float()  # Convert labels to tensor
+
+        # Apply transforms to tensors
+        if self.transform:
+            img_transformed = self.transform(img)
+
+        return img, img_transformed, label_vec
