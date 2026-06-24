@@ -441,13 +441,44 @@ def main():
             reverse=True,
         )
 
+        w = max(len(r["name"]) for r in results)
+        _cols = [
+            ("RF",  "rf",  "f1_macro"),
+            ("KNN", "knn", "f1_macro"),
+            ("LR",  "lr",  "f1_macro"),
+            ("RF",  "rf",  "auc_macro"),
+            ("KNN", "knn", "auc_macro"),
+            ("LR",  "lr",  "auc_macro"),
+            ("RF",  "rf",  "accuracy"),
+            ("KNN", "knn", "accuracy"),
+            ("LR",  "lr",  "accuracy"),
+            ("RF",  "rf",  "recall_macro"),
+            ("KNN", "knn", "recall_macro"),
+            ("LR",  "lr",  "recall_macro"),
+        ]
+        _short = {"f1_macro": "F1", "auc_macro": "AUC",
+                  "accuracy": "Acc", "recall_macro": "Rec"}
+        col_w = 10  # wider to accommodate *x.xxxx*
+
+        # Pre-compute per-column best values for highlighting
+        _col_best = {}
+        for _, clf, metric in _cols:
+            vals = [r.get(clf, {}).get(metric, float("nan")) for r in results]
+            valid = [v for v in vals if v == v]
+            _col_best[(clf, metric)] = max(valid) if valid else float("nan")
+
         def _fmt(r, clf, metric, width):
             v = r.get(clf, {}).get(metric, float("nan"))
-            return f"{v:>{width}.4f}" if v == v else " " * (width - 3) + "N/A"
+            if v != v:
+                return " " * (width - 3) + "N/A"
+            s = f"{v:.4f}"
+            if v == _col_best[(clf, metric)]:
+                s = f"*{s}*"
+            return f"{s:>{width}}"
 
-        w   = max(len(r["name"]) for r in results)
-        hdr = (f"{'Rank':>4}  {'RF F1':>7}  {'KNN F1':>7}  {'LR F1':>7}  "
-               f"{'RF AUC':>7}  {'KNN AUC':>8}  {'LR AUC':>7}  {'Run':<{w}}")
+        hdr = f"{'Rank':>4}  " + "  ".join(
+            f"{c[0]+' '+_short[c[2]]:>{col_w}}" for c in _cols
+        ) + f"  {'Run':<{w}}"
         sep = "=" * len(hdr)
         print(f"\n{sep}")
         print(f"RF / KNN / LR ({args.label_set} / {args.feature_type}) — ranked by RF F1-macro")
@@ -455,17 +486,14 @@ def main():
         print(hdr)
         print("-" * len(hdr))
         for i, r in enumerate(results, 1):
-            print(
-                f"{i:>4}  "
-                f"{_fmt(r, 'rf',  'f1_macro',  7)}  "
-                f"{_fmt(r, 'knn', 'f1_macro',  7)}  "
-                f"{_fmt(r, 'lr',  'f1_macro',  7)}  "
-                f"{_fmt(r, 'rf',  'auc_macro',  7)}  "
-                f"{_fmt(r, 'knn', 'auc_macro',  8)}  "
-                f"{_fmt(r, 'lr',  'auc_macro',  7)}  "
-                f"{r['name']:<{w}}"
-            )
+            row = f"{i:>4}  " + "  ".join(
+                _fmt(r, clf, metric, col_w) for _, clf, metric in _cols
+            ) + f"  {r['name']:<{w}}"
+            print(row)
         print(sep)
+
+    if results:
+        print_statistical_summary(results)
 
     # ── Failure summary ───────────────────────────────────────────────────────
     if failures:
@@ -483,6 +511,107 @@ def main():
             for f in group:
                 print(f"    {f['name']}")
                 print(f"      {f['detail']}")
+
+
+# ---------------------------------------------------------------------------
+# Statistical summary — average performance per hyperparameter value
+# ---------------------------------------------------------------------------
+
+# Patterns to extract hyperparameter values from run directory names.
+_HPARAM_RE = {
+    "ema":       r"_ema([\d.]+)",
+    "vicregvar": r"_vicregvar([\d.]+)",
+    "cov":       r"_cov([\d.]+)",
+    "gamma":     r"_gamma([\d.]+)",
+    "f":         r"_f([\d.]+)_sw",
+    "sw":        r"_sw([\d.]+?)(?:_|$)",
+    "pd":        r"_pd(\d+)",
+}
+
+
+def _parse_hparams(name: str) -> dict:
+    out = {}
+    for param, pat in _HPARAM_RE.items():
+        m = re.search(pat, name)
+        if m:
+            out[param] = m.group(1)
+    return out
+
+
+def print_statistical_summary(results: list,
+                               clfs=("rf", "knn", "lr"),
+                               metrics=("f1_macro", "auc_macro", "accuracy", "recall_macro")):
+    """For each hyperparameter, group runs by that param's value and print mean±std + N."""
+
+    metric_labels = {
+        "f1_macro":     "F1",
+        "auc_macro":    "AUC",
+        "accuracy":     "Acc",
+        "recall_macro": "Rec",
+    }
+
+    parsed = [(r, _parse_hparams(r["name"])) for r in results]
+    clf_metric_cols = [(c, m) for c in clfs for m in metrics]
+    col_headers = [f"{c.upper()} {metric_labels[m]}" for c, m in clf_metric_cols]
+    col_w = 12
+
+    for param in sorted(_HPARAM_RE.keys()):
+        groups: dict = {}
+        for r, hp in parsed:
+            if param in hp:
+                groups.setdefault(hp[param], []).append(r)
+
+        if len(groups) < 2:
+            continue
+
+        name_w = max(len(str(v)) for v in groups)
+        hdr = (f"  {param:<{name_w}}  {'N':>3}  " +
+               "  ".join(f"{h:^{col_w}}" for h in col_headers))
+        sep = "-" * len(hdr)
+
+        print(f"\n{'=' * len(hdr)}")
+        print(f"Grouped by: {param}")
+        print(f"{'=' * len(hdr)}")
+        print(hdr)
+        print(sep)
+
+        # Pre-compute per-column best mean across groups
+        _group_means = {}
+        for val, group in groups.items():
+            for clf, metric in clf_metric_cols:
+                vals = [r.get(clf, {}).get(metric, float("nan")) for r in group]
+                vals = [v for v in vals if v == v]
+                _group_means.setdefault((clf, metric), {})[val] = (
+                    float(np.mean(vals)) if vals else float("nan")
+                )
+        _col_best_mean = {}
+        for (clf, metric), val_means in _group_means.items():
+            valid = [v for v in val_means.values() if v == v]
+            _col_best_mean[(clf, metric)] = max(valid) if valid else float("nan")
+
+        for val in sorted(groups, key=lambda v: float(v)):
+            group = groups[val]
+            n = len(group)
+            cells = []
+            for clf, metric in clf_metric_cols:
+                vals = [r.get(clf, {}).get(metric, float("nan")) for r in group]
+                vals = [v for v in vals if v == v]
+                if not vals:
+                    cells.append(f"{'N/A':^{col_w}}")
+                else:
+                    mu = float(np.mean(vals))
+                    best = _col_best_mean[(clf, metric)]
+                    is_best = (mu == mu) and (best == best) and (mu == best)
+                    if len(vals) == 1:
+                        s = f"{mu:.3f}"
+                    else:
+                        s = f"{mu:.3f}±{float(np.std(vals)):.3f}"
+                    if is_best:
+                        s = f"*{s}*"
+                    cells.append(f"{s:^{col_w}}")
+            print(f"  {val:<{name_w}}  {n:>3}  " + "  ".join(cells))
+
+        print(sep)
 
 
 if __name__ == "__main__":
