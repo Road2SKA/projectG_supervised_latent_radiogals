@@ -11,7 +11,7 @@ For each dataset, saves:
 Usage:
     python scripts/extract_embeddings.py \\
         --datasets mirabest first mgcls_5k \\
-        --checkpoint outputs/runs/run_id/byol_model_best.pt \\
+        --checkpoint outputs/byol_runs/run_id/byol_model_best.pt \\
         --output_dir outputs/embeddings/run_id \\
         --root /users/mbredber/p3_SUPLAT
 """
