@@ -48,6 +48,7 @@ from suplat.trainer.trainer import (byol_loss, get_warmup_lr, get_supervision_we
                                     vicreg_var_cov_loss, effective_rank,  # [VICReg]
                                     byol_loss_weighted)                   # [TierW]
 from suplat.utils.plotting import fit_umap, plot_umap_single, plot_umap_outliers, plot_training_curves, plot_umap_scalar
+from suplat.utils.class_weights import compute_sample_weights, compute_class_weights, LABEL_COLS, TIERS  # [CW]
 
 # Check device availability
 if torch.cuda.is_available():
@@ -90,9 +91,9 @@ def parse_args():
                     choices=["closest", "ponderate"],
                     help="Weight function for sampling pairs: 'closest' or 'ponderate' (default: closest)")
     ap.add_argument("--class-weight-mode", type=str, default=None,
-                    choices=["score", "label"],
+                    choices=["score", "initial", "morphology", "environment", "classical", "all"],
                     help="Upweight rare classes in L_friend: 'score' (by interest tier 1-4) "
-                         "or 'label' (by inverse frequency of each binary label). "
+                         "or a label-set name (inverse frequency within that set). "
                          "Default: None (uniform).")
     ap.add_argument("--class-weight-strength", type=float, default=0.0,
                     help="Magnitude of class upweighting: 0=uniform (default), 1=full tier/freq weighting. "
@@ -278,9 +279,11 @@ else:
     RUN_ID = _timestamp
     if DATASET_NAME != "LOTSS":
         RUN_ID += f"_{DATASET_NAME}"
-    RUN_ID += f"_{MODEL_TYPE}_proj{PROJECTOR}_w{args.weighting}_f{F_LABEL}"
-    if args.vicreg_var_weight > 0 or args.vicreg_cov_weight > 0:  # [VICReg]
-        RUN_ID += f"_vic{args.vicreg_var_weight}-{args.vicreg_cov_weight}"
+    RUN_ID += f"_{MODEL_TYPE}_proj{PROJECTOR}_w{args.weighting}"
+    RUN_ID += f"_lr{args.lr_schedule}_wd{args.weight_decay}_l{args.label_type}"
+    RUN_ID += f"_ema{EMA_DECAY}"
+    RUN_ID += f"_vicregvar{args.vicreg_var_weight}_cov{args.vicreg_cov_weight}_gamma{args.vicreg_gamma}"
+    RUN_ID += f"_f{F_LABEL}_sw{args.supervision_weight}"
     if args.class_weight_mode is not None:
         RUN_ID += f"_cw{args.class_weight_mode}{args.class_weight_strength}"
 
@@ -964,51 +967,42 @@ _train_combined = ConcatDataset([_train_combined, test_unlab_ds])
 
 # =============================================================================
 # PROTEGE TIER CONSTANTS
+# LABEL_COLS and TIERS are imported from suplat.utils.class_weights above.
 # =============================================================================
-LABEL_COLS = [
-    "fri", "frii", "hybrid", "spiral", "relaxed",
-    "cshaped", "sshaped", "misaligned", "wings", "xshaped",
-    "straight", "multihotspots", "continuous", "banding", "onesided",
-    "restarted", "cluster", "merger", "diffuse", "unknown",
-]
-SCORE_4 = ["xshaped", "unknown", "cluster", "merger"]
-SCORE_3 = ["diffuse", "sshaped", "spiral"]
-SCORE_2 = ["restarted", "onesided", "banding", "cshaped", "wings", "misaligned", "multihotspots", "relaxed"]
-SCORE_1 = ["fri", "frii", "hybrid", "straight", "continuous"]
-TIERS   = [(4, SCORE_4), (3, SCORE_3), (2, SCORE_2), (1, SCORE_1)]
 POSITIVE_THRESHOLD   = 3
 PROTEGE_INITIAL_STEPS = 10
 
-# [TierW] precompute per-sample tier scores and attach to the labelled dataset
-# Per-sample L_friend loss weights based on class rarity
+# [TierW] precompute per-sample weights and attach to the labelled dataset.
+# L_friend is a BYOL similarity loss (no per-class terms), so per-class alpha must be
+# aggregated to a per-sample scalar before being passed to byol_loss_weighted.
 if CLASS_WEIGHT_MODE is not None and train_lab_ds is not None and F_LABEL > 0:
-    _lab_col_idx = {c: i for i, c in enumerate(LABEL_COLS)}
-    n_lab = len(labelled_labels)
-
-    if CLASS_WEIGHT_MODE == "score":
-        _raw = np.ones(n_lab, dtype=np.float32)
-        for _sv, _cols in reversed(TIERS):
-            _ci = [_lab_col_idx[c] for c in _cols]
-            _raw[labelled_labels[:, _ci].any(axis=1)] = float(_sv)
-    else:  # "label"
-        _label_freq = labelled_labels.mean(axis=0).clip(min=1e-6)
-        _inv_freq   = 1.0 / _label_freq
-        _pos_counts = labelled_labels.sum(axis=1)
-        _raw = np.where(
-            _pos_counts > 0,
-            (labelled_labels * _inv_freq).sum(axis=1) / _pos_counts.clip(min=1),
-            1.0,
-        ).astype(np.float32)
-
-    _raw_norm = _raw / _raw.mean()
-    _sw = (1.0 + CLASS_WEIGHT_STRENGTH * (_raw_norm - 1.0)).clip(min=0.0).astype(np.float32)
-    train_lab_ds.sample_weights = _sw
+    # Use full 20-col labels regardless of --label-type truncation
+    _lab_full = labels_full[train_idx][labelled_mask]
     print(f'  Class-weight mode={CLASS_WEIGHT_MODE} strength={CLASS_WEIGHT_STRENGTH}')
-    if CLASS_WEIGHT_MODE == "score":
+    if CLASS_WEIGHT_MODE == 'score':
+        _sw = compute_sample_weights(_lab_full, 'score', CLASS_WEIGHT_STRENGTH)
+        train_lab_ds.sample_weights = _sw
+        _raw = np.ones(len(_lab_full), dtype=np.float32)
+        for _sv, _cols in reversed(TIERS):
+            _ci = [LABEL_COLS.index(c) for c in _cols]
+            _raw[_lab_full[:, _ci].any(axis=1)] = float(_sv)
         for _sv in [1, 2, 3, 4]:
             _n = int((_raw == _sv).sum())
             _w = float((1.0 + CLASS_WEIGHT_STRENGTH * (_sv / _raw.mean() - 1.0)))
             print(f'    tier{_sv}: n={_n}  effective_weight={_w:.3f}')
+    else:
+        # label-set mode: get per-class alpha, aggregate to per-sample scalar for BYOL loss
+        _alpha = compute_class_weights(_lab_full, CLASS_WEIGHT_MODE, CLASS_WEIGHT_STRENGTH)
+        # _alpha is (20,); non-zero only for columns in the selected set
+        _pos = _lab_full.astype(np.float32)                        # (N_lab, 20)
+        _set_mask = (_alpha > 0).astype(np.float32)                # columns in selected set
+        _in_set_pos = (_pos * _set_mask).sum(axis=1).clip(min=1)   # positives in set per sample
+        _raw = (_pos * _alpha).sum(axis=1) / _in_set_pos           # mean alpha over set positives
+        _sw = (_raw / np.clip(_raw.mean(), 1e-6, None)).astype(np.float32)
+        train_lab_ds.sample_weights = _sw
+        _nz = _alpha[_alpha > 0]
+        print(f'    alpha stats: min={_nz.min():.3f}  max={_nz.max():.3f}')
+        print(f'    sample_weight: min={_sw.min():.3f}  max={_sw.max():.3f}  mean={_sw.mean():.3f}')
 elif CLASS_WEIGHT_MODE is not None and F_LABEL == 0.0:
     print("WARNING: --class-weight-mode has no effect when F_LABEL=0 (no labelled samples).")
 

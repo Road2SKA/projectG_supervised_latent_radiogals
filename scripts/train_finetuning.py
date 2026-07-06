@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from suplat.utils.class_weights import compute_class_weights
 from suplat.data.augmentations import get_augmentation
 from suplat.data.data_samplers import ImagesAndLabelsDataset
 from suplat.models.byol_models import (
@@ -150,6 +151,21 @@ def parse_args():
         default="",
         help="Unique name for this fine-tuning run (used in output directory).",
     )
+    ap.add_argument(
+        "--class-weight-mode",
+        type=str,
+        default=None,
+        choices=["score", "initial", "morphology", "environment", "classical", "all"],
+        help="Upweight rare samples in training loss: 'score' (interest tier 1-4) or "
+             "a label-set name (inverse frequency). Default: None (uniform).",
+    )
+    ap.add_argument(
+        "--class-weight-strength",
+        type=float,
+        default=0.0,
+        help="Magnitude of class upweighting (0=uniform, default). "
+             "w = clip(1 + strength*(raw_norm - 1), min=0).",
+    )
 
     return ap.parse_args()
 
@@ -266,6 +282,18 @@ lab_df = pd.DataFrame(labelled_labels)
 lab_ds = ImagesAndLabelsDataset(tags_data=lab_df, img_data=labelled_images,
                          transform=byol_strong_aug)
 
+# Per-class alpha for training loss (use first 20 cols = standard label set)
+_alpha_full = compute_class_weights(
+    labelled_labels[:, :20],
+    args.class_weight_mode,
+    args.class_weight_strength,
+)                                                  # (20,)
+if labels.shape[1] > 20:
+    # pad alpha for any extra derived/appended class columns with uniform weight
+    _alpha_full = np.append(_alpha_full, np.ones(labels.shape[1] - 20, dtype=np.float32))
+_alpha_t = torch.tensor(_alpha_full, dtype=torch.float32)   # moved to device in loop
+_alpha_sum = float(_alpha_t.sum().clamp(min=1e-6))
+
 labelled_train_loader = DataLoader(lab_ds, batch_size=256, shuffle=True, drop_last=True,
                           num_workers=1, pin_memory=use_cuda)
 
@@ -280,7 +308,6 @@ print(f"Training mode {TRAINING_MODE}: {TRAINING_MODE_DESCRIPTIONS[TRAINING_MODE
 print(f"Training {N_MODELS} model(s) with different initializations")
 
 num_classes = labels.shape[1]
-criterion = nn.BCEWithLogitsLoss()
 
 NUM_EPOCHS = args.epochs
 
@@ -355,6 +382,7 @@ def train_one_model(finetune_model):
 
             x1_aug = x1_aug.float().to(device)
             y = x1_lab.float().to(device)
+            w_dev = _alpha_t.to(device)
 
             if y.ndim == 3 and y.shape[1] == 1:
                 y = y.squeeze(1)
@@ -362,7 +390,9 @@ def train_one_model(finetune_model):
             optimizer.zero_grad()
 
             logits = finetune_model(x1_aug)
-            loss = criterion(logits, y)
+            unreduced = F.binary_cross_entropy_with_logits(logits, y, reduction='none')
+            loss = (unreduced * w_dev).sum(1) / _alpha_sum
+            loss = loss.mean()
 
             loss.backward()
             optimizer.step()
@@ -392,7 +422,7 @@ def train_one_model(finetune_model):
                     y = y.squeeze(1)
 
                 logits = finetune_model(x1_aug)
-                loss = criterion(logits, y)
+                loss = F.binary_cross_entropy_with_logits(logits, y)
 
                 test_loss += loss.detach().item()
                 test_batches += 1

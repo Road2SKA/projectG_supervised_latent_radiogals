@@ -45,6 +45,7 @@ from torchvision import transforms
 
 # ── Project imports ───────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+from suplat.utils.class_weights import compute_class_weights
 from suplat.models.baseline_models import (
     CNN, ScatterNet, SimpleScatterNet, DualScatterSqueezeNet
 )
@@ -111,26 +112,20 @@ class ScatterDataset(Dataset):
 
 
 # ── Training helpers ──────────────────────────────────────────────────────────
-def compute_pos_weights(y_train, device):
-    y_t = torch.from_numpy(y_train.astype(np.float32))
-    pos_counts = y_t.sum(dim=0).clamp(min=1)
-    neg_counts = len(y_t) - pos_counts
-    return (neg_counts / pos_counts).clamp(max=20).to(device)
+def weighted_class_mean_loss(logits, targets, alpha, n_classes):
+    """Weighted mean of cross-entropy over classes.
 
-
-def weighted_bce_loss(logits, targets, pos_weights, n_classes):
+    logits  : (B, n_classes, 2)
+    targets : (B, n_classes) int64
+    alpha   : (n_classes,) float32 tensor, already on device
+    Returns : scalar loss
     """
-    logits: (B, n_classes, 2)
-    targets: (B, n_classes) int64
-    """
-    loss = sum(
-        F.cross_entropy(
-            logits[:, c, :], targets[:, c],
-            weight=torch.tensor([1.0, pos_weights[c].item()], device=logits.device)
-        )
+    per_class = torch.stack([
+        F.cross_entropy(logits[:, c, :], targets[:, c], reduction='none')
         for c in range(n_classes)
-    ) / n_classes
-    return loss
+    ], dim=1)                                      # (B, n_classes)
+    alpha_sum = alpha.sum().clamp(min=1e-6)
+    return ((per_class * alpha).sum(1) / alpha_sum).mean()
 
 
 def evaluate_metrics(y_true, y_pred, y_prob, class_names):
@@ -297,6 +292,13 @@ def main():
     parser.add_argument('--cv_folds',   type=int, default=1)
     parser.add_argument('--run_name',   type=str, default=None,
                         help="Custom run name prefix (default: run_dir basename + timestamp)")
+    parser.add_argument('--class_weight_mode', type=str, default=None,
+                        choices=["score", "initial", "morphology", "environment", "classical", "all"],
+                        help="Upweight rare samples: 'score' (interest tier 1-4) or label-set name "
+                             "(inverse frequency). Default: None (uniform).")
+    parser.add_argument('--class_weight_strength', type=float, default=0.0,
+                        help="Magnitude of class upweighting (0=uniform, default). "
+                             "w = clip(1 + strength*(raw_norm - 1), min=0).")
     parser.add_argument('--byol_run_dir', type=Path, default=None,
                         help="BYOL run directory whose data/train_idx.npy + data/test_idx.npy "
                              "define the train/test split (default: --run_dir itself).")
@@ -431,6 +433,7 @@ def main():
             val_labels    = labels[fold_val_idx][:, label_cols]
 
         # Pure-source filtering on training and val splits
+        tr_mask = np.ones(len(fold_train_idx), dtype=bool)
         if args.label_set == "pure":
             tr_mask = labels[fold_train_idx].sum(axis=1) == 1
             va_mask = labels[fold_val_idx].sum(axis=1)   == 1
@@ -442,6 +445,22 @@ def main():
             train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
             val_images,    val_labels    = val_images[va_mask],    val_labels[va_mask]
 
+        # Per-class alpha (computed from full 20-col labels, filtered consistently)
+        if args.label_set == 'derived':
+            _dc = train_labels2.sum(axis=0).astype(float)
+            _mean_dc = _dc.mean()
+            if args.class_weight_mode is None or args.class_weight_strength == 0.0:
+                _alpha_arr = np.ones(n_classes, dtype=np.float32)
+            else:
+                _alpha_arr = (_mean_dc / np.maximum(_dc, 1)) ** args.class_weight_strength
+        else:
+            _alpha_full = compute_class_weights(
+                labels[fold_train_idx][tr_mask, :20],
+                args.class_weight_mode,
+                args.class_weight_strength,
+            )                                               # (20,)
+            _alpha_arr = _alpha_full[label_cols]            # (n_classes,)
+        alpha = torch.tensor(_alpha_arr, dtype=torch.float32, device=device)
         print(f"  Train: {len(train_images2)}, Val: {len(val_images)}")
 
         fold_out = out_dir / f'fold{fold_i + 1}' if args.cv_folds > 1 else out_dir
@@ -507,9 +526,6 @@ def main():
                                    args.batch_size, shuffle=False)
             use_scat_only = False
 
-        # ── Pos weights ───────────────────────────────────────────────────
-        pos_weights = compute_pos_weights(train_labels2, device)
-
         # ── Optimiser ─────────────────────────────────────────────────────
         optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -540,7 +556,7 @@ def main():
                     imgs, labels_b = imgs.to(device), labels_b.to(device)
                     logits = model(imgs)
 
-                loss = weighted_bce_loss(logits, labels_b, pos_weights, n_classes)
+                loss = weighted_class_mean_loss(logits, labels_b, alpha, n_classes)
                 optimiser.zero_grad()
                 loss.backward()
                 optimiser.step()
@@ -565,7 +581,10 @@ def main():
                         imgs, labels_b = batch
                         imgs, labels_b = imgs.to(device), labels_b.to(device)
                         logits = model(imgs)
-                    val_loss_total += weighted_bce_loss(logits, labels_b, pos_weights, n_classes).item() * len(labels_b)
+                    val_loss_total += (sum(
+                        F.cross_entropy(logits[:, c, :], labels_b[:, c])
+                        for c in range(n_classes)
+                    ) / n_classes).item() * len(labels_b)
 
             val_loss = val_loss_total / len(val_dl.dataset)
             val_losses.append(val_loss)

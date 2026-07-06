@@ -40,6 +40,9 @@ from astronomaly.anomaly_detection import human_loop_learning
 from astronomaly.base.base_dataset import Dataset as _AstroDataset
 from astronomaly.feature_extraction import shape_features as _sf
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+from suplat.utils.class_weights import compute_sample_weights, LABEL_COLS, TIERS
+
 # ---------------------------------------------------------------------------
 # Hardcoded paths and constants
 # ---------------------------------------------------------------------------
@@ -47,18 +50,7 @@ CSV_PATH    = Path("/users/mbredber/p3_SUPLAT/data/metadata/lotss_classification
 LABELS_PATH  = Path("/users/mbredber/p3_SUPLAT/data/preprocessed/lotss/labels_filtered.npy")
 IMAGES_PATH  = Path("/users/mbredber/p3_SUPLAT/data/preprocessed/lotss/images_filtered.npy")
 
-LABEL_COLS = [
-    "fri", "frii", "hybrid", "spiral", "relaxed",
-    "cshaped", "sshaped", "misaligned", "wings", "xshaped",
-    "straight", "multihotspots", "continuous", "banding", "onesided",
-    "restarted", "cluster", "merger", "diffuse", "unknown",
-]
-
-SCORE_4 = ["xshaped", "unknown", "cluster", "merger"]
-SCORE_3 = ["diffuse", "sshaped", "spiral"]
-SCORE_2 = ["restarted", "onesided", "banding", "cshaped", "wings", "misaligned", "multihotspots", "relaxed"]
-SCORE_1 = ["fri", "frii", "hybrid", "straight", "continuous"]
-TIERS   = [(4, SCORE_4), (3, SCORE_3), (2, SCORE_2), (1, SCORE_1)]
+# LABEL_COLS and TIERS imported from suplat.utils.class_weights above.
 
 PROTEGE_INITIAL_STEPS = 200
 
@@ -445,7 +437,8 @@ def process_run(run_dir: Path, epsilon: float,
                 steps: int, suffix: str, csv_df: pd.DataFrame, labels_all: np.ndarray,
                 latent: str = "proj",
                 use_pca: bool = False, max_queries: int = None, timing_plot: bool = False,
-                pca_components: int = None, outputs_root: Path = None, force: bool = False):
+                pca_components: int = None, outputs_root: Path = None, force: bool = False,
+                class_weight_mode: str = "score", class_weight_strength: float = 1.0):
     # Encoder features are 1280-dim: always apply PCA to keep GP tractable.
     if latent == "enc":
         use_pca = True
@@ -506,12 +499,9 @@ def process_run(run_dir: Path, epsilon: float,
     source_names = csv_df.iloc[all_idx]["Source_Name"].values
 
     # --- Labels ---
-    labels_split  = labels_all[all_idx]
-    labels_npy_df = pd.DataFrame(labels_split.astype(bool), columns=LABEL_COLS)
-    human_labels  = np.ones(len(labels_npy_df), dtype=int)
-    for score_val, cols in reversed(TIERS):
-        mask = labels_npy_df[cols].any(axis=1).values
-        human_labels[mask] = score_val
+    labels_split = labels_all[all_idx]
+    human_labels = compute_sample_weights(labels_split[:, :20], class_weight_mode,
+                                          class_weight_strength).astype(float)
     labels_df = pd.DataFrame({"human_label": human_labels}, index=source_names)
 
     # --- Features: optional PCA (no scaling — matches notebook APPLY_PCA=False default) ---
@@ -764,7 +754,7 @@ def process_run(run_dir: Path, epsilon: float,
 # Multiprocessing worker (must be top-level for pickling)
 # ---------------------------------------------------------------------------
 def _worker_process_run(args):
-    rd, epsilon, steps, suffix, csv_df, labels_all, latent, use_pca, max_queries, timing_plot, pca_components, outputs_root, force = args
+    rd, epsilon, steps, suffix, csv_df, labels_all, latent, use_pca, max_queries, timing_plot, pca_components, outputs_root, force, cw_mode, cw_strength = args
     m      = re.search(r'_f([\d.]+)_sw([\d.]+)', rd.name)
     f_val  = float(m.group(1)) if m else float('nan')
     sw_val = float(m.group(2)) if m else float('nan')
@@ -774,7 +764,9 @@ def _worker_process_run(args):
                                                      latent=latent,
                                                      use_pca=use_pca, max_queries=max_queries,
                                                      timing_plot=timing_plot, pca_components=pca_components,
-                                                     outputs_root=outputs_root, force=force)
+                                                     outputs_root=outputs_root, force=force,
+                                                     class_weight_mode=cw_mode,
+                                                     class_weight_strength=cw_strength)
         return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, auc=auc, train_auc=train_auc,
                     n_eval=n_eval, n_pos=n_pos)
     except FileNotFoundError as exc:
@@ -822,6 +814,13 @@ def main():
                         help="Save a GP fit-time vs labelled-points plot for each run.")
     parser.add_argument("--pca-components",    type=int, default=None,
                         help="Fixed number of PCA components (overrides 95%% variance threshold).")
+    parser.add_argument("--class-weight-mode", type=str, default="score",
+                        choices=["score", "initial", "morphology", "environment", "classical", "all"],
+                        help="How to score sources for GP seeding: 'score' (interest tier 1-4, default) "
+                             "or a label-set name (inverse frequency within that set).")
+    parser.add_argument("--class-weight-strength", type=float, default=1.0,
+                        help="Magnitude of class weighting for GP seeds (default: 1.0). "
+                             "w = clip(1 + strength*(raw_norm - 1), min=0).")
     args = parser.parse_args()
 
     outputs_root = Path(args.outputs_root)
@@ -882,7 +881,8 @@ def main():
                 else:
                     worker_args.append((rd, args.epsilon, args.steps, suffix, csv_df, labels_all,
                                         latent, args.pca, args.max_queries, args.timing_plot,
-                                        args.pca_components, outputs_root, args.force))
+                                        args.pca_components, outputs_root, args.force,
+                                        args.class_weight_mode, args.class_weight_strength))
 
     if worker_args:
         n_workers = min(args.workers, len(worker_args))

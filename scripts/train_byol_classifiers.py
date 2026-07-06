@@ -26,6 +26,9 @@ from sklearn.multioutput import MultiOutputClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler, label_binarize
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+from suplat.utils.class_weights import compute_sample_weights
+
 
 # ---------------------------------------------------------------------------
 # Label-set definitions (copied from train_sklearn_classifiers.py)
@@ -150,9 +153,12 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def _fit_and_eval(clf, X_train, y_train, X_test, y_test, class_names,
-                  label_set, is_multi_output=False):
+                  label_set, is_multi_output=False, sample_weight=None):
     """Fit clf and return evaluate_metrics result dict."""
-    clf.fit(X_train, y_train)
+    if sample_weight is not None:
+        clf.fit(X_train, y_train, sample_weight=sample_weight)
+    else:
+        clf.fit(X_train, y_train)
     if is_multi_output:
         y_pred = clf.predict(X_test)
         y_prob = np.stack(
@@ -166,7 +172,8 @@ def _fit_and_eval(clf, X_train, y_train, X_test, y_test, class_names,
 
 def process_run(run_dir: Path, feature_type: str, label_set: str,
                 n_estimators: int, n_neighbors: int, lr_C: float,
-                seed: int, force: bool):
+                seed: int, force: bool,
+                class_weight_mode: str = None, class_weight_strength: float = 0.0):
     """Train RF, KNN, and LR for one run directory.
 
     Returns a result dict with keys rf/knn/lr (each with f1_macro, auc_macro, accuracy),
@@ -295,6 +302,10 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         y_train = y_train_raw
         y_test  = y_test_raw
 
+    # ── Per-sample weights (computed from unmasked 20-col labels, then masked) ──
+    sample_weights = compute_sample_weights(y_train_full[train_mask, :20],
+                                            class_weight_mode, class_weight_strength)
+
     clf_dir.mkdir(parents=True, exist_ok=True)
     out = dict(name=run_dir.name)
 
@@ -325,8 +336,11 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
             continue
 
         is_mo = not is_multiclass and clf_name == "rf"
+        # KNN does not support sample_weight; RF and LR do
+        sw = None if clf_name == "knn" else sample_weights
         metrics, y_pred_test = _fit_and_eval(clf, X_train, y_train, X_test, y_test,
-                                             class_names, label_set, is_multi_output=is_mo)
+                                             class_names, label_set, is_multi_output=is_mo,
+                                             sample_weight=sw)
         print(f"    {clf_name.upper()}: F1={metrics['f1_macro']:.4f}  "
               f"AUC={metrics['auc_macro']:.4f}  Acc={metrics['accuracy']:.4f}", flush=True)
 
@@ -362,10 +376,11 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
 # ---------------------------------------------------------------------------
 
 def _worker(args):
-    run_dir, feature_type, label_set, n_estimators, n_neighbors, lr_C, seed, force = args
+    run_dir, feature_type, label_set, n_estimators, n_neighbors, lr_C, seed, force, cw_mode, cw_strength = args
     try:
         return process_run(run_dir, feature_type, label_set,
-                           n_estimators, n_neighbors, lr_C, seed, force)
+                           n_estimators, n_neighbors, lr_C, seed, force,
+                           class_weight_mode=cw_mode, class_weight_strength=cw_strength)
     except Exception as exc:
         import traceback
         print(f"  ERROR in {run_dir.name}: {exc}", file=sys.stderr, flush=True)
@@ -403,6 +418,17 @@ def main():
                         help="Re-run even if result already saved.")
     parser.add_argument("--workers",      type=int, default=1,
                         help="Number of parallel worker processes (default: 1).")
+    parser.add_argument("--class-weight-mode", type=str, default=None,
+                        choices=["score", "initial", "morphology", "environment", "classical", "all"],
+                        help="Upweight rare samples: 'score' (interest tier 1-4) or a label-set name. "
+                             "Label-set modes (e.g. initial, morphology) require a pure label set — "
+                             "each training sample must have exactly one positive in the selected columns. "
+                             "Pass a *_pure label_set (e.g. initial_pure). "
+                             "RF and LR accept sample_weight; KNN does not and always receives uniform weights. "
+                             "Default: None (uniform).")
+    parser.add_argument("--class-weight-strength", type=float, default=0.0,
+                        help="Magnitude of class upweighting (0=uniform, default). "
+                             "w = clip(1 + strength*(raw_norm - 1), min=0).")
     args = parser.parse_args()
 
     outputs_root = Path(args.outputs_root)
@@ -419,7 +445,8 @@ def main():
     # ── Dispatch ──────────────────────────────────────────────────────────────
     worker_args = [
         (rd, args.feature_type, args.label_set, args.n_estimators,
-         args.n_neighbors, args.lr_c, args.seed, args.force)
+         args.n_neighbors, args.lr_c, args.seed, args.force,
+         args.class_weight_mode, args.class_weight_strength)
         for rd in run_dirs
     ]
 
