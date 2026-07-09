@@ -104,9 +104,12 @@ def main():
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
-        subplot_titles=("Train Loss", "Validation Loss"),
+        subplot_titles=("Train Loss", "Val / Train Loss Ratio  (1.0 = perfect generalisation)"),
         vertical_spacing=0.08,
     )
+
+    # Reference line at ratio=1 (perfect generalisation)
+    fig.add_hline(y=1.0, line=dict(color="black", width=1, dash="dot"), row=2, col=1)
 
     seen_sw: set[str] = set()
 
@@ -141,13 +144,17 @@ def main():
                 row=1, col=1,
             )
 
-        # Val loss (bottom subplot) — same color, slightly more transparent
-        if rec["val_loss"]:
-            val_epochs = list(range(1, len(rec["val_loss"]) + 1))
+        # Val/Train ratio (bottom subplot)
+        if rec["val_loss"] and rec["train_loss"]:
+            n = min(len(rec["val_loss"]), len(rec["train_loss"]))
+            ratio = [
+                v / t if t > 1e-9 else float("nan")
+                for v, t in zip(rec["val_loss"][:n], rec["train_loss"][:n])
+            ]
             fig.add_trace(
                 go.Scatter(
-                    x=val_epochs,
-                    y=rec["val_loss"],
+                    x=list(range(1, n + 1)),
+                    y=ratio,
                     mode="lines",
                     line=dict(color=color, width=1),
                     name=f"sw={sw}",
@@ -169,7 +176,7 @@ def main():
         ),
         xaxis2=dict(title="Epoch"),
         yaxis=dict(title="Train Loss"),
-        yaxis2=dict(title="Val Loss"),
+        yaxis2=dict(title="Val / Train Ratio"),
         template="plotly_white",
     )
 

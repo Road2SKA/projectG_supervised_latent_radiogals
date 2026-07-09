@@ -111,7 +111,7 @@ class ImagesAndLabelsDataset(Dataset):
 
         # Convert numpy arrays to tensors BEFORE transforms
         img = torch.from_numpy(img).unsqueeze(0).float()  # Shape: (1, H, W)
-        label_vec = torch.from_numpy(label_vec).float()  # Convert labels to tensor
+        label_vec = torch.from_numpy(label_vec.copy()).float()  # Convert labels to tensor
 
         # Apply transforms to tensors
         if self.transform:

@@ -115,9 +115,11 @@ def parse_args():
                     help="Subsample dataset to N samples (for quick testing)")
 
     # Augmentation
-    ap.add_argument("--augmentation", type=str, default="standard",
-                    choices=["standard", "extended"],
-                    help="Augmentation pipeline: 'standard' (flip+rotate) or 'extended' (+ gaussian noise + intensity scaling)")
+    ap.add_argument("--augmentation", type=str, default="simple",
+                    choices=["quarter", "simple", "extended"],
+                    help="Augmentation pipeline: 'quarter' (flip + 0/90/180/270 rotation), "
+                         "'simple' (flip + continuous rotation), "
+                         "'extended' (simple + crop + noise + intensity scaling)")
 
     # Model selection
     ap.add_argument("--model-type", type=str, default="efficientnet-b0",
@@ -267,11 +269,14 @@ SPLITS_DIR = OUTPUT_BASE / 'data_splits' / str(DATA_SEED)
 SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Create run directory — include projector type to avoid collisions with train_byol.py
+BYOL_RUNS_DIR = OUTPUT_BASE / 'byol_runs'
+BYOL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     RUN_ID = f"{args.run_name}_{_timestamp}"
     # Skip if a run with this name already exists (any timestamp)
-    _existing = sorted(OUTPUT_BASE.glob(f"{args.run_name}_*"))
+    _existing = sorted(BYOL_RUNS_DIR.glob(f"{args.run_name}_*"))
     if _existing:
         print(f"[SKIP] Run '{args.run_name}' already exists: {_existing[0].name}")
         import sys; sys.exit(0)
@@ -298,7 +303,7 @@ LABEL_RANGES = {
     'derived':     (19, 24),
 }
 
-OUTPUT_DIR = OUTPUT_BASE / RUN_ID
+OUTPUT_DIR = BYOL_RUNS_DIR / RUN_ID
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Create subfolders

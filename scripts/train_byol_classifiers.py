@@ -8,7 +8,7 @@ For each run directory matching --run-glob under --outputs-root:
   4. Evaluate each on the test set (F1-macro, AUC-macro, accuracy).
   5. Save a JSON result per classifier to {run_dir}/data/classifiers/{clf}_{label_set}_{feature_type}.json.
 
-After all runs, print a summary table sorted by RF F1-macro descending.
+After all runs, print a summary table sorted by best F1-macro across classifiers descending.
 """
 
 import argparse
@@ -200,7 +200,13 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         return out
 
     print(f"  [{run_dir.name}] processing...", flush=True)
-    splits_dir = run_dir / "../data_splits/42/"
+    # Locate data_splits/ by walking upward — robust to any nesting depth
+    _search = run_dir.parent
+    for _ in range(5):
+        if (_search / "data_splits").is_dir():
+            break
+        _search = _search.parent
+    splits_dir = _search / "data_splits" / "42"
     feat_dir   = run_dir / "data" / "byol"
 
     # ── Load features ────────────────────────────────────────────────────────
@@ -396,8 +402,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Sklearn classifier sweep (RF / KNN / LR) over BYOL run directories."
     )
-    parser.add_argument("--outputs-root", default="outputs",
-                        help="Root directory containing run subdirectories (default: outputs).")
+    parser.add_argument("--outputs-root", default="outputs/byol_runs",
+                        help="Root directory containing run subdirectories (default: outputs/byol_runs).")
     parser.add_argument("--run-glob",     default="enb0_*",
                         help="Glob pattern for run directories (default: enb0_*).")
     parser.add_argument("--feature-type", default="projections",
@@ -464,7 +470,11 @@ def main():
     # ── Ranked summary ────────────────────────────────────────────────────────
     if results:
         results.sort(
-            key=lambda r: r.get("rf", {}).get("f1_macro", -1.0),
+            key=lambda r: max(
+                r.get("rf",  {}).get("f1_macro", -1.0),
+                r.get("knn", {}).get("f1_macro", -1.0),
+                r.get("lr",  {}).get("f1_macro", -1.0),
+            ),
             reverse=True,
         )
 
@@ -508,7 +518,7 @@ def main():
         ) + f"  {'Run':<{w}}"
         sep = "=" * len(hdr)
         print(f"\n{sep}")
-        print(f"RF / KNN / LR ({args.label_set} / {args.feature_type}) — ranked by RF F1-macro")
+        print(f"RF / KNN / LR ({args.label_set} / {args.feature_type}) — ranked by best F1-macro")
         print(sep)
         print(hdr)
         print("-" * len(hdr))

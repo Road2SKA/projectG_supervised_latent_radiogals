@@ -31,6 +31,17 @@ class IntensityScaling:
         return f"IntensityScaling(scale={self.scale})"
 
 
+class QuarterTurnRotation:
+    """Rotate by a randomly chosen quarter turn: 0, 90, 180, or 270 degrees."""
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        k = torch.randint(0, 4, (1,)).item()
+        return torch.rot90(x, k, dims=[-2, -1])
+
+    def __repr__(self) -> str:
+        return "QuarterTurnRotation()"
+
+
 # =============================================================================
 # AUGMENTATION PIPELINES
 # =============================================================================
@@ -40,12 +51,18 @@ def get_augmentation(name: str) -> T.Compose:
     Return a named augmentation pipeline.
 
     Args:
-        name: 'standard' or 'extended'
+        name: 'quarter', 'simple', or 'extended'
 
     Returns:
         T.Compose pipeline
     """
-    if name == "standard":
+    if name == "quarter":
+        return T.Compose([
+            T.RandomHorizontalFlip(),
+            T.RandomVerticalFlip(),
+            QuarterTurnRotation(),
+        ])
+    elif name == "simple":
         return T.Compose([
             T.RandomHorizontalFlip(),
             T.RandomVerticalFlip(),
@@ -61,4 +78,4 @@ def get_augmentation(name: str) -> T.Compose:
             IntensityScaling(scale=0.2),
         ])
     else:
-        raise ValueError(f"Unknown augmentation: '{name}'. Choose from: standard, extended")
+        raise ValueError(f"Unknown augmentation: '{name}'. Choose from: quarter, simple, extended")

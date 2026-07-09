@@ -106,10 +106,12 @@ def parse_args():
         help="Number of fine-tuning epochs.",
     )
     ap.add_argument(
-        "--n-models",
+        "--n-runs", "--n-models",
         type=positive_int,
         default=1,
-        help="Number of models to train with different initializations.",
+        dest="n_runs",
+        help="Number of training runs with different initialisations. "
+             "Run i uses seed DATA_SEED + (i-1). Default: 1.",
     )
     # Data and run configuration
     ap.add_argument(
@@ -244,7 +246,7 @@ DATA_SEED = checkpoint["config"]['data_seed']
 F_LABEL = checkpoint["config"]['f_label']
 TRAINING_MODE = args.training_mode
 LEARNING_RATE = args.lr
-N_MODELS = args.n_models
+N_RUNS = args.n_runs
 
 TRAIN_RATIO, TEST_RATIO = 0.70, 0.30
 
@@ -305,7 +307,7 @@ labelled_test_loader = DataLoader(test_lab_ds, batch_size=256, shuffle=True, dro
 print(f"With current settings, Train/Test sizes are {len(lab_ds)}/{len(test_lab_ds)}")
 
 print(f"Training mode {TRAINING_MODE}: {TRAINING_MODE_DESCRIPTIONS[TRAINING_MODE]}")
-print(f"Training {N_MODELS} model(s) with different initializations")
+print(f"Training {N_RUNS} run(s) with different initialisations")
 
 num_classes = labels.shape[1]
 
@@ -346,7 +348,9 @@ def build_finetune_model(model_idx):
             "Training from scratch with checkpoint architecture and newly initialized weights"
         )
     else:
-        model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint["model_state_dict"]
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
 
     finetune_model = BYOLFineTuner(
         byol_model=model,
@@ -493,7 +497,7 @@ def compute_finetuning_metrics(finetune_model, dataset):
 
     print(f'shape of y_true: {y_true.shape[0]}')
 
-    return {
+    metrics = {
         "precision": precision.tolist(),
         "recall": recall.tolist(),
         "f1": f1.tolist(),
@@ -502,6 +506,7 @@ def compute_finetuning_metrics(finetune_model, dataset):
         "macro_f1": [float(f1.mean().item())],
         "n_members": n_members.tolist(),
     }
+    return metrics, y_prob_np, y_pred.numpy(), y_true_np
 
 
 all_train_losses = []
@@ -509,9 +514,9 @@ all_test_losses = []
 all_train_metrics = []
 all_test_metrics = []
 
-for model_idx in range(N_MODELS):
+for model_idx in range(N_RUNS):
     run_number = model_idx + 1
-    print(f"Starting model {run_number}/{N_MODELS}")
+    print(f"Starting run {run_number}/{N_RUNS}")
 
     finetune_model, run_seed = build_finetune_model(model_idx)
     seed_training_randomness()
@@ -537,7 +542,7 @@ for model_idx in range(N_MODELS):
                 "initialization_seed": run_seed,
                 "f_label": F_LABEL,
                 "model_index": run_number,
-                "n_models": N_MODELS,
+                "n_runs": N_RUNS,
             },
             "train_losses": train_losses,
             "test_losses": test_losses,
@@ -546,17 +551,26 @@ for model_idx in range(N_MODELS):
     )
     print(f"Finetuned model checkpoint saved to {checkpoint_path}")
 
-    train_metrics = compute_finetuning_metrics(finetune_model, lab_ds)
-    test_metrics = compute_finetuning_metrics(finetune_model, test_lab_ds)
+    train_metrics, _, _, _ = compute_finetuning_metrics(finetune_model, lab_ds)
+    test_metrics, test_probs_arr, test_preds_arr, test_labels_arr = compute_finetuning_metrics(
+        finetune_model, test_lab_ds
+    )
     all_train_metrics.append(train_metrics)
     all_test_metrics.append(test_metrics)
+
+    run_dir = OUTPUT_DIR / f'run{run_number}' if N_RUNS > 1 else OUTPUT_DIR
+    run_dir.mkdir(exist_ok=True)
+    np.save(run_dir / 'test_probs.npy',  test_probs_arr.astype(np.float32))
+    np.save(run_dir / 'test_preds.npy',  test_preds_arr)
+    np.save(run_dir / 'test_labels.npy', test_labels_arr)
+    print(f"Per-run arrays saved to: {run_dir}")
 
     del finetune_model
     if use_cuda:
         torch.cuda.empty_cache()
 
 fig, ax = plt.subplots(figsize=(6, 4))
-curve_alpha = 0.45 if N_MODELS > 1 else 1.0
+curve_alpha = 0.45 if N_RUNS > 1 else 1.0
 for model_idx, (train_losses, test_losses) in enumerate(
     zip(all_train_losses, all_test_losses)
 ):

@@ -222,6 +222,9 @@ OUTPUT_BASE = args.output_dir
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
 # Create run directory
+BYOL_RUNS_DIR = OUTPUT_BASE / 'byol_runs'
+BYOL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     RUN_ID = f"{args.run_name}_{_timestamp}"
@@ -230,7 +233,7 @@ else:
     if DATASET_NAME != "LOTSS":
         RUN_ID += f"_{DATASET_NAME}"
     RUN_ID += f"_{MODEL_TYPE}_w{args.weighting}_f{F_LABEL}"
-    
+
 # Truncate labels based on label type
 LABEL_RANGES = {
     'full':        (0, 20),   # All labels
@@ -242,7 +245,7 @@ LABEL_RANGES = {
     'derived':     (19, 24),  # Compact+hybrids through Straight+multi hotspots
 }
 
-OUTPUT_DIR = OUTPUT_BASE / f'run_{RUN_ID}'
+OUTPUT_DIR = BYOL_RUNS_DIR / f'run_{RUN_ID}'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Create subfolders
