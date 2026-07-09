@@ -51,24 +51,37 @@ def get_augmentation(name: str) -> T.Compose:
     Return a named augmentation pipeline.
 
     Args:
-        name: 'quarter', 'simple', or 'extended'
+        name: 'quart', 'cont', 'quart_ext', or 'cont_ext'
+            quart    — flip + quarter-turn rotation (lossless)
+            cont     — flip + continuous rotation
+            quart_ext — crop + flip + quarter-turn rotation + noise + intensity scaling
+            cont_ext  — crop + flip + continuous rotation + noise + intensity scaling
 
     Returns:
         T.Compose pipeline
     """
-    if name == "quarter":
+    if name == "quart":
         return T.Compose([
             T.RandomHorizontalFlip(),
             T.RandomVerticalFlip(),
             QuarterTurnRotation(),
         ])
-    elif name == "simple":
+    elif name == "cont":
         return T.Compose([
             T.RandomHorizontalFlip(),
             T.RandomVerticalFlip(),
             T.RandomRotation(180),
         ])
-    elif name == "extended":
+    elif name == "quart_ext":
+        return T.Compose([
+            T.RandomResizedCrop(89, scale=(0.5, 1.0)),
+            T.RandomHorizontalFlip(),
+            T.RandomVerticalFlip(),
+            QuarterTurnRotation(),
+            GaussianNoise(std=0.05),
+            IntensityScaling(scale=0.2),
+        ])
+    elif name == "cont_ext":
         return T.Compose([
             T.RandomResizedCrop(89, scale=(0.5, 1.0)),
             T.RandomHorizontalFlip(),
@@ -78,4 +91,4 @@ def get_augmentation(name: str) -> T.Compose:
             IntensityScaling(scale=0.2),
         ])
     else:
-        raise ValueError(f"Unknown augmentation: '{name}'. Choose from: quarter, simple, extended")
+        raise ValueError(f"Unknown augmentation: '{name}'. Choose from: quart, cont, quart_ext, cont_ext")

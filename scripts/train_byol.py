@@ -115,11 +115,13 @@ def parse_args():
                     help="Subsample dataset to N samples (for quick testing)")
 
     # Augmentation
-    ap.add_argument("--augmentation", type=str, default="simple",
-                    choices=["quarter", "simple", "extended"],
-                    help="Augmentation pipeline: 'quarter' (flip + 0/90/180/270 rotation), "
-                         "'simple' (flip + continuous rotation), "
-                         "'extended' (simple + crop + noise + intensity scaling)")
+    ap.add_argument("--augmentation", type=str, default="cont",
+                    choices=["quart", "cont", "quart_ext", "cont_ext"],
+                    help="Augmentation pipeline: "
+                         "'quart' (flip + quarter-turn rotation), "
+                         "'cont' (flip + continuous rotation), "
+                         "'quart_ext' (crop + flip + quarter-turn + noise + intensity), "
+                         "'cont_ext' (crop + flip + continuous rotation + noise + intensity)")
 
     # Model selection
     ap.add_argument("--model-type", type=str, default="efficientnet-b0",
