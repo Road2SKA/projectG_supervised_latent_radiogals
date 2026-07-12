@@ -116,12 +116,13 @@ def parse_args():
 
     # Augmentation
     ap.add_argument("--augmentation", type=str, default="cont",
-                    choices=["quart", "cont", "quart_ext", "cont_ext"],
+                    choices=["quart", "cont", "quart_ext", "cont_ext", "baronperez"],
                     help="Augmentation pipeline: "
                          "'quart' (flip + quarter-turn rotation), "
                          "'cont' (flip + continuous rotation), "
                          "'quart_ext' (crop + flip + quarter-turn + noise + intensity), "
-                         "'cont_ext' (crop + flip + continuous rotation + noise + intensity)")
+                         "'cont_ext' (crop + flip + continuous rotation + noise + intensity), "
+                         "'baronperez' (tight crop + vertical-flip + full rotation + contrast jitter)")
 
     # Model selection
     ap.add_argument("--model-type", type=str, default="efficientnet-b0",
@@ -290,7 +291,7 @@ else:
     RUN_ID += f"_lr{args.lr_schedule}_wd{args.weight_decay}_l{args.label_type}"
     RUN_ID += f"_ema{EMA_DECAY}"
     RUN_ID += f"_vicregvar{args.vicreg_var_weight}_cov{args.vicreg_cov_weight}_gamma{args.vicreg_gamma}"
-    RUN_ID += f"_f{F_LABEL}_sw{args.supervision_weight}"
+    RUN_ID += f"_f{F_LABEL}_sw{args.supervision_weight}_swsch{args.supervision_weight_schedule}"
     if args.class_weight_mode is not None:
         RUN_ID += f"_cw{args.class_weight_mode}{args.class_weight_strength}"
 
@@ -312,9 +313,10 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 FIGURES_DIR = OUTPUT_DIR / 'figures'
 UMAP_DIR    = FIGURES_DIR / 'umap'
 LOGS_DIR    = OUTPUT_DIR / 'logs'
-DATA_DIR    = OUTPUT_DIR / 'data'
-BYOL_DIR    = DATA_DIR / 'byol'
-for _d in [FIGURES_DIR, UMAP_DIR, LOGS_DIR, DATA_DIR, BYOL_DIR]:
+DATA_DIR      = OUTPUT_DIR / 'data'
+UMAP_DATA_DIR = DATA_DIR / 'umap'
+BYOL_DIR      = DATA_DIR / 'byol'
+for _d in [FIGURES_DIR, UMAP_DIR, LOGS_DIR, DATA_DIR, UMAP_DATA_DIR, BYOL_DIR]:
     _d.mkdir(exist_ok=True)
 
 checkpoint_path = OUTPUT_DIR / 'byol_model_best.pt'
@@ -1252,42 +1254,109 @@ for _item in _items:
                             'Curved FRIIs', 'Straight+multi hotspots'],
         }
 
-        _n_tr = len(train_projections)
-        _n_te = len(test_projections)
+        _enc_parquet  = UMAP_DATA_DIR / f'umap_encodings{_suffix}.parquet'
+        _proj_parquet = UMAP_DATA_DIR / f'umap_projections{_suffix}.parquet'
 
-        _lf_train = labels_full[train_idx][:_n_tr]
-        _lf_test  = labels_full[test_idx][:_n_te]
+        if _enc_parquet.exists() and _proj_parquet.exists():
+            # ── Load coordinates and metadata from cached parquets ─────────────
+            print("  Loading UMAP coordinates from cached parquet files...")
+            _enc_df  = pd.read_parquet(_enc_parquet)
+            _proj_df = pd.read_parquet(_proj_parquet)
 
-        if unlab_encodings is not None:
-            _n_ul = len(unlab_encodings)
-            _lf_unlab = np.zeros((_n_ul, _lf_train.shape[1]), dtype=_lf_train.dtype)
-            _parts = [unlab_encodings, train_encodings]
-            _lf_parts = [_lf_unlab, _lf_train]
+            _all_2d        = _enc_df[['umap_x', 'umap_y']].values
+            _proj_2d       = _proj_df[['umap_x', 'umap_y']].values
+            _all_lf        = _enc_df[LABEL_COLS].values.astype(np.int64)
+            _all_pixel_sum = _enc_df['pixel_sum'].values
+            _interest      = _enc_df['interest_score'].values.astype(float)
+
+            _split_col = _enc_df['split'].values
+            _n_ul = int((_split_col == 'unlabelled_train').sum())
+            _n_tr = int((_split_col == 'labelled_train').sum())
+            _n_te = int((_split_col == 'test').sum())
+            _mask_ul = _split_col == 'unlabelled_train'
+            _mask_tr = _split_col == 'labelled_train'
+            _mask_te = _split_col == 'test'
         else:
-            _n_ul = 0
-            _parts = [train_encodings]
-            _lf_parts = [_lf_train]
-        _parts.append(test_encodings)
-        _lf_parts.append(_lf_test)
-        _all_proj = np.concatenate(_parts)
-        _all_lf   = np.concatenate(_lf_parts)
+            # ── Fit UMAP and save parquets ─────────────────────────────────────
+            _n_tr = len(train_projections)
+            _n_te = len(test_projections)
 
-        _n_all = _n_ul + _n_tr + _n_te
-        _mask_ul = np.zeros(_n_all, dtype=bool); _mask_ul[:_n_ul] = True
-        _mask_tr = np.zeros(_n_all, dtype=bool); _mask_tr[_n_ul:_n_ul+_n_tr] = True
-        _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul+_n_tr:] = True
+            _lf_train = labels_full[train_idx][:_n_tr]
+            _lf_test  = labels_full[test_idx][:_n_te]
 
-        _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
-        _umap_cache_dir = DATA_DIR / 'umap'
-        _umap_cache_dir.mkdir(exist_ok=True)
-        np.save(_umap_cache_dir / f'umap_encodings_coords{_suffix}.npy', _all_2d)
+            if unlab_encodings is not None:
+                _n_ul = len(unlab_encodings)
+                _lf_unlab = np.zeros((_n_ul, _lf_train.shape[1]), dtype=_lf_train.dtype)
+                _parts = [unlab_encodings, train_encodings]
+                _lf_parts = [_lf_unlab, _lf_train]
+            else:
+                _n_ul = 0
+                _parts = [train_encodings]
+                _lf_parts = [_lf_train]
+            _parts.append(test_encodings)
+            _lf_parts.append(_lf_test)
+            _all_proj = np.concatenate(_parts)
+            _all_lf   = np.concatenate(_lf_parts)
 
+            _n_all = _n_ul + _n_tr + _n_te
+            _mask_ul = np.zeros(_n_all, dtype=bool); _mask_ul[:_n_ul] = True
+            _mask_tr = np.zeros(_n_all, dtype=bool); _mask_tr[_n_ul:_n_ul+_n_tr] = True
+            _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul+_n_tr:] = True
+
+            _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
+
+            _proj_parts = ([unlab_projections] if unlab_encodings is not None else []) + [train_projections, test_projections]
+            _all_projections = np.concatenate(_proj_parts)
+            _, _proj_2d = fit_umap(_all_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
+
+            _img_parts = []
+            if unlab_encodings is not None:
+                _img_parts.append(unlabelled_images[:_n_ul])
+            _img_parts.append(train_images[:_n_tr])
+            _img_parts.append(test_images[:_n_te])
+            _all_images_arr = np.concatenate(_img_parts, axis=0)
+            _all_pixel_sum = _all_images_arr.sum(axis=(1, 2))
+
+            _lf_b = _all_lf.astype(bool)
+            _interest = np.ones(len(_all_lf), dtype=float)
+            for _score, _cols in reversed(TIERS):
+                _col_idx = [LABEL_COLS.index(c) for c in _cols]
+                _interest[_lf_b[:, _col_idx].any(axis=1)] = _score
+
+            _split_col = np.array(
+                (['unlabelled_train'] * _n_ul if _n_ul > 0 else []) +
+                ['labelled_train'] * _n_tr +
+                ['test'] * _n_te
+            )
+            _lf_true = np.concatenate(
+                ([labels_full[unlabelled_train_idx][:_n_ul]] if _n_ul > 0 else []) +
+                [_lf_train, _lf_test]
+            )
+            _umap_meta = pd.DataFrame({'split': _split_col})
+            for _ci, _cn in enumerate(LABEL_COLS):
+                _umap_meta[_cn] = _lf_true[:, _ci].astype(int)
+            _umap_meta['pixel_sum'] = _all_pixel_sum
+            _umap_meta['interest_score'] = _interest.astype(int)
+
+            _enc_df = _umap_meta.copy()
+            _enc_df['umap_x'] = _all_2d[:, 0]
+            _enc_df['umap_y'] = _all_2d[:, 1]
+            _enc_df.to_parquet(_enc_parquet, index=False)
+
+            _proj_df = _umap_meta.copy()
+            _proj_df['umap_x'] = _proj_2d[:, 0]
+            _proj_df['umap_y'] = _proj_2d[:, 1]
+            _proj_df.to_parquet(_proj_parquet, index=False)
+            print(f"  UMAP metadata saved to {UMAP_DATA_DIR}/")
+
+        # ── Produce all figures from whichever source ──────────────────────────
         _split_masks_all = {}
         if _n_ul > 0:
             _split_masks_all['Unlabelled train'] = _mask_ul
         _tr_key = 'Labelled train' if len(labelled_images) > 0 else 'Unlabelled train'
         _split_masks_all[_tr_key] = _mask_tr
         _split_masks_all['Test'] = _mask_te
+
         for _col in ('initial', 'morphology', 'train_labelled'):
             plot_umap_single(
                 _all_2d, _all_lf, _col, CLASS_NAMES, LABEL_RANGES,
@@ -1296,11 +1365,6 @@ for _item in _items:
                 split_masks=_split_masks_all,
             )
 
-        # UMAP on projections — initial labels only
-        _proj_parts = ([unlab_projections] if unlab_encodings is not None else []) + [train_projections, test_projections]
-        _all_projections = np.concatenate(_proj_parts)
-        _, _proj_2d = fit_umap(_all_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
-        np.save(_umap_cache_dir / f'umap_projections_coords{_suffix}.npy', _proj_2d)
         plot_umap_single(
             _proj_2d, _all_lf, 'initial', CLASS_NAMES, LABEL_RANGES,
             title='All (projections) — initial',
@@ -1308,14 +1372,6 @@ for _item in _items:
             split_masks=_split_masks_all,
         )
 
-        _img_parts = []
-        if unlab_encodings is not None:
-            _img_parts.append(unlabelled_images[:_n_ul])
-        _img_parts.append(train_images[:_n_tr])
-        _img_parts.append(test_images[:_n_te])
-        _all_images_arr = np.concatenate(_img_parts, axis=0)
-
-        _all_pixel_sum = _all_images_arr.sum(axis=(1, 2))
         plot_umap_scalar(
             _all_2d, _all_pixel_sum,
             title='All — brightness',
@@ -1324,11 +1380,6 @@ for _item in _items:
             cmap='plasma',
         )
 
-        _lf_b    = _all_lf.astype(bool)
-        _interest = np.ones(len(_all_lf), dtype=float)
-        for _score, _cols in reversed(TIERS):
-            _col_idx = [LABEL_COLS.index(c) for c in _cols]
-            _interest[_lf_b[:, _col_idx].any(axis=1)] = _score
         plot_umap_scalar(
             _all_2d, _interest,
             title='All — interest score',
@@ -1338,34 +1389,6 @@ for _item in _items:
             vmin=1, vmax=4,
             cbar_ticks=[1, 2, 3, 4],
         )
-
-        # Save UMAP metadata so plots can be regenerated without refitting
-        _split_col = np.array(
-            (['unlabelled_train'] * _n_ul if _n_ul > 0 else []) +
-            ['labelled_train'] * _n_tr +
-            ['test'] * _n_te
-        )
-        _lf_true = np.concatenate(
-            ([labels_full[unlabelled_train_idx][:_n_ul]] if _n_ul > 0 else []) +
-            [_lf_train, _lf_test]
-        )
-        _umap_meta = pd.DataFrame({'split': _split_col})
-        for _ci, _cn in enumerate(LABEL_COLS):
-            _umap_meta[_cn] = _lf_true[:, _ci].astype(int)
-        _umap_meta['pixel_sum'] = _all_pixel_sum
-        _umap_meta['interest_score'] = _interest.astype(int)
-
-        _enc_df = _umap_meta.copy()
-        _enc_df['umap_x'] = _all_2d[:, 0]
-        _enc_df['umap_y'] = _all_2d[:, 1]
-        _enc_df.to_parquet(DATA_DIR / f'umap_encodings{_suffix}.parquet', index=False)
-
-        _proj_df = _umap_meta.copy()
-        _proj_df['umap_x'] = _proj_2d[:, 0]
-        _proj_df['umap_y'] = _proj_2d[:, 1]
-        _proj_df.to_parquet(DATA_DIR / f'umap_projections{_suffix}.parquet', index=False)
-
-        print(f"UMAP metadata saved to {DATA_DIR}/")
 
         plot_umap_outliers(
             _all_2d[:_n_tr],

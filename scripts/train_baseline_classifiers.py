@@ -810,6 +810,164 @@ def main():
             json.dump(summary_out, f, indent=2)
         print(f"\n  Summary saved to: {out_dir / 'run_summary.json'}")
 
+    # ── Label-fraction sweep ───────────────────────────────────────────────────
+    # Runs n_runs independent sweeps (one per training run, matching seeds).
+    # 100% fraction is read from the already-completed results.json — no
+    # retraining.  Sub-100% fractions are retrained from scratch with the
+    # run's seed so that std is meaningful across all fractions.
+    # One label_fraction_metrics.json is saved per run_out directory so that
+    # the notebook's rglob() picks them all up and computes mean ± std.
+    # Skipped for scatter-based models (dualssn, scatternet, simplescatternet).
+    _skip_sweep = args.model in ('dualssn', 'scatternet', 'simplescatternet')
+    if _skip_sweep:
+        print(f"\nLabel-fraction sweep skipped for model '{args.model}'.")
+    else:
+        _FRACS_SUB = [0.01, 0.05, 0.10, 0.25, 0.50]  # 100% loaded from results.json
+        _H, _W     = images.shape[-2], images.shape[-1]
+        _tf_sw     = (transforms.Compose([transforms.Resize(224)])
+                      if args.model in ('vit', 'enb0') else None)
+        _alpha_sw  = torch.ones(n_classes, dtype=torch.float32, device=device)
+
+        # Val images / labels (rebuilt from val_idx for correctness)
+        _va_images_sw = images[val_idx]
+        _va_labels_sw = (_make_derived(labels[val_idx]) if args.label_set == "derived"
+                         else labels[val_idx][:, label_cols])
+        if args.label_set in ("classical_pure", "initial_pure"):
+            _va_pure      = labels[val_idx][:, 0:5].sum(axis=1) == 1
+            _va_images_sw = _va_images_sw[_va_pure]
+            _va_labels_sw = _va_labels_sw[_va_pure]
+
+        _te_dl_sw = make_loader(
+            RadioImageDataset(test_images, test_labels, _tf_sw),
+            args.batch_size, shuffle=False)
+
+        print(f"\n{'='*60}")
+        print(f"Label-fraction sweep  ({args.label_set}, {args.model}, {args.n_runs} run(s))")
+        print(f"{'='*60}")
+
+        for _ri in range(1, args.n_runs + 1):
+            _run_seed   = args.seed + (_ri - 1)
+            _run_out    = out_dir / f'run{_ri}' if args.n_runs > 1 else out_dir
+            _frac_cache = _run_out / "label_fraction_metrics.json"
+
+            if _frac_cache.exists() and not args.force:
+                print(f"  Run {_ri}: fraction cache exists — skipping.")
+                continue
+
+            print(f"\n  --- Run {_ri} / {args.n_runs}  (seed={_run_seed}) ---", flush=True)
+            _frac_out: dict = {}
+
+            # 100% — load from this run's already-completed results (no retraining)
+            _res_path = _run_out / "results.json"
+            if _res_path.exists():
+                with open(_res_path) as _f:
+                    _r100 = json.load(_f)
+                _frac_out["1.0"] = {"Supervised": {
+                    "f1":       _r100["f1_macro"],
+                    "auc":      _r100["auc_macro"],
+                    "accuracy": _r100["accuracy"],
+                    "recall":   _r100["recall_macro"],
+                }}
+                print(f"    100%: F1={_r100['f1_macro']:.4f}  (from results.json)", flush=True)
+            else:
+                print(f"    100%: results.json not found — skipping 100% point.", flush=True)
+
+            # Sub-100% fractions: retrain with this run's seed
+            _rng_sw = np.random.default_rng(_run_seed)
+            _va_dl_sw = make_loader(
+                RadioImageDataset(_va_images_sw, _va_labels_sw, _tf_sw),
+                args.batch_size, shuffle=False)
+
+            for _frac in _FRACS_SUB:
+                print(f"\n    Fraction {_frac:.0%}:", flush=True)
+                _n_sw      = max(n_classes * 2, int(_frac * len(train_idx)))
+                _fi        = _rng_sw.choice(len(train_idx), size=_n_sw, replace=False)
+                _tr_idx_sw = train_idx[_fi]
+
+                _tr_im_sw = images[_tr_idx_sw]
+                _tr_lb_sw = (_make_derived(labels[_tr_idx_sw]) if args.label_set == "derived"
+                             else labels[_tr_idx_sw][:, label_cols])
+                if args.label_set in ("classical_pure", "initial_pure"):
+                    _tr_pm    = labels[_tr_idx_sw][:, 0:5].sum(axis=1) == 1
+                    _tr_im_sw = _tr_im_sw[_tr_pm]
+                    _tr_lb_sw = _tr_lb_sw[_tr_pm]
+
+                if len(_tr_im_sw) == 0:
+                    print("      No samples after filtering — skipping.", flush=True)
+                    continue
+                print(f"      Training on {len(_tr_im_sw)} samples", flush=True)
+
+                torch.manual_seed(_run_seed)
+                np.random.seed(_run_seed)
+                _mdl_sw = build_model(args.model, n_classes, (1, _H, _W)).to(device)
+                _opt_sw = torch.optim.Adam(_mdl_sw.parameters(),
+                                           lr=args.lr, weight_decay=1e-4)
+                _sch_sw = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    _opt_sw, mode='min', factor=0.5, patience=5)
+                _tr_dl_sw = make_loader(
+                    RadioImageDataset(_tr_im_sw, _tr_lb_sw, _tf_sw),
+                    args.batch_size, shuffle=True)
+
+                _bv_sw, _bs_sw, _ni_sw = float('inf'), None, 0
+                for _ep_sw in range(1, args.epochs + 1):
+                    _mdl_sw.train()
+                    for _im_sw, _lb_sw in _tr_dl_sw:
+                        _im_sw, _lb_sw = _im_sw.to(device), _lb_sw.to(device)
+                        _loss_sw = weighted_class_mean_loss(
+                            _mdl_sw(_im_sw), _lb_sw, _alpha_sw, n_classes)
+                        _opt_sw.zero_grad()
+                        _loss_sw.backward()
+                        _opt_sw.step()
+                    _mdl_sw.eval()
+                    _vl_sw = 0.0
+                    with torch.no_grad():
+                        for _im_sw, _lb_sw in _va_dl_sw:
+                            _im_sw, _lb_sw = _im_sw.to(device), _lb_sw.to(device)
+                            _vl_sw += (sum(
+                                F.cross_entropy(_mdl_sw(_im_sw)[:, c, :], _lb_sw[:, c])
+                                for c in range(n_classes)
+                            ) / n_classes).item() * len(_lb_sw)
+                    _vl_sw /= len(_va_dl_sw.dataset)
+                    _sch_sw.step(_vl_sw)
+                    if _vl_sw < _bv_sw:
+                        _bv_sw = _vl_sw
+                        _bs_sw = {k: v.cpu().clone()
+                                  for k, v in _mdl_sw.state_dict().items()}
+                        _ni_sw = 0
+                    else:
+                        _ni_sw += 1
+                        if _ni_sw >= args.patience:
+                            print(f"      Early stop ep {_ep_sw}", flush=True)
+                            break
+                _mdl_sw.load_state_dict(_bs_sw)
+
+                _mdl_sw.eval()
+                _pb_sw, _pd_sw, _lb_sw_all = [], [], []
+                with torch.no_grad():
+                    for _im_sw, _lb_sw in _te_dl_sw:
+                        _im_sw = _im_sw.to(device)
+                        _pb = F.softmax(_mdl_sw(_im_sw), dim=-1)[:, :, 1].cpu().numpy()
+                        _pb_sw.append(_pb)
+                        _pd_sw.append((_pb >= 0.5).astype(int))
+                        _lb_sw_all.append(_lb_sw.numpy())
+                _tp_sw = np.concatenate(_pb_sw)
+                _yp_sw = np.concatenate(_pd_sw)
+                _yt_sw = np.concatenate(_lb_sw_all)
+                _ms    = evaluate_metrics(_yt_sw, _yp_sw, _tp_sw, class_names)
+                _frac_out[str(_frac)] = {"Supervised": {
+                    "f1":       _ms["f1_macro"],
+                    "auc":      _ms["auc_macro"],
+                    "accuracy": _ms["accuracy"],
+                    "recall":   _ms["recall_macro"],
+                }}
+                print(f"      F1={_ms['f1_macro']:.4f}  AUC={_ms['auc_macro']:.4f}"
+                      f"  Acc={_ms['accuracy']:.4f}", flush=True)
+
+            if _frac_out:
+                with open(_frac_cache, "w") as _fh:
+                    json.dump(_frac_out, _fh, indent=2)
+                print(f"    Saved → {_frac_cache}", flush=True)
+
 
 if __name__ == '__main__':
     main()

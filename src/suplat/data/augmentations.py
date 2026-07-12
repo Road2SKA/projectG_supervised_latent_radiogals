@@ -31,6 +31,20 @@ class IntensityScaling:
         return f"IntensityScaling(scale={self.scale})"
 
 
+class ContrastJitter:
+    """Multiply pixel values by a factor sampled uniformly from [low, high]."""
+    def __init__(self, low: float = 0.0, high: float = 1.1):
+        self.low = low
+        self.high = high
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        factor = self.low + torch.rand(1).item() * (self.high - self.low)
+        return x * factor
+
+    def __repr__(self) -> str:
+        return f"ContrastJitter(low={self.low}, high={self.high})"
+
+
 class QuarterTurnRotation:
     """Rotate by a randomly chosen quarter turn: 0, 90, 180, or 270 degrees."""
 
@@ -51,11 +65,13 @@ def get_augmentation(name: str) -> T.Compose:
     Return a named augmentation pipeline.
 
     Args:
-        name: 'quart', 'cont', 'quart_ext', or 'cont_ext'
-            quart    — flip + quarter-turn rotation (lossless)
-            cont     — flip + continuous rotation
-            quart_ext — crop + flip + quarter-turn rotation + noise + intensity scaling
-            cont_ext  — crop + flip + continuous rotation + noise + intensity scaling
+        name: 'quart', 'cont', 'quart_ext', 'cont_ext', or 'baronperez'
+            quart      — flip + quarter-turn rotation (lossless)
+            cont       — flip + continuous rotation
+            quart_ext  — crop + flip + quarter-turn rotation + noise + intensity scaling
+            cont_ext   — crop + flip + continuous rotation + noise + intensity scaling
+            baronperez — tight crop + vertical-flip + full rotation + contrast jitter
+                         (Barón-Pérez et al. style; no horizontal flip)
 
     Returns:
         T.Compose pipeline
@@ -90,5 +106,12 @@ def get_augmentation(name: str) -> T.Compose:
             GaussianNoise(std=0.05),
             IntensityScaling(scale=0.2),
         ])
+    elif name == "baronperez":
+        return T.Compose([
+            T.RandomResizedCrop(89, scale=(0.9, 1.0)),
+            T.RandomVerticalFlip(p=0.5),
+            T.RandomRotation(360),
+            ContrastJitter(low=0.0, high=1.1),
+        ])
     else:
-        raise ValueError(f"Unknown augmentation: '{name}'. Choose from: quart, cont, quart_ext, cont_ext")
+        raise ValueError(f"Unknown augmentation: '{name}'. Choose from: quart, cont, quart_ext, cont_ext, baronperez")

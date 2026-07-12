@@ -179,12 +179,14 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     Returns a result dict with keys rf/knn/lr (each with f1_macro, auc_macro, accuracy),
     or a failure dict (with key 'error' and 'detail').
     """
-    clf_dir  = run_dir / "data" / "classifiers"
-    rf_path  = clf_dir / f"rf_{label_set}_{feature_type}.json"
-    knn_path = clf_dir / f"knn_{label_set}_{feature_type}.json"
-    lr_path  = clf_dir / f"lr_{label_set}_{feature_type}.json"
+    clf_dir          = run_dir / "data" / "classifiers"
+    rf_path          = clf_dir / f"rf_{label_set}_{feature_type}.json"
+    knn_path         = clf_dir / f"knn_{label_set}_{feature_type}.json"
+    lr_path          = clf_dir / f"lr_{label_set}_{feature_type}.json"
+    _frac_cache_path = clf_dir / "label_fraction_metrics.json"
 
-    all_cached = rf_path.exists() and knn_path.exists() and lr_path.exists()
+    all_cached = (rf_path.exists() and knn_path.exists() and lr_path.exists()
+                  and _frac_cache_path.exists())
     if all_cached and not force:
         print(f"  [{run_dir.name}] skipping (all cached — use --force to rerun)", flush=True)
         out = dict(name=run_dir.name)
@@ -373,6 +375,54 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
             "accuracy":     metrics["accuracy"],
             "recall_macro": metrics["recall_macro"],
         }
+
+    # ── Label-fraction sweep (multiclass only) ────────────────────────────────
+    if is_multiclass and (not _frac_cache_path.exists() or force):
+        _FRACS = [0.01, 0.05, 0.10, 0.25, 0.50, 1.0]
+        _rng   = np.random.default_rng(seed)
+        _frac_out: dict = {}
+        for _frac in _FRACS:
+            _n   = max(len(class_names) * 2, int(_frac * len(X_train)))
+            _idx = (_rng.choice(len(X_train), size=_n, replace=False)
+                    if _frac < 1.0 else np.arange(len(X_train)))
+            _Xf, _yf = X_train[_idx], y_train[_idx]
+            _frac_out[str(_frac)] = {}
+            _knn_k = min(n_neighbors, len(_Xf))
+            for _cname, _clf_frac in [
+                ("LogReg", LogisticRegression(max_iter=1000, C=lr_C,
+                                              random_state=seed)),
+                ("KNN",    KNeighborsClassifier(n_neighbors=_knn_k,
+                                                metric="euclidean", n_jobs=-1)),
+                ("RF",     RandomForestClassifier(n_estimators=50,
+                                                  random_state=seed, n_jobs=-1)),
+            ]:
+                _clf_frac.fit(_Xf, _yf)
+                _yp   = _clf_frac.predict(X_test)
+                _prob = _clf_frac.predict_proba(X_test)
+                _ncls = len(class_names)
+                if _prob.shape[1] != _ncls:
+                    _full_p = np.zeros((len(X_test), _ncls), dtype=np.float64)
+                    for _j, _c in enumerate(_clf_frac.classes_):
+                        _full_p[:, int(_c)] = _prob[:, _j]
+                    _prob = _full_p
+                _y_bin = label_binarize(y_test, classes=list(range(_ncls)))
+                try:
+                    _auc = float(roc_auc_score(_y_bin, _prob,
+                                               multi_class="ovr", average="macro"))
+                except Exception:
+                    _auc = float("nan")
+                _frac_out[str(_frac)][_cname] = {
+                    "f1":       float(f1_score(y_test, _yp, average="macro",
+                                               zero_division=0)),
+                    "auc":      _auc,
+                    "accuracy": float(accuracy_score(y_test, _yp)),
+                    "recall":   float(recall_score(y_test, _yp, average="macro",
+                                                   zero_division=0)),
+                }
+        with open(_frac_cache_path, "w") as _fh:
+            json.dump(_frac_out, _fh, indent=2)
+        print(f"    Saved label-fraction sweep → {_frac_cache_path.name}",
+              flush=True)
 
     return out
 
@@ -575,6 +625,17 @@ def _parse_hparams(name: str) -> dict:
     return out
 
 
+def _parse_aug_type(name: str) -> str:
+    """Return the augmentation tag from a run name, or 'standard' if absent.
+
+    Tags like 'augextended', 'augquart', 'augquart_ext' sit between the sw
+    value and the trailing _YYYYMMDD_HHMM timestamp.
+    """
+    name_no_ts = re.sub(r'_\d{8}_\d{4}$', '', name)
+    m = re.search(r'_(aug\S+)$', name_no_ts)
+    return m.group(1) if m else 'standard'
+
+
 def print_statistical_summary(results: list,
                                clfs=("rf", "knn", "lr"),
                                metrics=("f1_macro", "auc_macro", "accuracy", "recall_macro")):
@@ -626,7 +687,13 @@ def print_statistical_summary(results: list,
             valid = [v for v in val_means.values() if v == v]
             _col_best_mean[(clf, metric)] = max(valid) if valid else float("nan")
 
-        for val in sorted(groups, key=lambda v: float(v)):
+        def _sort_key(v):
+            try:
+                return (0, float(v), "")
+            except (ValueError, TypeError):
+                return (1, 0.0, str(v))
+
+        for val in sorted(groups, key=_sort_key):
             group = groups[val]
             n = len(group)
             cells = []
@@ -638,6 +705,61 @@ def print_statistical_summary(results: list,
                 else:
                     mu = float(np.mean(vals))
                     best = _col_best_mean[(clf, metric)]
+                    is_best = (mu == mu) and (best == best) and (mu == best)
+                    if len(vals) == 1:
+                        s = f"{mu:.3f}"
+                    else:
+                        s = f"{mu:.3f}±{float(np.std(vals)):.3f}"
+                    if is_best:
+                        s = f"*{s}*"
+                    cells.append(f"{s:^{col_w}}")
+            print(f"  {val:<{name_w}}  {n:>3}  " + "  ".join(cells))
+
+        print(sep)
+
+    # ── Augmentation grouping ──────────────────────────────────────────────────
+    aug_groups: dict = {}
+    for r, _ in parsed:
+        aug = _parse_aug_type(r["name"])
+        aug_groups.setdefault(aug, []).append(r)
+
+    if len(aug_groups) >= 2:
+        name_w = max(len(str(v)) for v in aug_groups)
+        hdr = (f"  {'augmentation':<{name_w}}  {'N':>3}  " +
+               "  ".join(f"{h:^{col_w}}" for h in col_headers))
+        sep = "-" * len(hdr)
+
+        print(f"\n{'=' * len(hdr)}")
+        print("Grouped by: augmentation")
+        print(f"{'=' * len(hdr)}")
+        print(hdr)
+        print(sep)
+
+        _aug_means = {}
+        for val, group in aug_groups.items():
+            for clf, metric in clf_metric_cols:
+                vals = [r.get(clf, {}).get(metric, float("nan")) for r in group]
+                vals = [v for v in vals if v == v]
+                _aug_means.setdefault((clf, metric), {})[val] = (
+                    float(np.mean(vals)) if vals else float("nan")
+                )
+        _aug_col_best = {}
+        for (clf, metric), val_means in _aug_means.items():
+            valid = [v for v in val_means.values() if v == v]
+            _aug_col_best[(clf, metric)] = max(valid) if valid else float("nan")
+
+        for val in sorted(aug_groups):
+            group = aug_groups[val]
+            n = len(group)
+            cells = []
+            for clf, metric in clf_metric_cols:
+                vals = [r.get(clf, {}).get(metric, float("nan")) for r in group]
+                vals = [v for v in vals if v == v]
+                if not vals:
+                    cells.append(f"{'N/A':^{col_w}}")
+                else:
+                    mu = float(np.mean(vals))
+                    best = _aug_col_best[(clf, metric)]
                     is_best = (mu == mu) and (best == best) and (mu == best)
                     if len(vals) == 1:
                         s = f"{mu:.3f}"

@@ -108,10 +108,10 @@ def parse_args():
     ap.add_argument(
         "--n-runs", "--n-models",
         type=positive_int,
-        default=1,
+        default=10,
         dest="n_runs",
         help="Number of training runs with different initialisations. "
-             "Run i uses seed DATA_SEED + (i-1). Default: 1.",
+             "Run i uses seed DATA_SEED + (i-1). Default: 10.",
     )
     # Data and run configuration
     ap.add_argument(
@@ -129,8 +129,8 @@ def parse_args():
     ap.add_argument(
         "--augmentation",
         type=str,
-        default="standard",
-        choices=["standard", "extended"],
+        default="quart",
+        choices=["quart", "cont", "quart_ext", "cont_ext", "baronperez"],
         help="Augmentation pipeline for training images.",
     )
     # Optimization and output
@@ -167,6 +167,12 @@ def parse_args():
         default=0.0,
         help="Magnitude of class upweighting (0=uniform, default). "
              "w = clip(1 + strength*(raw_norm - 1), min=0).",
+    )
+    ap.add_argument(
+        "--f-label",
+        type=float,
+        default=None,
+        help="Override label fraction (0–1). Defaults to the value stored in the checkpoint config.",
     )
 
     return ap.parse_args()
@@ -243,7 +249,7 @@ labels = np.load(LABELS_PATH)
 print(labels.shape)
 
 DATA_SEED = checkpoint["config"]['data_seed']
-F_LABEL = checkpoint["config"]['f_label']
+F_LABEL = args.f_label if args.f_label is not None else checkpoint["config"]['f_label']
 TRAINING_MODE = args.training_mode
 LEARNING_RATE = args.lr
 N_RUNS = args.n_runs
@@ -256,53 +262,50 @@ train_images, train_labels = images[train_idx], labels[train_idx]
 test_images  = images[test_idx]
 test_labels  = labels[test_idx]
 
-# Labelled subset via stratified sampling
-if F_LABEL == 0.0:
-    labelled_mask = np.zeros(len(train_idx), dtype=bool)
-elif F_LABEL >= 1.0:
-    labelled_mask = np.ones(len(train_idx), dtype=bool)
-else:
-    strat_key = np.argmax(train_labels[:, :min(5, train_labels.shape[1])], axis=1)
-    n_lab = max(2, int(round(F_LABEL * len(train_idx))))
-    try:
-        sss = StratifiedShuffleSplit(n_splits=1, train_size=n_lab, random_state=DATA_SEED)
-        lab_rel, _ = next(sss.split(train_images, strat_key))
-    except ValueError:
-        print("Stratification failed, falling back to random selection")
-        lab_rel = np.random.choice(len(train_idx), n_lab, replace=False)
-    labelled_mask = np.zeros(len(train_idx), dtype=bool)
-    labelled_mask[lab_rel] = True
-
-labelled_images = train_images[labelled_mask]
-labelled_labels = train_labels[labelled_mask]
-unlabelled_images = train_images[~labelled_mask]
-labelled_train_idx = train_idx[labelled_mask]
-
-byol_strong_aug = get_augmentation("standard")
-
-lab_df = pd.DataFrame(labelled_labels)
-lab_ds = ImagesAndLabelsDataset(tags_data=lab_df, img_data=labelled_images,
-                         transform=byol_strong_aug)
-
-# Per-class alpha for training loss (use first 20 cols = standard label set)
-_alpha_full = compute_class_weights(
-    labelled_labels[:, :20],
-    args.class_weight_mode,
-    args.class_weight_strength,
-)                                                  # (20,)
-if labels.shape[1] > 20:
-    # pad alpha for any extra derived/appended class columns with uniform weight
-    _alpha_full = np.append(_alpha_full, np.ones(labels.shape[1] - 20, dtype=np.float32))
-_alpha_t = torch.tensor(_alpha_full, dtype=torch.float32)   # moved to device in loop
-_alpha_sum = float(_alpha_t.sum().clamp(min=1e-6))
-
-labelled_train_loader = DataLoader(lab_ds, batch_size=256, shuffle=True, drop_last=True,
-                          num_workers=1, pin_memory=use_cuda)
+byol_strong_aug = get_augmentation(args.augmentation)
 
 test_lab_ds = ImagesAndLabelsDataset(tags_data=pd.DataFrame(test_labels), img_data=test_images,
                          transform=byol_strong_aug)
 labelled_test_loader = DataLoader(test_lab_ds, batch_size=256, shuffle=True, drop_last=True,
                                   num_workers=1, pin_memory=use_cuda)
+
+
+def _make_labeled_loader(f_label, seed):
+    """Create a labelled-subset DataLoader at fraction f_label using the given seed."""
+    if f_label <= 0.0:
+        _mask = np.zeros(len(train_idx), dtype=bool)
+    elif f_label >= 1.0:
+        _mask = np.ones(len(train_idx), dtype=bool)
+    else:
+        _strat_key = np.argmax(train_labels[:, :min(5, train_labels.shape[1])], axis=1)
+        _n_lab = max(2, int(round(f_label * len(train_idx))))
+        try:
+            _sss = StratifiedShuffleSplit(n_splits=1, train_size=_n_lab, random_state=seed)
+            _lab_rel, _ = next(_sss.split(train_images, _strat_key))
+        except ValueError:
+            print("Stratification failed, falling back to random selection")
+            _lab_rel = np.random.choice(len(train_idx), _n_lab, replace=False)
+        _mask = np.zeros(len(train_idx), dtype=bool)
+        _mask[_lab_rel] = True
+    _lab_imgs = train_images[_mask]
+    _lab_labs = train_labels[_mask]
+    _alpha = compute_class_weights(
+        _lab_labs[:, :20], args.class_weight_mode, args.class_weight_strength)
+    if labels.shape[1] > 20:
+        _alpha = np.append(_alpha, np.ones(labels.shape[1] - 20, dtype=np.float32))
+    _alpha_t   = torch.tensor(_alpha, dtype=torch.float32)
+    _alpha_sum = float(_alpha_t.sum().clamp(min=1e-6))
+    _lab_df = pd.DataFrame(_lab_labs)
+    _lab_ds = ImagesAndLabelsDataset(
+        tags_data=_lab_df, img_data=_lab_imgs, transform=byol_strong_aug)
+    _loader = DataLoader(
+        _lab_ds, batch_size=256, shuffle=True,
+        drop_last=(len(_lab_ds) > 256),
+        num_workers=1, pin_memory=use_cuda)
+    return _lab_ds, _loader, _alpha_t, _alpha_sum
+
+
+lab_ds, labelled_train_loader, _alpha_t, _alpha_sum = _make_labeled_loader(F_LABEL, DATA_SEED)
 
 print(f"With current settings, Train/Test sizes are {len(lab_ds)}/{len(test_lab_ds)}")
 
@@ -361,7 +364,7 @@ def build_finetune_model(model_idx):
     return finetune_model.to(device), run_seed
 
 
-def train_one_model(finetune_model):
+def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum):
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, finetune_model.parameters()),
         lr=LEARNING_RATE,
@@ -381,12 +384,12 @@ def train_one_model(finetune_model):
         train_loss = 0.0
         train_batches = 0
 
-        for batch in labelled_train_loader:
+        for batch in train_loader:
             x1, x1_aug, x1_lab = batch
 
             x1_aug = x1_aug.float().to(device)
             y = x1_lab.float().to(device)
-            w_dev = _alpha_t.to(device)
+            w_dev = alpha_t.to(device)
 
             if y.ndim == 3 and y.shape[1] == 1:
                 y = y.squeeze(1)
@@ -395,7 +398,7 @@ def train_one_model(finetune_model):
 
             logits = finetune_model(x1_aug)
             unreduced = F.binary_cross_entropy_with_logits(logits, y, reduction='none')
-            loss = (unreduced * w_dev).sum(1) / _alpha_sum
+            loss = (unreduced * w_dev).sum(1) / alpha_sum
             loss = loss.mean()
 
             loss.backward()
@@ -520,7 +523,8 @@ for model_idx in range(N_RUNS):
 
     finetune_model, run_seed = build_finetune_model(model_idx)
     seed_training_randomness()
-    train_losses, test_losses, optimizer = train_one_model(finetune_model)
+    train_losses, test_losses, optimizer = train_one_model(
+        finetune_model, labelled_train_loader, _alpha_t, _alpha_sum)
 
     all_train_losses.append(train_losses)
     all_test_losses.append(test_losses)
@@ -610,3 +614,59 @@ metrics_path = OUTPUT_DIR / "finetuning_metrics.json"
 with open(metrics_path, "w") as f:
     json.dump(metrics, f, indent=2)
 print(f"Finetuning metrics saved to {metrics_path}")
+
+# =============================================================================
+# LABEL-FRACTION SWEEP
+# Train N_RUNS models at each sub-100% fraction; save test_probs.npy /
+# test_labels.npy to OUTPUT_DIR/frac_{f:.2f}/run{i}/ for notebook loading.
+# 100% results already live in OUTPUT_DIR/run{i}/.
+# Each run i uses a different labelled-subset seed (DATA_SEED + i - 1) so
+# that std across runs reflects genuine variability.
+# =============================================================================
+_FRACS_SUB = [0.01, 0.05, 0.10, 0.25, 0.50]
+
+print(f"\n{'='*60}")
+print(f"Label-fraction sweep ({len(_FRACS_SUB)} fractions × {N_RUNS} runs)")
+print(f"{'='*60}")
+
+for _frac in _FRACS_SUB:
+    _frac_dir = OUTPUT_DIR / f"frac_{_frac:.2f}"
+
+    # Check whether every run for this fraction is already complete
+    _all_done = all(
+        (_frac_dir / f"run{_ri}" / "test_probs.npy").exists()
+        for _ri in range(1, N_RUNS + 1)
+    )
+    if _all_done:
+        print(f"\nfrac={_frac:.0%}: all {N_RUNS} run(s) already exist, skipping.")
+        continue
+
+    print(f"\nfrac={_frac:.0%} ── {int(round(_frac * len(train_idx)))} labelled train sources")
+    _frac_dir.mkdir(parents=True, exist_ok=True)
+
+    for _ri in range(1, N_RUNS + 1):
+        _run_dir = _frac_dir / f"run{_ri}"
+        if (_run_dir / "test_probs.npy").exists():
+            print(f"  run{_ri}: already exists, skipping.")
+            continue
+        _run_dir.mkdir(exist_ok=True)
+
+        # Different labelled subset per run (mirrors baseline script behaviour)
+        _run_seed = DATA_SEED + (_ri - 1)
+        _, _train_loader, _a_t, _a_sum = _make_labeled_loader(_frac, _run_seed)
+
+        _ft_model, _ = build_finetune_model(_ri - 1)
+        seed_training_randomness()
+        train_one_model(_ft_model, _train_loader, _a_t, _a_sum)
+
+        _, _probs, _, _lbls = compute_finetuning_metrics(_ft_model, test_lab_ds)
+        np.save(_run_dir / "test_probs.npy",  _probs.astype(np.float32))
+        np.save(_run_dir / "test_labels.npy", _lbls)
+        print(f"  run{_ri}: saved to {_run_dir}")
+
+        del _ft_model
+        if use_cuda:
+            torch.cuda.empty_cache()
+
+print(f"\nLabel-fraction sweep complete.")
+

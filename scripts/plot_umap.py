@@ -28,9 +28,18 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# 20-column label names matching the umap_*.parquet files saved by train_byol.py
+_UMAP_LABEL_COLS = [
+    'fri', 'frii', 'hybrid', 'spiral', 'relaxed',
+    'cshaped', 'sshaped', 'misaligned', 'wings', 'xshaped',
+    'straight', 'multihotspots', 'continuous', 'banding', 'onesided',
+    'restarted', 'cluster', 'merger', 'diffuse', 'unknown',
+]
 
 SEED = 42
 
@@ -135,8 +144,20 @@ def run_dir_main(args):
     umap_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Fast path: --minimal with pre-computed coords ─────────────────────────
-    _new_coords = data_dir / 'umap' / 'umap_projections_coords.npy'
-    coords_path = _new_coords if _new_coords.exists() else data_dir / 'umap_all_coords.npy'
+    _proj_parquet = data_dir / 'umap' / 'umap_projections.parquet'
+    _new_coords   = data_dir / 'umap' / 'umap_projections_coords.npy'
+    coords_path   = _new_coords if _new_coords.exists() else data_dir / 'umap_all_coords.npy'
+
+    if args.minimal and _proj_parquet.exists():
+        print(f"Loading pre-computed UMAP coordinates from {_proj_parquet}...")
+        _df     = pd.read_parquet(_proj_parquet, columns=['umap_x', 'umap_y'] + _UMAP_LABEL_COLS)
+        _all_2d = _df[['umap_x', 'umap_y']].values
+        _all_lf = _df[_UMAP_LABEL_COLS].values.astype(np.int64)
+        print(f"  Coords: {_all_2d.shape}  Labels: {_all_lf.shape}")
+        plot_umap_minimal(_all_2d, _all_lf, umap_dir / 'umap_all_initial_minimal.png')
+        print(f"\nMinimal UMAP saved to {umap_dir}/")
+        return
+
     if args.minimal and coords_path.exists():
         print(f"Loading pre-computed UMAP coordinates from {coords_path}...")
         _all_2d = np.load(coords_path)
@@ -239,11 +260,23 @@ def run_dir_main(args):
     _mask_va = np.zeros(_n_all, dtype=bool); _mask_va[_n_ul + _n_tr:_n_ul + _n_tr + _n_va] = True
     _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul + _n_tr + _n_va:] = True
 
-    _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
     umap_data_dir = data_dir / 'umap'
     umap_data_dir.mkdir(parents=True, exist_ok=True)
-    np.save(umap_data_dir / 'umap_projections_coords.npy', _all_2d)
-    print(f"  Saved UMAP coordinates: {umap_data_dir / 'umap_projections_coords.npy'}")
+    _proj_parquet_full = umap_data_dir / 'umap_projections.parquet'
+    if _proj_parquet_full.exists():
+        _pq = pd.read_parquet(_proj_parquet_full, columns=['umap_x', 'umap_y'] + _UMAP_LABEL_COLS)
+        if len(_pq) == _n_all:
+            print(f"  Loading UMAP coordinates from {_proj_parquet_full}...")
+            _all_2d = _pq[['umap_x', 'umap_y']].values
+            _all_lf = _pq[_UMAP_LABEL_COLS].values.astype(np.int64)
+        else:
+            print(f"  Parquet row count ({len(_pq)}) != expected ({_n_all}), fitting UMAP...")
+            _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
+            np.save(umap_data_dir / 'umap_projections_coords.npy', _all_2d)
+    else:
+        _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
+        np.save(umap_data_dir / 'umap_projections_coords.npy', _all_2d)
+        print(f"  Saved UMAP coordinates: {umap_data_dir / 'umap_projections_coords.npy'}")
 
     _split_masks_all = {}
     if _n_ul > 0:
