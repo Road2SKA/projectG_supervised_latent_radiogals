@@ -179,7 +179,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     Returns a result dict with keys rf/knn/lr (each with f1_macro, auc_macro, accuracy),
     or a failure dict (with key 'error' and 'detail').
     """
-    clf_dir          = run_dir / "data" / "classifiers"
+    clf_dir          = run_dir / "data" / "classifiers" / "simple_downstream"
     rf_path          = clf_dir / f"rf_{label_set}_{feature_type}.json"
     knn_path         = clf_dir / f"knn_{label_set}_{feature_type}.json"
     lr_path          = clf_dir / f"lr_{label_set}_{feature_type}.json"
@@ -491,7 +491,7 @@ def main():
 
     # ── Discover run directories ───────────────────────────────────────────────
     run_dirs = sorted(outputs_root.glob(args.run_glob))
-    run_dirs = [rd for rd in run_dirs if re.search(r'_f[\d.]+_sw[\d.]+', rd.name)]
+    run_dirs = [rd for rd in run_dirs if re.search(r'_f[\d.]+_sw(?:cos|lin)?[\d.]+', rd.name)]
     if not run_dirs:
         print(f"No run directories found matching '{args.run_glob}' under {outputs_root}",
               file=sys.stderr)
@@ -611,7 +611,7 @@ _HPARAM_RE = {
     "cov":       r"_cov([\d.]+)",
     "gamma":     r"_gamma([\d.]+)",
     "f":         r"_f([\d.]+)_sw",
-    "sw":        r"_sw([\d.]+?)(?:_|$)",
+    "sw":        r"_sw((?:cos|lin)?[\d.]+(?:to[\d.]+)?)(?:_|$)",
     "pd":        r"_pd(\d+)",
 }
 

@@ -114,7 +114,6 @@ class ImagesAndLabelsDataset(Dataset):
         label_vec = torch.from_numpy(label_vec.copy()).float()  # Convert labels to tensor
 
         # Apply transforms to tensors
-        if self.transform:
-            img_transformed = self.transform(img)
+        img_transformed = self.transform(img) if self.transform else img.clone()
 
         return img, img_transformed, label_vec

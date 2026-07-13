@@ -3,7 +3,6 @@
 __pycache__
 **/__pycache__/
 core_*
-jobs
 data/raw
 data/processed
 logs

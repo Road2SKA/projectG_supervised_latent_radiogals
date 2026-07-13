@@ -174,6 +174,12 @@ def parse_args():
         default=None,
         help="Override label fraction (0–1). Defaults to the value stored in the checkpoint config.",
     )
+    ap.add_argument(
+        "--patience",
+        type=int,
+        default=15,
+        help="Early stopping patience (epochs with no improvement on test loss). Default: 15.",
+    )
 
     return ap.parse_args()
 
@@ -233,7 +239,7 @@ args = parse_args()
 
 BYOL_PATH = args.model_path / "byol_model_best.pt"
 finetune_name = "finetuning" if args.run_name == "" else f"finetuning_{args.run_name}"
-OUTPUT_DIR = args.model_path / finetune_name
+OUTPUT_DIR = args.model_path / "data" / "classifiers" / finetune_name
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 checkpoint = torch.load(BYOL_PATH, map_location="cpu", weights_only=True)
@@ -264,10 +270,11 @@ test_labels  = labels[test_idx]
 
 byol_strong_aug = get_augmentation(args.augmentation)
 
+# Test set: no augmentation
 test_lab_ds = ImagesAndLabelsDataset(tags_data=pd.DataFrame(test_labels), img_data=test_images,
-                         transform=byol_strong_aug)
-labelled_test_loader = DataLoader(test_lab_ds, batch_size=256, shuffle=True, drop_last=True,
-                                  num_workers=1, pin_memory=use_cuda)
+                                     transform=None)
+labelled_test_loader = DataLoader(test_lab_ds, batch_size=args.batch_size, shuffle=False,
+                                  drop_last=False, num_workers=args.num_workers, pin_memory=use_cuda)
 
 
 def _make_labeled_loader(f_label, seed):
@@ -299,9 +306,9 @@ def _make_labeled_loader(f_label, seed):
     _lab_ds = ImagesAndLabelsDataset(
         tags_data=_lab_df, img_data=_lab_imgs, transform=byol_strong_aug)
     _loader = DataLoader(
-        _lab_ds, batch_size=256, shuffle=True,
-        drop_last=(len(_lab_ds) > 256),
-        num_workers=1, pin_memory=use_cuda)
+        _lab_ds, batch_size=args.batch_size, shuffle=True,
+        drop_last=(len(_lab_ds) > args.batch_size),
+        num_workers=args.num_workers, pin_memory=use_cuda)
     return _lab_ds, _loader, _alpha_t, _alpha_sum
 
 
@@ -370,9 +377,15 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum):
         lr=LEARNING_RATE,
         weight_decay=args.weight_decay,
     )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
 
     train_losses = []
     test_losses = []
+    best_test_loss = float('inf')
+    best_state = None
+    epochs_no_impr = 0
 
     for epoch in range(NUM_EPOCHS):
 
@@ -436,12 +449,28 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum):
 
         avg_test_loss = test_loss / test_batches
         test_losses.append(avg_test_loss)
+        scheduler.step(avg_test_loss)
+
+        if avg_test_loss < best_test_loss:
+            best_test_loss = avg_test_loss
+            best_state = {k: v.cpu().clone() for k, v in finetune_model.state_dict().items()}
+            epochs_no_impr = 0
+        else:
+            epochs_no_impr += 1
 
         print(
             f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
             f"| Train: {avg_train_loss:.4f} "
-            f"| Test: {avg_test_loss:.4f}"
+            f"| Test: {avg_test_loss:.4f} "
+            f"| lr: {optimizer.param_groups[0]['lr']:.2e}"
         )
+
+        if epochs_no_impr >= args.patience:
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+    if best_state is not None:
+        finetune_model.load_state_dict(best_state)
 
     return train_losses, test_losses, optimizer
 

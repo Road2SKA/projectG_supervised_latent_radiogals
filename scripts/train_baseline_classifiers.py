@@ -156,9 +156,9 @@ def evaluate_metrics(y_true, y_pred, y_prob, class_names):
     }
 
 
-def make_loader(dataset, batch_size, shuffle):
+def make_loader(dataset, batch_size, shuffle, num_workers=4):
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
-                      num_workers=0, pin_memory=True)
+                      num_workers=num_workers, pin_memory=True)
 
 
 # ── Forward pass wrappers ─────────────────────────────────────────────────────
@@ -229,7 +229,7 @@ def build_model(model_name, n_classes, img_shape, scat_shape=None):
         vit.heads = nn.Linear(768, n_out)
         base = vit
     elif model_name == 'enb0':
-        backbone = create_efficientnet_b0_backbone(num_channels=1, img_size=224)
+        backbone = create_efficientnet_b0_backbone(num_channels=1)
         base = nn.Sequential(
             backbone,
             nn.Flatten(),
@@ -298,6 +298,8 @@ def main():
                         help="Custom run name prefix (default: run_dir basename + timestamp)")
     parser.add_argument('--force', action='store_true',
                         help="Retrain even if outputs already exist.")
+    parser.add_argument('--skip_sweep', action='store_true',
+                        help="Skip the label-fraction sweep entirely.")
     parser.add_argument('--class_weight_mode', type=str, default='initial',
                         choices=["score", "initial", "morphology", "environment", "classical", "all"],
                         help="Upweight rare samples: 'score' (interest tier 1-4) or label-set name "
@@ -312,6 +314,15 @@ def main():
                         help="Data seed used to locate data_splits/<seed>/ directly, "
                              "without needing a BYOL checkpoint. Overrides --byol_run_dir "
                              "split resolution if provided.")
+    parser.add_argument('--gen_dir', type=Path, default=None,
+                        help="Path to generative model directory containing decoder.pt and nsf.pt. "
+                             "When provided, skips the label-fraction sweep and instead trains the "
+                             "classifier augmented with generated images at fractions 0.5, 1.0, and 2.0 "
+                             "of the real training set size, repeated n_runs times each.")
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help="DataLoader worker processes for data loading (default: 4).")
+    parser.add_argument('--compile', action='store_true',
+                        help="Apply torch.compile() to the model for faster GPU execution.")
     args = parser.parse_args()
     if args.byol_run_dir is None:
         args.byol_run_dir = args.run_dir
@@ -320,6 +331,12 @@ def main():
     np.random.seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
+
+    # Shadow module-level make_loader with num_workers from args
+    _nw = args.num_workers
+    make_loader = lambda ds, bs, shuffle: DataLoader(  # noqa: E731
+        ds, batch_size=bs, shuffle=shuffle, num_workers=_nw, pin_memory=True
+    )
 
     # ── Output directory ──────────────────────────────────────────────────
     _prefix = args.run_name if args.run_name else args.run_dir.name
@@ -368,7 +385,7 @@ def main():
 
     # ── Train/test split ──────────────────────────────────────────────────
     if args.data_seed is not None:
-        _splits_dir = args.byol_run_dir.parent / "data_splits" / str(args.data_seed)
+        _splits_dir = args.byol_run_dir.parent.parent / "data_splits" / str(args.data_seed)
         split_label = f"data_seed={args.data_seed}"
     else:
         byol_data = args.byol_run_dir / "data"
@@ -431,7 +448,9 @@ def main():
 
     all_run_results = []
 
-    for run_i in range(1, args.n_runs + 1):
+    if args.gen_dir is not None:
+        print("Skipping supervised training loop (--gen_dir mode).")
+    for run_i in range(1, args.n_runs + 1) if args.gen_dir is None else []:
         run_seed = args.seed + (run_i - 1)
         torch.manual_seed(run_seed)
         np.random.seed(run_seed)
@@ -504,12 +523,23 @@ def main():
           img_shape = (1, H, W)
 
           # ── Transforms ───────────────────────────────────────────────────
-          needs_upsample = args.model in ('vit', 'enb0')
-          if needs_upsample:
-              tf = transforms.Compose([transforms.Resize(224)])
-              print(f"  Upsampling images to 224×224 for {args.model}")
+          _aug = transforms.Compose([
+              transforms.RandomHorizontalFlip(),
+              transforms.RandomVerticalFlip(),
+              transforms.RandomRotation(degrees=180),
+          ])
+          if args.model == 'vit':
+              tf_train = transforms.Compose([transforms.Resize(224), transforms.RandomHorizontalFlip(),
+                                             transforms.RandomVerticalFlip(), transforms.RandomRotation(degrees=180)])
+              tf_val   = transforms.Compose([transforms.Resize(224)])
+              print(f"  Upsampling images to 224×224 for {args.model} (train: +flip/rotate aug)")
+          elif args.model == 'enb0':
+              tf_train = _aug
+              tf_val   = None
+              print(f"  Training at native 89×89 for {args.model} (train: +flip/rotate aug)")
           else:
-              tf = None
+              tf_train = None
+              tf_val   = None
 
           # ── Scattering coefficients ───────────────────────────────────────
           scat_shape = None
@@ -528,6 +558,9 @@ def main():
           print(f"Building model: {args.model}")
           model = build_model(args.model, n_classes, img_shape, scat_shape)
           model = model.to(device)
+          if args.compile:
+              model = torch.compile(model)
+              print("  torch.compile() applied")
           n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
           print(f"  Parameters: {n_params:,}")
 
@@ -551,11 +584,11 @@ def main():
                                      args.batch_size, shuffle=False)
               use_scat_only = False
           else:
-              train_dl = make_loader(RadioImageDataset(train_images2, train_labels2, tf),
+              train_dl = make_loader(RadioImageDataset(train_images2, train_labels2, tf_train),
                                      args.batch_size, shuffle=True)
-              val_dl   = make_loader(RadioImageDataset(val_images, val_labels, tf),
+              val_dl   = make_loader(RadioImageDataset(val_images, val_labels, tf_val),
                                      args.batch_size, shuffle=False)
-              test_dl  = make_loader(RadioImageDataset(test_images, test_labels, tf),
+              test_dl  = make_loader(RadioImageDataset(test_images, test_labels, tf_val),
                                      args.batch_size, shuffle=False)
               use_scat_only = False
 
@@ -746,7 +779,7 @@ def main():
         all_run_results.append(fold_results_list)
 
     # ── Multi-run summary ─────────────────────────────────────────────────────
-    if args.n_runs > 1 and args.cv_folds == 1:
+    if args.gen_dir is None and args.n_runs > 1 and args.cv_folds == 1:
         run_results = [rlist[0] for rlist in all_run_results]
 
         print(f"\n{'='*60}")
@@ -818,28 +851,208 @@ def main():
     # One label_fraction_metrics.json is saved per run_out directory so that
     # the notebook's rglob() picks them all up and computes mean ± std.
     # Skipped for scatter-based models (dualssn, scatternet, simplescatternet).
-    _skip_sweep = args.model in ('dualssn', 'scatternet', 'simplescatternet')
-    if _skip_sweep:
-        print(f"\nLabel-fraction sweep skipped for model '{args.model}'.")
+    _skip_sweep = args.skip_sweep or args.model in ('dualssn', 'scatternet', 'simplescatternet')
+
+    # Shared preamble for sweep and gen-aug
+    _H, _W     = images.shape[-2], images.shape[-1]
+    _aug_sw = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(degrees=180),
+    ])
+    if args.model == 'vit':
+        _tf_sw       = transforms.Compose([transforms.Resize(224)])
+        _tf_train_sw = transforms.Compose([transforms.Resize(224), transforms.RandomHorizontalFlip(),
+                                           transforms.RandomVerticalFlip(), transforms.RandomRotation(degrees=180)])
+    elif args.model == 'enb0':
+        _tf_sw       = None
+        _tf_train_sw = _aug_sw
     else:
+        _tf_sw       = None
+        _tf_train_sw = None
+    print(f"  Transforms: val={'Resize(224)' if args.model == 'vit' else 'none'}  "
+          f"train={'+flip/rotate' if args.model in ('vit', 'enb0') else 'none'}")
+    _alpha_sw  = torch.ones(n_classes, dtype=torch.float32, device=device)
+
+    # Val images / labels (rebuilt from val_idx for correctness)
+    _va_images_sw = images[val_idx]
+    _va_labels_sw = (_make_derived(labels[val_idx]) if args.label_set == "derived"
+                     else labels[val_idx][:, label_cols])
+    if args.label_set in ("classical_pure", "initial_pure"):
+        _va_pure      = labels[val_idx][:, 0:5].sum(axis=1) == 1
+        _va_images_sw = _va_images_sw[_va_pure]
+        _va_labels_sw = _va_labels_sw[_va_pure]
+
+    _te_dl_sw = make_loader(
+        RadioImageDataset(test_images, test_labels, _tf_sw),
+        args.batch_size, shuffle=False)
+
+    if args.gen_dir is not None:
+        # ── Generative augmentation experiment ────────────────────────────────
+        GEN_FRACS = [0.5, 1.0, 2.0]
+
+        import zuko
+        from suplat.models.generative_models import FlowMatchingUNet
+
+        _dec_ckpt = torch.load(args.gen_dir / "decoder.pt", map_location="cpu", weights_only=False)
+        _decoder  = FlowMatchingUNet(z_dim=_dec_ckpt["feat_dim"], base_ch=_dec_ckpt["base_ch"])
+        _decoder.load_state_dict(_dec_ckpt["model_state_dict"])
+        _decoder.to(device).eval()
+
+        _nsf_ckpt = torch.load(args.gen_dir / "nsf.pt", map_location="cpu", weights_only=False)
+        _nsf      = zuko.flows.NSF(
+            features=_nsf_ckpt["feat_dim"],
+            context=_nsf_ckpt["n_labels"],
+            transforms=_nsf_ckpt["n_transforms"],
+        )
+        _nsf.load_state_dict(_nsf_ckpt["model_state_dict"])
+        _nsf.to(device).eval()
+
+        _n_initial_labels = _nsf_ckpt["n_labels"]  # 5
+        _gen_out_dir = out_dir / "gen_aug"
+        _gen_out_dir.mkdir(exist_ok=True)
+        _gen_summary = {}
+
+        print(f"\n{'='*60}")
+        print(f"Gen-augmentation experiment  ({args.label_set}, {args.model}, {args.n_runs} run(s))")
+        print(f"Gen dir: {args.gen_dir}")
+        print(f"{'='*60}")
+
+        for _gfrac in GEN_FRACS:
+            _frac_dir = _gen_out_dir / f"frac_{_gfrac:.2f}"
+            _frac_dir.mkdir(exist_ok=True)
+            _frac_run_results = []
+
+            for _ri in range(1, args.n_runs + 1):
+                _run_seed = args.seed + (_ri - 1)
+                _run_dir  = _frac_dir / f"run{_ri}"
+                _run_dir.mkdir(exist_ok=True)
+                _res_path = _run_dir / "results.json"
+
+                if _res_path.exists() and not args.force:
+                    print(f"  frac={_gfrac} run={_ri}: cached — skipping.")
+                    with open(_res_path) as _f:
+                        _frac_run_results.append(json.load(_f))
+                    continue
+
+                torch.manual_seed(_run_seed)
+                np.random.seed(_run_seed)
+
+                # ── Real training images (full set, with pure filter if applicable) ──
+                _tr_im = images[train_idx]
+                _tr_lb = (_make_derived(labels[train_idx]) if args.label_set == "derived"
+                          else labels[train_idx][:, label_cols])
+                _tr_initial = labels[train_idx][:, :_n_initial_labels].astype(np.float32)
+
+                if args.label_set in ("classical_pure", "initial_pure"):
+                    _pm = labels[train_idx][:, 0:5].sum(axis=1) == 1
+                    _tr_im, _tr_lb, _tr_initial = _tr_im[_pm], _tr_lb[_pm], _tr_initial[_pm]
+                elif args.label_set == "pure":
+                    _pm = labels[train_idx].sum(axis=1) == 1
+                    _tr_im, _tr_lb, _tr_initial = _tr_im[_pm], _tr_lb[_pm], _tr_initial[_pm]
+
+                n_real  = len(_tr_im)
+                n_gen   = int(_gfrac * n_real)
+                print(f"\n  frac={_gfrac}  run={_ri}  real={n_real}  gen={n_gen}", flush=True)
+
+                # ── Generate images ────────────────────────────────────────────────
+                # Sample conditions by cycling through training labels
+                _cond_idx = np.resize(np.arange(n_real), n_gen)  # tile if n_gen > n_real
+                _cond     = torch.tensor(_tr_initial[_cond_idx], dtype=torch.float32)
+                _gen_imgs_list, _gen_lbs_list = [], []
+
+                _GEN_BS = 64
+                with torch.no_grad():
+                    for _b0 in range(0, n_gen, _GEN_BS):
+                        _b1   = min(_b0 + _GEN_BS, n_gen)
+                        _cy   = _cond[_b0:_b1].to(device)
+                        _z    = _nsf(_cy).sample()          # (B, feat_dim)
+                        _xgen = _decoder.sample(_z)          # (B, 1, 89, 89) float [0,1]
+                        # Convert to uint8 to match images_filtered.npy dtype
+                        _xgen_u8 = (_xgen.squeeze(1).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                        _gen_imgs_list.append(_xgen_u8)
+                        _gen_lbs_list.append(
+                            (_make_derived(labels[train_idx[_cond_idx[_b0:_b1]]])
+                             if args.label_set == "derived"
+                             else labels[train_idx[_cond_idx[_b0:_b1]]][:, label_cols])
+                        )
+
+                _gen_imgs = np.concatenate(_gen_imgs_list, axis=0)   # (n_gen, 89, 89) uint8
+                _gen_lbs  = np.concatenate(_gen_lbs_list, axis=0)    # (n_gen, n_classes)
+
+                # ── Combine real + generated ───────────────────────────────────────
+                _aug_imgs = np.concatenate([_tr_im, _gen_imgs], axis=0)
+                _aug_lbs  = np.concatenate([_tr_lb, _gen_lbs],  axis=0)
+                print(f"    Augmented training set: {len(_aug_imgs)} total ({n_real} real + {n_gen} gen)", flush=True)
+
+                # ── Train classifier ───────────────────────────────────────────────
+                torch.manual_seed(_run_seed); np.random.seed(_run_seed)
+                _mdl_g = build_model(args.model, n_classes, (1, _H, _W)).to(device)
+                if args.compile:
+                    _mdl_g = torch.compile(_mdl_g)
+                _opt_g = torch.optim.Adam(_mdl_g.parameters(), lr=args.lr, weight_decay=1e-4)
+                _sch_g = torch.optim.lr_scheduler.ReduceLROnPlateau(_opt_g, mode='min', factor=0.5, patience=5)
+                _alpha_g = torch.ones(n_classes, dtype=torch.float32, device=device)
+
+                _tr_dl_g = make_loader(RadioImageDataset(_aug_imgs, _aug_lbs, _tf_train_sw), args.batch_size, shuffle=True)
+                _va_dl_g = make_loader(RadioImageDataset(_va_images_sw, _va_labels_sw, _tf_sw), args.batch_size, shuffle=False)
+
+                _bv_g, _bs_g, _ni_g = float('inf'), None, 0
+                for _ep_g in range(1, args.epochs + 1):
+                    _mdl_g.train()
+                    for _im_g, _lb_g in _tr_dl_g:
+                        _im_g, _lb_g = _im_g.to(device), _lb_g.to(device)
+                        _loss_g = weighted_class_mean_loss(_mdl_g(_im_g), _lb_g, _alpha_g, n_classes)
+                        _opt_g.zero_grad(); _loss_g.backward(); _opt_g.step()
+                    _mdl_g.eval()
+                    _vl_g = 0.0
+                    with torch.no_grad():
+                        for _im_g, _lb_g in _va_dl_g:
+                            _im_g, _lb_g = _im_g.to(device), _lb_g.to(device)
+                            _vl_g += (sum(F.cross_entropy(_mdl_g(_im_g)[:, c, :], _lb_g[:, c])
+                                          for c in range(n_classes)) / n_classes).item() * len(_lb_g)
+                    _vl_g /= len(_va_dl_g.dataset)
+                    _sch_g.step(_vl_g)
+                    if _vl_g < _bv_g:
+                        _bv_g, _bs_g, _ni_g = _vl_g, {k: v.cpu().clone() for k, v in _mdl_g.state_dict().items()}, 0
+                    else:
+                        _ni_g += 1
+                        if _ni_g >= args.patience:
+                            print(f"      Early stop ep {_ep_g}", flush=True); break
+                _mdl_g.load_state_dict(_bs_g)
+
+                # ── Evaluate on test set ───────────────────────────────────────────
+                _mdl_g.eval()
+                _pb_g, _pd_g, _lb_g_all = [], [], []
+                with torch.no_grad():
+                    for _im_g, _lb_g in _te_dl_sw:
+                        _im_g = _im_g.to(device)
+                        _pb   = F.softmax(_mdl_g(_im_g), dim=-1)[:, :, 1].cpu().numpy()
+                        _pb_g.append(_pb); _pd_g.append((_pb >= 0.5).astype(int)); _lb_g_all.append(_lb_g.numpy())
+                _ms_g = evaluate_metrics(np.concatenate(_lb_g_all), np.concatenate(_pd_g), np.concatenate(_pb_g), class_names)
+                print(f"      F1={_ms_g['f1_macro']:.4f}  AUC={_ms_g['auc_macro']:.4f}  Rec={_ms_g['recall_macro']:.4f}  Acc={_ms_g['accuracy']:.4f}", flush=True)
+
+                _res_g = {"gen_frac": _gfrac, "n_real": n_real, "n_gen": n_gen,
+                          "f1_macro": _ms_g["f1_macro"], "auc_macro": _ms_g["auc_macro"],
+                          "accuracy": _ms_g["accuracy"], "recall_macro": _ms_g["recall_macro"]}
+                with open(_res_path, "w") as _f: json.dump(_res_g, _f, indent=2)
+                _frac_run_results.append(_res_g)
+
+            # Aggregate across runs
+            _metrics_agg = {m: float(np.mean([r[m] for r in _frac_run_results]))
+                            for m in ("f1_macro", "auc_macro", "accuracy", "recall_macro")}
+            if args.n_runs > 1:
+                _metrics_agg.update({f"{m}_std": float(np.std([r[m] for r in _frac_run_results]))
+                                     for m in ("f1_macro", "auc_macro", "accuracy", "recall_macro")})
+            _gen_summary[str(_gfrac)] = _metrics_agg
+            print(f"\n  frac={_gfrac}: mean F1={_metrics_agg['f1_macro']:.4f}  AUC={_metrics_agg['auc_macro']:.4f}  Rec={_metrics_agg['recall_macro']:.4f}  Acc={_metrics_agg['accuracy']:.4f}", flush=True)
+
+        with open(_gen_out_dir / "gen_aug_summary.json", "w") as _f:
+            json.dump(_gen_summary, _f, indent=2)
+        print(f"\nGen-aug summary saved → {_gen_out_dir / 'gen_aug_summary.json'}")
+
+    elif not _skip_sweep:
         _FRACS_SUB = [0.01, 0.05, 0.10, 0.25, 0.50]  # 100% loaded from results.json
-        _H, _W     = images.shape[-2], images.shape[-1]
-        _tf_sw     = (transforms.Compose([transforms.Resize(224)])
-                      if args.model in ('vit', 'enb0') else None)
-        _alpha_sw  = torch.ones(n_classes, dtype=torch.float32, device=device)
-
-        # Val images / labels (rebuilt from val_idx for correctness)
-        _va_images_sw = images[val_idx]
-        _va_labels_sw = (_make_derived(labels[val_idx]) if args.label_set == "derived"
-                         else labels[val_idx][:, label_cols])
-        if args.label_set in ("classical_pure", "initial_pure"):
-            _va_pure      = labels[val_idx][:, 0:5].sum(axis=1) == 1
-            _va_images_sw = _va_images_sw[_va_pure]
-            _va_labels_sw = _va_labels_sw[_va_pure]
-
-        _te_dl_sw = make_loader(
-            RadioImageDataset(test_images, test_labels, _tf_sw),
-            args.batch_size, shuffle=False)
 
         print(f"\n{'='*60}")
         print(f"Label-fraction sweep  ({args.label_set}, {args.model}, {args.n_runs} run(s))")
@@ -900,12 +1113,14 @@ def main():
                 torch.manual_seed(_run_seed)
                 np.random.seed(_run_seed)
                 _mdl_sw = build_model(args.model, n_classes, (1, _H, _W)).to(device)
+                if args.compile:
+                    _mdl_sw = torch.compile(_mdl_sw)
                 _opt_sw = torch.optim.Adam(_mdl_sw.parameters(),
                                            lr=args.lr, weight_decay=1e-4)
                 _sch_sw = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     _opt_sw, mode='min', factor=0.5, patience=5)
                 _tr_dl_sw = make_loader(
-                    RadioImageDataset(_tr_im_sw, _tr_lb_sw, _tf_sw),
+                    RadioImageDataset(_tr_im_sw, _tr_lb_sw, _tf_train_sw),
                     args.batch_size, shuffle=True)
 
                 _bv_sw, _bs_sw, _ni_sw = float('inf'), None, 0
@@ -967,6 +1182,9 @@ def main():
                 with open(_frac_cache, "w") as _fh:
                     json.dump(_frac_out, _fh, indent=2)
                 print(f"    Saved → {_frac_cache}", flush=True)
+
+    else:
+        print(f"\nLabel-fraction sweep skipped for model '{args.model}'.")
 
 
 if __name__ == '__main__':

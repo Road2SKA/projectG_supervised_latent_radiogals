@@ -143,6 +143,8 @@ def parse_args():
                     help="Gradient clipping max norm (default: None, no clipping)")
     ap.add_argument("--weight-decay", type=float, default=0.0,
                     help="L2 weight decay for Adam optimizer (default: 0.0)")
+    ap.add_argument("--ema-decay", type=float, default=0.996,
+                    help="EMA momentum for target network update (default: 0.996)")
     ap.add_argument("--dropout", type=float, default=0.2,
                     help="Dropout rate applied after the encoder (default: 0.2)")
     ap.add_argument("--warmup-epochs", type=int, default=0,
@@ -215,7 +217,7 @@ if args.projector == 'mlp' and args.projection_dim is None:
 BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.lr
 NUM_EPOCHS = args.epochs
-EMA_DECAY = 0.996 # Standard BYOL decay; can be tuned if desired but generally works well across settings
+EMA_DECAY = args.ema_decay
 PROJECTION_DIM = args.projection_dim
 HIDDEN_DIM = args.hidden_dim
 MODEL_TYPE = args.model_type
