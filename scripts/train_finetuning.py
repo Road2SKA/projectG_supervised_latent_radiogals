@@ -99,6 +99,22 @@ def parse_args():
         help="Learning rate for fine-tuning.",
     )
     ap.add_argument(
+        "--steplr",
+        action="store_true",
+        help=(
+            "Enable stepwise LR: epochs 0-9 use 5x lr, epochs 10-39 use lr, "
+            "epochs >=40 use lr/5."
+        ),
+    )
+    ap.add_argument(
+        "--layerwise-lr",
+        action="store_true",
+        help=(
+            "Enable layer-wise LR decay: i-th layer (going backward) uses "
+            "lr * 0.75^i."
+        ),
+    )
+    ap.add_argument(
         "--epochs",
         type=int,
         default=10,
@@ -155,15 +171,24 @@ def parse_args():
 
 
 class BYOLFineTuner(nn.Module):
-    def __init__(self, byol_model, num_classes=21, training_mode=3):
+    def __init__(
+        self,
+        byol_model,
+        projection_dim,
+        num_classes=21,
+        training_mode=3,
+    ):
         super().__init__()
 
         self.encoder = byol_model.online_encoder
         self.projector = byol_model.online_projector
         self.training_mode = training_mode
 
-        # BYOL projection_dim = 128 in your case
-        self.classifier = nn.Linear(128, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Linear(projection_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes),
+        )
 
         self.apply_training_mode(training_mode)
 
@@ -214,6 +239,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 checkpoint = torch.load(BYOL_PATH, map_location="cpu", weights_only=True)
 print(checkpoint["config"])
+PROJECTION_DIM = checkpoint["config"]["projection_dim"]
 
 # Data paths
 IMAGES_PATH = args.data_dir / 'images_filtered.npy'
@@ -228,6 +254,9 @@ DATA_SEED = checkpoint["config"]['data_seed']
 F_LABEL = checkpoint["config"]['f_label']
 TRAINING_MODE = args.training_mode
 LEARNING_RATE = args.lr
+USE_STEP_LR = args.steplr
+USE_LAYERWISE_LR = args.layerwise_lr
+LAYERWISE_LR_RHO = 0.8
 N_MODELS = args.n_models
 
 TRAIN_RATIO, TEST_RATIO = 0.70, 0.30
@@ -307,7 +336,7 @@ def build_finetune_model(model_idx):
     run_seed = seed_model_initialization(model_idx)
 
     model = BYOLEfficientNetB0(
-        projection_dim=checkpoint["config"]['projection_dim'],
+        projection_dim=PROJECTION_DIM,
         hidden_dim=checkpoint["config"]['hidden_dim'],
         bn_momentum=0.1,
         feature_compression_mode=checkpoint["config"]['projector'],
@@ -323,6 +352,7 @@ def build_finetune_model(model_idx):
 
     finetune_model = BYOLFineTuner(
         byol_model=model,
+        projection_dim=PROJECTION_DIM,
         num_classes=num_classes,
         training_mode=TRAINING_MODE,
     )
@@ -331,16 +361,75 @@ def build_finetune_model(model_idx):
 
 
 def train_one_model(finetune_model):
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, finetune_model.parameters()),
-        lr=LEARNING_RATE,
-        weight_decay=args.weight_decay,
-    )
+    def iter_leaf_param_groups(module):
+        children = list(module.children())
+        if not children:
+            params = [p for p in module.parameters(recurse=False) if p.requires_grad]
+            if params:
+                yield params
+            return
+
+        for child in children:
+            yield from iter_leaf_param_groups(child)
+
+        own_params = [p for p in module.parameters(recurse=False) if p.requires_grad]
+        if own_params:
+            yield own_params
+
+    def build_layerwise_param_groups(model):
+        # Build groups from output backward:
+        # classifier -> projector -> encoder, each internally reversed.
+        ordered_groups = []
+        for part in (model.classifier, model.projector, model.encoder):
+            part_groups = list(iter_leaf_param_groups(part))
+            ordered_groups.extend(reversed(part_groups))
+
+        param_groups = []
+        seen = set()
+        for i, params in enumerate(ordered_groups):
+            unique_params = [p for p in params if id(p) not in seen]
+            if not unique_params:
+                continue
+            seen.update(id(p) for p in unique_params)
+            lr_scale = LAYERWISE_LR_RHO ** i
+            param_groups.append(
+                {
+                    "params": unique_params,
+                    "lr": LEARNING_RATE * lr_scale,
+                    "lr_scale": lr_scale,
+                }
+            )
+
+        return param_groups
+
+    if USE_LAYERWISE_LR:
+        optimizer = torch.optim.AdamW(
+            build_layerwise_param_groups(finetune_model),
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, finetune_model.parameters()),
+            lr=LEARNING_RATE,
+            weight_decay=args.weight_decay,
+        )
 
     train_losses = []
     test_losses = []
 
+    def get_epoch_lr(epoch):
+        if not USE_STEP_LR:
+            return LEARNING_RATE
+        if epoch < 10:
+            return LEARNING_RATE * 5.0
+        if epoch < 40:
+            return LEARNING_RATE
+        return LEARNING_RATE / 5.0
+
     for epoch in range(NUM_EPOCHS):
+        current_lr = get_epoch_lr(epoch)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr * param_group.get("lr_scale", 1.0)
 
         # ======================
         # TRAIN
@@ -402,6 +491,7 @@ def train_one_model(finetune_model):
 
         print(
             f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
+            f"| LR: {current_lr:.6g} "
             f"| Train: {avg_train_loss:.4f} "
             f"| Test: {avg_test_loss:.4f}"
         )
@@ -500,8 +590,12 @@ for model_idx in range(N_MODELS):
                 "training_mode": TRAINING_MODE,
                 "training_mode_description": TRAINING_MODE_DESCRIPTIONS[TRAINING_MODE],
                 "lr": LEARNING_RATE,
+                "steplr": USE_STEP_LR,
+                "layerwise_lr": USE_LAYERWISE_LR,
+                "layerwise_lr_rho": LAYERWISE_LR_RHO,
                 "weight_decay": args.weight_decay,
                 "epochs": NUM_EPOCHS,
+                "projection_dim": PROJECTION_DIM,
                 "num_classes": num_classes,
                 "data_seed": DATA_SEED,
                 "initialization_seed": run_seed,
