@@ -28,9 +28,18 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# 20-column label names matching the umap_*.parquet files saved by train_byol.py
+_UMAP_LABEL_COLS = [
+    'fri', 'frii', 'hybrid', 'spiral', 'relaxed',
+    'cshaped', 'sshaped', 'misaligned', 'wings', 'xshaped',
+    'straight', 'multihotspots', 'continuous', 'banding', 'onesided',
+    'restarted', 'cluster', 'merger', 'diffuse', 'unknown',
+]
 
 SEED = 42
 
@@ -111,23 +120,50 @@ def plot_umap_minimal(embedding_2d, all_lf, save_path):
     plt.close()
 
 
+def _get_splits_dir(run_dir: Path) -> Path:
+    import torch as _torch
+    ckpt = _torch.load(run_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
+    seed = int(ckpt["config"]["data_seed"])
+    return run_dir.parent / "data_splits" / str(seed)
+
+
+def _load_idx(splits_dir: Path, data_dir: Path, filename: str) -> np.ndarray:
+    p = splits_dir / filename
+    return np.load(p if p.exists() else data_dir / filename)
+
+
 def run_dir_main(args):
     """Reproduce train_byol.py UMAP plots from a completed run directory."""
     from suplat.utils.plotting import fit_umap, plot_umap_single, plot_umap_outliers
 
-    run_dir  = args.run_dir
-    data_dir = run_dir / 'data'
-    umap_dir = run_dir / 'figures' / 'umap'
+    run_dir    = args.run_dir
+    data_dir   = run_dir / 'data'
+    byol_dir   = data_dir / 'byol'
+    splits_dir = _get_splits_dir(run_dir)
+    umap_dir   = run_dir / 'figures' / 'umap'
     umap_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Fast path: --minimal with pre-computed coords ─────────────────────────
-    coords_path = data_dir / 'umap_all_coords.npy'
+    _proj_parquet = data_dir / 'umap' / 'umap_projections.parquet'
+    _new_coords   = data_dir / 'umap' / 'umap_projections_coords.npy'
+    coords_path   = _new_coords if _new_coords.exists() else data_dir / 'umap_all_coords.npy'
+
+    if args.minimal and _proj_parquet.exists():
+        print(f"Loading pre-computed UMAP coordinates from {_proj_parquet}...")
+        _df     = pd.read_parquet(_proj_parquet, columns=['umap_x', 'umap_y'] + _UMAP_LABEL_COLS)
+        _all_2d = _df[['umap_x', 'umap_y']].values
+        _all_lf = _df[_UMAP_LABEL_COLS].values.astype(np.int64)
+        print(f"  Coords: {_all_2d.shape}  Labels: {_all_lf.shape}")
+        plot_umap_minimal(_all_2d, _all_lf, umap_dir / 'umap_all_initial_minimal.png')
+        print(f"\nMinimal UMAP saved to {umap_dir}/")
+        return
+
     if args.minimal and coords_path.exists():
         print(f"Loading pre-computed UMAP coordinates from {coords_path}...")
         _all_2d = np.load(coords_path)
 
-        labelled_train_idx = np.load(data_dir / 'labelled_train_idx.npy')
-        test_idx           = np.load(data_dir / 'test_idx.npy')
+        labelled_train_idx = _load_idx(splits_dir, data_dir, 'labelled_train_idx.npy')
+        test_idx           = _load_idx(splits_dir, data_dir, 'test_idx.npy')
 
         labels_path = args.data_dir / 'labels_filtered.npy'
         if not labels_path.exists():
@@ -136,9 +172,9 @@ def run_dir_main(args):
         labels_full = np.load(labels_path)
 
         # Use mmap to get projection lengths without loading full arrays
-        _tr_proj_path = (data_dir / 'train_projections.npy'
-                         if (data_dir / 'train_projections.npy').exists()
-                         else data_dir / 'labelled_train_projections.npy')
+        _tr_proj_path = (byol_dir / 'train_projections.npy'
+                         if (byol_dir / 'train_projections.npy').exists()
+                         else byol_dir / 'labelled_train_projections.npy')
         _n_tr = len(np.load(_tr_proj_path, mmap_mode='r'))
 
         _lf_train = labels_full[labelled_train_idx][:_n_tr]
@@ -148,12 +184,12 @@ def run_dir_main(args):
         _val_idx_path = data_dir / 'val_idx.npy'
         if _val_idx_path.exists():
             val_idx = np.load(_val_idx_path)
-            _n_va = len(np.load(data_dir / 'val_projections.npy', mmap_mode='r'))
+            _n_va = len(np.load(byol_dir / 'val_projections.npy', mmap_mode='r'))
             _lf_val = labels_full[val_idx][:_n_va]
         else:
             _lf_val = None
 
-        _unlab_proj_path = data_dir / 'unlabelled_train_projections.npy'
+        _unlab_proj_path = byol_dir / 'unlabelled_train_projections.npy'
         if _unlab_proj_path.exists():
             _n_ul = len(np.load(_unlab_proj_path, mmap_mode='r'))
         else:
@@ -175,15 +211,15 @@ def run_dir_main(args):
 
     # ── Load projections ──────────────────────────────────────────────────────
     print("Loading projections...")
-    train_proj = np.load(data_dir / 'train_projections.npy')
-    val_proj   = np.load(data_dir / 'val_projections.npy')
-    test_proj  = np.load(data_dir / 'test_projections.npy')
+    train_proj = np.load(byol_dir / 'train_projections.npy')
+    val_proj   = np.load(byol_dir / 'val_projections.npy')
+    test_proj  = np.load(byol_dir / 'test_projections.npy')
     print(f"  Train: {train_proj.shape}  Val: {val_proj.shape}  Test: {test_proj.shape}")
 
     # ── Load split indices ────────────────────────────────────────────────────
-    labelled_train_idx = np.load(data_dir / 'labelled_train_idx.npy')
+    labelled_train_idx = _load_idx(splits_dir, data_dir, 'labelled_train_idx.npy')
     val_idx            = np.load(data_dir / 'val_idx.npy')
-    test_idx           = np.load(data_dir / 'test_idx.npy')
+    test_idx           = _load_idx(splits_dir, data_dir, 'test_idx.npy')
 
     # ── Load full 20-column labels from the original dataset ─────────────────
     labels_path = args.data_dir / 'labels_filtered.npy'
@@ -205,7 +241,7 @@ def run_dir_main(args):
 
     # ── "all" UMAP: unlabelled train (if any) + labelled train + val + test ──
     print("\nGenerating 'all' UMAP (train + val + test)...")
-    _unlab_proj_path = data_dir / 'unlabelled_train_projections.npy'
+    _unlab_proj_path = byol_dir / 'unlabelled_train_projections.npy'
     if _unlab_proj_path.exists():
         _unlab_proj = np.load(_unlab_proj_path)
         _n_ul = len(_unlab_proj)
@@ -224,9 +260,23 @@ def run_dir_main(args):
     _mask_va = np.zeros(_n_all, dtype=bool); _mask_va[_n_ul + _n_tr:_n_ul + _n_tr + _n_va] = True
     _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul + _n_tr + _n_va:] = True
 
-    _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
-    np.save(data_dir / 'umap_all_coords.npy', _all_2d)
-    print(f"  Saved UMAP coordinates: {data_dir / 'umap_all_coords.npy'}")
+    umap_data_dir = data_dir / 'umap'
+    umap_data_dir.mkdir(parents=True, exist_ok=True)
+    _proj_parquet_full = umap_data_dir / 'umap_projections.parquet'
+    if _proj_parquet_full.exists():
+        _pq = pd.read_parquet(_proj_parquet_full, columns=['umap_x', 'umap_y'] + _UMAP_LABEL_COLS)
+        if len(_pq) == _n_all:
+            print(f"  Loading UMAP coordinates from {_proj_parquet_full}...")
+            _all_2d = _pq[['umap_x', 'umap_y']].values
+            _all_lf = _pq[_UMAP_LABEL_COLS].values.astype(np.int64)
+        else:
+            print(f"  Parquet row count ({len(_pq)}) != expected ({_n_all}), fitting UMAP...")
+            _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
+            np.save(umap_data_dir / 'umap_projections_coords.npy', _all_2d)
+    else:
+        _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
+        np.save(umap_data_dir / 'umap_projections_coords.npy', _all_2d)
+        print(f"  Saved UMAP coordinates: {umap_data_dir / 'umap_projections_coords.npy'}")
 
     _split_masks_all = {}
     if _n_ul > 0:
@@ -243,7 +293,7 @@ def run_dir_main(args):
     # ── "test" UMAP: test only ────────────────────────────────────────────────
     print("\nGenerating 'test' UMAP...")
     _, _test_2d = fit_umap(test_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
-    np.save(data_dir / 'umap_test_coords.npy', _test_2d)
+    np.save(umap_data_dir / 'umap_test_coords.npy', _test_2d)
 
     _split_masks_test = {'Test': np.ones(_n_te, dtype=bool)}
     for _col in ('initial', 'morphology'):

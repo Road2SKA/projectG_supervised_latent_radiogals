@@ -166,9 +166,10 @@ def load_encoder(checkpoint_path, device, model_type=None):
         model_type = "convnet"
     print(f"  Model type: {model_type}")
 
-    # Read feature_compression_mode from checkpoint; default 'pca' for back-compat
+    # Read feature_compression_mode from checkpoint; default 'pca' for back-compat.
+    # Older checkpoints store this as 'projector' instead of 'feature_compression_mode'.
     cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-    fcm         = cfg.get("feature_compression_mode", "pca")
+    fcm         = cfg.get("feature_compression_mode") or cfg.get("projector", "pca")
     encoder_dim = cfg.get("encoder_dim", 512)
     proj_dim    = cfg.get("projection_dim", 256)
     hidden_dim  = cfg.get("hidden_dim", 4096)
@@ -189,8 +190,16 @@ def load_encoder(checkpoint_path, device, model_type=None):
     else:
         model_cls, model_kwargs = MODEL_TYPE_MAP[model_type]
         if model_cls is BYOLEfficientNetB0:
-            model_kwargs = {**model_kwargs, "feature_compression_mode": fcm}
+            model_kwargs = {
+                **model_kwargs,
+                "feature_compression_mode": fcm,
+                "projection_dim": proj_dim,
+                "hidden_dim": hidden_dim,
+            }
         model = model_cls(**model_kwargs)
+    # Strip _orig_mod. prefix inserted by torch.compile before matching keys
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()

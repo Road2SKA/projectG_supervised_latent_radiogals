@@ -251,7 +251,14 @@ class PCAProjection(nn.Module):
         super().__init__()
         self.variance_threshold = variance_threshold
         self.n_components = n_components  # if set, overrides variance_threshold
-        self._fitted = False
+        # Pre-register buffers as None so load_state_dict can restore them
+        self.register_buffer('mean_', None)
+        self.register_buffer('active_mask_', None)
+        self.register_buffer('components_', None)
+
+    @property
+    def _fitted(self) -> bool:
+        return self.components_ is not None
 
     def fit(self, X: torch.Tensor):
         """
@@ -277,7 +284,6 @@ class PCAProjection(nn.Module):
             n_comp = int((cumvar < self.variance_threshold).sum().item()) + 1
         self.register_buffer('components_', Vh[:n_comp])  # (n_comp, n_active)
         self.variance_explained_ = float(((S[:n_comp] ** 2).sum() / (S ** 2).sum()).item())
-        self._fitted = True
 
     @property
     def out_dim(self) -> int:
@@ -368,7 +374,7 @@ class BYOLEfficientNetB0(nn.Module):
             out_dim=pca_dim, bn_momentum=bn_momentum
         )
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, return_online_proj=False):  # [VICReg]
         if self.feature_compression_mode == 'pca' and self.online_predictor is None:
             raise RuntimeError("Call fit_pca() before the first forward pass")
 
@@ -388,6 +394,10 @@ class BYOLEfficientNetB0(nn.Module):
             target_proj_1 = self.target_projector(target_repr_1)
             target_proj_2 = self.target_projector(target_repr_2)
 
+        # [VICReg] optionally expose online projections for VICReg regularisation
+        if return_online_proj:
+            return (online_pred_1, online_pred_2, target_proj_1, target_proj_2,
+                    online_proj_1, online_proj_2)
         return online_pred_1, online_pred_2, target_proj_1, target_proj_2
 
     @torch.no_grad()
@@ -466,7 +476,7 @@ class BYOLPretrainedBackbone(nn.Module):
             out_dim=pca_dim, bn_momentum=bn_momentum
         )
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, return_online_proj=False):  # [VICReg]
         if self.feature_compression_mode == 'pca' and self.online_predictor is None:
             raise RuntimeError("Call fit_pca() before the first forward pass")
 
@@ -486,6 +496,10 @@ class BYOLPretrainedBackbone(nn.Module):
             target_proj_1 = self.target_projector(target_repr_1)
             target_proj_2 = self.target_projector(target_repr_2)
 
+        # [VICReg] optionally expose online projections for VICReg regularisation
+        if return_online_proj:
+            return (online_pred_1, online_pred_2, target_proj_1, target_proj_2,
+                    online_proj_1, online_proj_2)
         return online_pred_1, online_pred_2, target_proj_1, target_proj_2
 
     @torch.no_grad()
@@ -585,7 +599,7 @@ class BYOLEfficient(nn.Module):
             out_dim=pca_dim, bn_momentum=bn_momentum
         )
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, return_online_proj=False):  # [VICReg]
         """
         Forward pass for two augmented views.
 
@@ -616,6 +630,10 @@ class BYOLEfficient(nn.Module):
             target_proj_1 = self.target_projector(target_repr_1)
             target_proj_2 = self.target_projector(target_repr_2)
 
+        # [VICReg] optionally expose online projections for VICReg regularisation
+        if return_online_proj:
+            return (online_pred_1, online_pred_2, target_proj_1, target_proj_2,
+                    online_proj_1, online_proj_2)
         return online_pred_1, online_pred_2, target_proj_1, target_proj_2
 
     @torch.no_grad()
