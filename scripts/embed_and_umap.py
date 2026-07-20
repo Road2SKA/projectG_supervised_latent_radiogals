@@ -52,6 +52,7 @@ from suplat.models.byol_models import (
     BYOLEfficient, BYOLEfficientNetB0, BYOLPretrainedBackbone, BYOLOriginal,
     create_resnet18_backbone, create_resnet50_backbone, create_convnext_tiny_backbone,
 )
+from suplat.models.ijepa_models import IJEPAModel
 from suplat.data.eval_dataset import EvalDataset, DATASET_REGISTRY
 from suplat.data.catalogue import Catalogue
 
@@ -157,6 +158,42 @@ def load_encoder(checkpoint_path, device, model_type=None):
         state_dict = checkpoint["state_dict"]
     else:
         state_dict = checkpoint
+
+    # ── I-JEPA checkpoint ────────────────────────────────────────────────────
+    cfg_method = checkpoint.get("config", {}).get("method") if isinstance(checkpoint, dict) else None
+    if cfg_method == "jepa":
+        cfg = checkpoint.get("config", {})
+        print("  Method: I-JEPA (ViT encoder)")
+        jepa_model = IJEPAModel(
+            img_size   = cfg.get("img_size",      96),
+            patch_size = cfg.get("patch_size",     8),
+            in_chans   = 1,
+            embed_dim  = cfg.get("vit_embed_dim", 192),
+            depth      = cfg.get("vit_depth",       9),
+            num_heads  = cfg.get("vit_num_heads",   3),
+            pred_dim   = cfg.get("pred_dim",       96),
+            pred_depth = cfg.get("pred_depth",      6),
+        )
+        jepa_model.load_state_dict(state_dict, strict=False)
+        jepa_model.to(device)
+        jepa_model.eval()
+
+        # Wrap so that the rest of this script can call
+        #   projector(encoder(imgs)) and get (B, D) embeddings.
+        class _JEPAEncoderWrapper(torch.nn.Module):
+            def __init__(self, vit):
+                super().__init__()
+                self._vit = vit
+            def forward(self, x):
+                import torch.nn.functional as _F
+                x = _F.pad(x, (3, 4, 3, 4), mode='reflect')  # 89 → 96
+                return self._vit.get_embedding(x)             # (B, D)
+
+        encoder   = _JEPAEncoderWrapper(jepa_model.online_encoder)
+        projector = torch.nn.Identity()
+        print(f"  Projector output dim: {jepa_model.online_encoder.embed_dim} (ViT mean-pool)")
+        return encoder, projector
+    # ── end I-JEPA ──────────────────────────────────────────────────────────
 
     # Resolve model type
     if model_type is None:

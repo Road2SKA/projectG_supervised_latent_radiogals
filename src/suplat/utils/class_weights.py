@@ -14,12 +14,18 @@ SCORE_1 = ["fri", "frii", "hybrid", "straight", "continuous"]
 TIERS   = [(4, SCORE_4), (3, SCORE_3), (2, SCORE_2), (1, SCORE_1)]
 
 LABEL_SETS = {
-    "classical":   ["fri", "frii"],
-    "initial":     ["fri", "frii", "hybrid", "spiral", "relaxed"],
-    "morphology":  ["cshaped", "sshaped", "misaligned", "wings", "xshaped",
-                    "straight", "multihotspots", "continuous", "banding", "onesided", "restarted"],
-    "environment": ["cluster", "merger", "diffuse", "unknown"],
-    "all":         LABEL_COLS,
+    "classical":        ["fri", "frii"],
+    "classical_pure":   ["fri", "frii"],
+    "initial":          ["fri", "frii", "hybrid", "spiral", "relaxed"],
+    "initial_pure":     ["fri", "frii", "hybrid", "spiral", "relaxed"],
+    "morphology":       ["cshaped", "sshaped", "misaligned", "wings", "xshaped",
+                         "straight", "multihotspots", "continuous", "banding", "onesided", "restarted"],
+    "morphology_pure":  ["cshaped", "sshaped", "misaligned", "wings", "xshaped",
+                         "straight", "multihotspots", "continuous", "banding", "onesided", "restarted"],
+    "environment":      ["cluster", "merger", "diffuse", "unknown"],
+    "environment_pure": ["cluster", "merger", "diffuse", "unknown"],
+    "all":              LABEL_COLS,
+    "all_pure":         LABEL_COLS,
 }
 
 _LABEL_COL_IDX = {c: i for i, c in enumerate(LABEL_COLS)}

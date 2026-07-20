@@ -43,6 +43,7 @@ from suplat.models.byol_models import (
     create_convnext_tiny_backbone,
 )
 from suplat.trainer.trainer import (byol_loss, get_warmup_lr, get_supervision_weight,
+                                    get_ema_decay,
                                     extract_embeddings_from_loader,
                                     extract_raw_embeddings_from_loader,
                                     vicreg_var_cov_loss, effective_rank,  # [VICReg]
@@ -137,14 +138,16 @@ def parse_args():
     ap.add_argument("--epochs", type=int, default=100,
                     help="Number of training epochs (default: 100)")
     # Gradient and optimization
-    ap.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "step", "cosine"],
-                    help="Learning rate schedule: 'constant', 'step' (step decay at 70%% of epochs, gamma=0.2), or 'cosine' (cosine annealing to 0) (default: constant)")
+    ap.add_argument("--lr-schedule", type=str, default=None, choices=["constant", "step", "cosine"],
+                    help="Learning rate schedule: 'constant', 'step' (step decay at 70%% of epochs, gamma=0.2), or 'cosine' (cosine annealing to 0). "
+                         "Default: 'constant' for byol, 'cosine' for jepa.")
     ap.add_argument("--grad-clip", type=float, default=None,
                     help="Gradient clipping max norm (default: None, no clipping)")
     ap.add_argument("--weight-decay", type=float, default=0.0,
                     help="L2 weight decay for Adam optimizer (default: 0.0)")
-    ap.add_argument("--ema-decay", type=float, default=0.996,
-                    help="EMA momentum for target network update (default: 0.996)")
+    ap.add_argument("--ema-decay", type=float, default=None,
+                    help="EMA momentum for target network update. "
+                         "Default: 0.996 for byol; cosine 0.996→0.9999 for jepa (pass a value to override).")
     ap.add_argument("--dropout", type=float, default=0.2,
                     help="Dropout rate applied after the encoder (default: 0.2)")
     ap.add_argument("--warmup-epochs", type=int, default=0,
@@ -192,6 +195,10 @@ def parse_args():
     ap.add_argument("--no-protege-pca", action="store_false", dest="protege_pca",
                     help="Disable PCA dimensionality reduction before Protege GP (on by default)")
 
+    # SSL method selection
+    ap.add_argument("--method", choices=["byol", "jepa"], default="byol",
+                    help="SSL method: 'byol' (default) or 'jepa' (I-JEPA with ViT-Tiny).")
+
     # [VICReg] anti-collapse regularisation (default 0.0 = off; behaviour unchanged)
     ap.add_argument("--vicreg-var-weight", type=float, default=0.0,
                     help="Weight on VICReg variance hinge (try ~25 for mlp/none projector).")
@@ -207,6 +214,18 @@ def parse_args():
 # CONFIGURATION
 # =============================================================================
 args = parse_args()
+
+# Apply method-specific defaults for args that were not explicitly set
+if args.method == 'jepa':
+    if args.lr_schedule is None:
+        args.lr_schedule = 'cosine'
+    if args.ema_decay is None:
+        args.ema_decay = 0.996   # start of cosine schedule; end is fixed at 0.9999
+else:  # byol
+    if args.lr_schedule is None:
+        args.lr_schedule = 'constant'
+    if args.ema_decay is None:
+        args.ema_decay = 0.996
 
 if args.projector == 'mlp' and args.projection_dim is None:
     import sys
@@ -273,8 +292,8 @@ OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 SPLITS_DIR = OUTPUT_BASE / 'data_splits' / str(DATA_SEED)
 SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Create run directory — include projector type to avoid collisions with train_byol.py
-BYOL_RUNS_DIR = OUTPUT_BASE / 'byol_runs'
+# Create run directory — BYOL runs go in byol_runs/, JEPA runs in ijepa_runs/
+BYOL_RUNS_DIR = OUTPUT_BASE / ('ijepa_runs' if args.method == 'jepa' else 'byol_runs')
 BYOL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
@@ -353,16 +372,23 @@ print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"CUDA version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
 print(f"{'='*70}")
-print(f"Model type:     {MODEL_TYPE}")
-print(f"Projector:      {PROJECTOR}")
-if PROJECTOR == 'pca':
-    if PROJECTION_DIM is not None:
-        print(f"PCA components: {PROJECTION_DIM} (fixed, re-fitted each epoch)")
-    else:
-        print(f"PCA components: 95% variance threshold (re-fitted each epoch)")
-elif PROJECTOR == 'mlp':
-    print(f"Projection dim: {PROJECTION_DIM}")
-print(f"Hidden dim:     {HIDDEN_DIM}")
+if args.method == 'jepa':
+    print(f"Method:         I-JEPA (ViT-Tiny encoder)")
+else:
+    print(f"Model type:     {MODEL_TYPE}")
+    print(f"Projector:      {PROJECTOR}")
+    if PROJECTOR == 'pca':
+        if PROJECTION_DIM is not None:
+            print(f"PCA components: {PROJECTION_DIM} (fixed, re-fitted each epoch)")
+        else:
+            print(f"PCA components: 95% variance threshold (re-fitted each epoch)")
+    elif PROJECTOR == 'mlp':
+        print(f"Projection dim: {PROJECTION_DIM}")
+    print(f"Hidden dim:     {HIDDEN_DIM}")
+    print(f"Weighting:      {args.weighting}")
+    print(f"Class weight:   {f'mode={CLASS_WEIGHT_MODE} strength={CLASS_WEIGHT_STRENGTH}' if CLASS_WEIGHT_MODE else 'None (uniform)'}")
+    print(f"F_label:        {F_LABEL}")
+    print(f"Compile:        {'enabled' if USE_COMPILE else 'disabled'}")
 print(f"Dataset:        {DATASET_NAME}")
 print(f"Data dir:       {args.data_dir}")
 print(f"Label type:     {args.label_type} ({label_dims} dims)")
@@ -372,11 +398,7 @@ print(f"Epochs:         {NUM_EPOCHS}")
 print(f"Warmup epochs:  {WARMUP_EPOCHS}")
 print(f"Grad clip:      {GRAD_CLIP if GRAD_CLIP else 'None'}")
 print(f"EMA decay:      {EMA_DECAY}")
-print(f"Weighting:      {args.weighting}")
-print(f"Class weight:   {f'mode={CLASS_WEIGHT_MODE} strength={CLASS_WEIGHT_STRENGTH}' if CLASS_WEIGHT_MODE else 'None (uniform)'}")
-print(f"F_label:        {F_LABEL}")
 print(f"Num workers:    {NUM_WORKERS}")
-print(f"Compile:        {'enabled' if USE_COMPILE else 'disabled'}")
 print(f"Device:         {device}")
 if SUBSAMPLE_SIZE:
     print(f"Subsampling:    {SUBSAMPLE_SIZE} samples")
@@ -923,6 +945,259 @@ train_idx, test_idx = train_test_split(all_idx, test_size=TEST_RATIO, random_sta
 train_images, train_labels = images[train_idx], labels[train_idx]
 test_images  = images[test_idx]
 test_labels  = labels[test_idx]
+
+# =============================================================================
+# I-JEPA TRAINING PATH  (args.method == 'jepa')
+# All code below is skipped when using the default BYOL method.
+# =============================================================================
+if args.method == 'jepa':
+    import torch.nn.functional as _F  # may not be imported at module level
+    from suplat.data.ijepa_mask_sampler import (
+        MultiBlockMaskSampler, IJEPADataset, jepa_collate_fn)
+    from suplat.models.ijepa_models import IJEPAModel
+    from suplat.trainer.trainer import jepa_loss as _jepa_loss, effective_rank
+
+    # --- ViT / model hyper-parameters (follow plan defaults) -----------------
+    _VIT_EMBED_DIM  = 192
+    _VIT_DEPTH      = 9
+    _VIT_HEADS      = 3
+    _VIT_MLP_RATIO  = 4.0
+    _PATCH_SIZE     = 8
+    _IMG_SIZE       = 96
+    _PRED_DIM       = 96
+    _PRED_DEPTH     = 6
+    _PRED_HEADS     = 3
+
+    print(f"\n{'='*70}")
+    print("I-JEPA TRAINING")
+    print(f"{'='*70}")
+    print(f"ViT-Tiny: D={_VIT_EMBED_DIM}  depth={_VIT_DEPTH}  "
+          f"heads={_VIT_HEADS}  patch={_PATCH_SIZE}px")
+    print(f"Predictor: D_pred={_PRED_DIM}  depth={_PRED_DEPTH}  heads={_PRED_HEADS}")
+    print(f"Grid: {_IMG_SIZE}x{_IMG_SIZE} / {_PATCH_SIZE}x{_PATCH_SIZE} = "
+          f"{(_IMG_SIZE//_PATCH_SIZE)**2} patches")
+
+    # --- DataLoaders: ALL images for self-supervised training ----------------
+    _nw_jepa  = NUM_WORKERS if use_cuda else 0
+    _sampler  = MultiBlockMaskSampler(grid_size=(12, 12))
+    _all_imgs = images   # N × 89 × 89, float32
+    _jepa_ds  = IJEPADataset(_all_imgs, sampler=_sampler)
+    _jepa_loader = torch.utils.data.DataLoader(
+        _jepa_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
+        num_workers=_nw_jepa, pin_memory=use_cuda,
+        collate_fn=jepa_collate_fn,
+    )
+
+    # --- Model ---------------------------------------------------------------
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+
+    _jepa_model = IJEPAModel(
+        img_size=_IMG_SIZE, patch_size=_PATCH_SIZE, in_chans=1,
+        embed_dim=_VIT_EMBED_DIM, depth=_VIT_DEPTH,
+        num_heads=_VIT_HEADS, mlp_ratio=_VIT_MLP_RATIO,
+        pred_dim=_PRED_DIM, pred_depth=_PRED_DEPTH, pred_heads=_PRED_HEADS,
+    ).to(device)
+
+    _total_p     = sum(p.numel() for p in _jepa_model.parameters())
+    _trainable_p = sum(p.numel() for p in _jepa_model.parameters() if p.requires_grad)
+    print(f"Total parameters:     {_total_p:,}")
+    print(f"Trainable parameters: {_trainable_p:,}")
+
+    # --- Optimizer and scheduler ---------------------------------------------
+    _opt = torch.optim.Adam(_jepa_model.parameters(),
+                             lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    _sched_eps = max(NUM_EPOCHS - WARMUP_EPOCHS, 1)
+    if LR_SCHEDULE == "step":
+        _sched = torch.optim.lr_scheduler.MultiStepLR(
+            _opt, milestones=[int(0.7 * _sched_eps)], gamma=0.2)
+    elif LR_SCHEDULE == "cosine":
+        _sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            _opt, T_max=_sched_eps, eta_min=0)
+    else:
+        _sched = torch.optim.lr_scheduler.ConstantLR(_opt, factor=1.0)
+
+    _jepa_history = {'train_jepa_loss': [], 'effective_rank': [], 'lr': []}
+    _best_loss = float('inf')
+    _best_state = None
+
+    print(f"\n{'='*70}")
+    print("STARTING I-JEPA TRAINING")
+    print(f"{'='*70}\n")
+
+    for _epoch in range(NUM_EPOCHS):
+        # LR warmup
+        if _epoch < WARMUP_EPOCHS:
+            _wlr = LEARNING_RATE * (_epoch + 1) / WARMUP_EPOCHS
+            for _pg in _opt.param_groups:
+                _pg['lr'] = _wlr
+
+        # Cosine EMA schedule: 0.996 → 0.9999 over training (I-JEPA paper default)
+        _cur_ema = get_ema_decay(_epoch, NUM_EPOCHS, schedule='cosine',
+                                 start_decay=EMA_DECAY, end_decay=0.9999)
+
+        _jepa_model.train()
+        _total_loss  = 0.0
+        _rank_buf    = []
+
+        _pbar = tqdm(_jepa_loader, desc=f"Epoch {_epoch+1}/{NUM_EPOCHS}")
+        for _imgs, _ctx_ids, _tgt_ids_list in _pbar:
+            _imgs = _imgs.to(device)
+            _preds, _tgts = _jepa_model(_imgs, _ctx_ids, _tgt_ids_list)
+            _loss = _jepa_loss(_preds, _tgts)
+
+            _opt.zero_grad(set_to_none=True)
+            _loss.backward()
+            if GRAD_CLIP:
+                torch.nn.utils.clip_grad_norm_(_jepa_model.parameters(), GRAD_CLIP)
+            _opt.step()
+            _jepa_model.update_target_network(momentum=_cur_ema)
+
+            _total_loss += _loss.item()
+            # Accumulate target tokens for RankMe (mean-pool per sample)
+            if len(_rank_buf) * _imgs.size(0) < 4096:
+                _mean_tgt = _tgts.detach().float().mean(dim=1).cpu()  # (B, D)
+                _rank_buf.append(_mean_tgt)
+            _pbar.set_postfix({'jepa': f'{_loss.item():.4f}'})
+
+        _avg_loss = _total_loss / len(_jepa_loader)
+        _rank = (effective_rank(torch.cat(_rank_buf, dim=0))
+                 if _rank_buf else float('nan'))
+        _cur_lr = _opt.param_groups[0]['lr']
+
+        _jepa_history['train_jepa_loss'].append(_avg_loss)
+        _jepa_history['effective_rank'].append(_rank)
+        _jepa_history['lr'].append(_cur_lr)
+
+        print(f"Epoch {_epoch+1:>4}/{NUM_EPOCHS} | t_jepa: {_avg_loss:.4f} "
+              f"| rank: {_rank:.1f} | lr: {_cur_lr:.2e} | ema: {_cur_ema:.4f}")
+
+        # Save last epoch as best (self-supervised, no held-out criterion)
+        _best_loss  = _avg_loss
+        _best_state = {k: v.cpu().clone() for k, v in _jepa_model.state_dict().items()}
+
+        if _epoch >= WARMUP_EPOCHS:
+            _sched.step()
+
+    print(f"\n{'='*70}")
+    print("I-JEPA TRAINING COMPLETE")
+    print(f"Best train loss: {_best_loss:.4f}")
+    print(f"{'='*70}\n")
+
+    # --- Save checkpoint -----------------------------------------------------
+    _jepa_model.load_state_dict(_best_state)
+    _chk_path = OUTPUT_DIR / 'byol_model_best.pt'
+    torch.save({
+        'model_state_dict': _jepa_model.state_dict(),
+        'epoch': NUM_EPOCHS,
+        'best_val_loss': _best_loss,
+        'history': _jepa_history,
+        'config': {
+            'method': 'jepa',
+            'model_type': 'jepa',
+            'vit_embed_dim': _VIT_EMBED_DIM,
+            'vit_depth': _VIT_DEPTH,
+            'vit_num_heads': _VIT_HEADS,
+            'patch_size': _PATCH_SIZE,
+            'img_size': _IMG_SIZE,
+            'pred_dim': _PRED_DIM,
+            'pred_depth': _PRED_DEPTH,
+            'batch_size': BATCH_SIZE,
+            'learning_rate': LEARNING_RATE,
+            'num_epochs': NUM_EPOCHS,
+            'ema_decay': EMA_DECAY,
+            'data_seed': DATA_SEED,
+        },
+    }, _chk_path)
+    print(f"Checkpoint saved to {_chk_path}")
+    np.save(BYOL_DIR / 'training_history.npy', _jepa_history)
+
+    # --- Training curve plot -------------------------------------------------
+    if not args.no_plot_history:
+        _fig_h, _ax_h = plt.subplots(figsize=(8, 4))
+        _ax_h.plot(_jepa_history['train_jepa_loss'], label='I-JEPA loss')
+        _ax_h.set_xlabel('Epoch')
+        _ax_h.set_ylabel('MSE loss')
+        _ax_h.set_title('I-JEPA training loss')
+        _ax_h.legend()
+        plt.tight_layout()
+        _fig_h.savefig(FIGURES_DIR / 'jepa_training_loss.png', dpi=150)
+        plt.close(_fig_h)
+
+    # --- Embedding extraction ------------------------------------------------
+    def _jepa_extract(img_arr):
+        """Extract mean-pooled ViT embeddings from a numpy (N, 89, 89) array."""
+        _jepa_model.eval()
+        _all_emb = []
+        _imgs_t = torch.from_numpy(img_arr[:, None].astype(np.float32))
+        _imgs_t = _F.pad(_imgs_t, (3, 4, 3, 4), mode='reflect')  # → 96×96
+        with torch.no_grad():
+            for _i in range(0, len(_imgs_t), BATCH_SIZE):
+                _b = _imgs_t[_i:_i + BATCH_SIZE].to(device)
+                _all_emb.append(_jepa_model.online_encoder.get_embedding(_b).float().cpu().numpy())
+        return np.vstack(_all_emb)
+
+    print("\nExtracting embeddings...")
+    _train_enc = _jepa_extract(train_images)
+    _test_enc  = _jepa_extract(test_images)
+    print(f"  Train: {_train_enc.shape}  Test: {_test_enc.shape}")
+
+    np.save(BYOL_DIR / 'labelled_train_projections.npy', _train_enc)
+    np.save(BYOL_DIR / 'test_projections.npy',            _test_enc)
+    np.save(BYOL_DIR / 'labelled_train_encodings.npy',    _train_enc)
+    np.save(BYOL_DIR / 'test_encodings.npy',              _test_enc)
+
+    _f_str = (str(F_LABEL).rstrip('0').rstrip('.')
+              if '.' in str(F_LABEL) else str(int(F_LABEL)))
+    np.save(SPLITS_DIR / 'train_idx.npy',                      train_idx)
+    np.save(SPLITS_DIR / 'test_idx.npy',                       test_idx)
+    np.save(SPLITS_DIR / f'labelled_train_idx_f{_f_str}.npy',  train_idx)
+    np.save(SPLITS_DIR / f'labelled_train_labels_f{_f_str}.npy', train_labels)
+    np.save(SPLITS_DIR / 'test_labels.npy',                    test_labels)
+    print(f"Embeddings + split indices saved.")
+
+    # --- UMAP ----------------------------------------------------------------
+    if not args.no_plot_umap:
+        print("\nGenerating UMAP visualizations...")
+        _lf_train = labels_full[train_idx]
+        _lf_test  = labels_full[test_idx]
+        _all_enc  = np.concatenate([_train_enc, _test_enc], axis=0)
+        _all_lf   = np.concatenate([_lf_train, _lf_test], axis=0)
+        _n_tr     = len(_train_enc)
+        _n_te     = len(_test_enc)
+        _n_all    = _n_tr + _n_te
+        _mask_tr  = np.zeros(_n_all, dtype=bool); _mask_tr[:_n_tr] = True
+        _mask_te  = np.zeros(_n_all, dtype=bool); _mask_te[_n_tr:] = True
+
+        _umap_parquet = UMAP_DATA_DIR / 'umap_encodings.parquet'
+        if _umap_parquet.exists() and not False:
+            _, _all_2d = fit_umap(_all_enc, args.umap_n_neighbors, args.umap_min_dist, SEED)
+        else:
+            _, _all_2d = fit_umap(_all_enc, args.umap_n_neighbors, args.umap_min_dist, SEED)
+
+        _split_masks = {'Labelled train': _mask_tr, 'Test': _mask_te}
+        CLASS_NAMES = {
+            'initial':     ['FRI', 'FRII', 'Hybrids', 'Spirals', 'Relaxed doubles'],
+            'morphology':  ['C-curvature', 'S-curvature', 'Misalignment', 'Wings',
+                            'X-shaped', 'Straight jets', 'Multiple hotspots',
+                            'Continuous jets', 'Banding', 'One-sided', 'Restarted'],
+            'environment': ['Cluster', 'Merger', 'Diffuse emission', 'Unknown'],
+            'derived':     ['Compact+hybrids', 'Hybrid FRI/FRII', 'Curved FRIs',
+                            'Curved FRIIs', 'Straight+multi hotspots'],
+        }
+        for _col in ('initial', 'morphology'):
+            plot_umap_single(
+                _all_2d, _all_lf, _col, CLASS_NAMES, LABEL_RANGES,
+                title=f'I-JEPA — {_col}',
+                save_path=UMAP_DIR / f'umap_all_{_col}.png',
+                split_masks=_split_masks,
+            )
+        print("UMAP plots saved.")
+
+    import sys as _sys2
+    _sys2.exit(0)
+# END of I-JEPA path --------------------------------------------------------
 
 # Labelled subset via stratified sampling
 if F_LABEL == 0.0:

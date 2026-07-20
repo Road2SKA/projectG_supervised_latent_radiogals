@@ -261,6 +261,50 @@ def load_data(args):
         train_lbl = _all_lbl[train_idx]
         val_lbl   = _all_lbl[val_idx]
 
+    # ── BYOL data/byol/ layout + catalogue sidecar ───────────────────────────
+    elif (base_dir / "data" / "byol" / "labelled_train_projections.npy").exists() \
+            and sidecar_path is not None:
+        _byol_dir       = base_dir / "data" / "byol"
+        _lab_train_proj = np.load(_byol_dir / "labelled_train_projections.npy").astype(np.float32)
+        _run_test_proj  = np.load(_byol_dir / "test_projections.npy").astype(np.float32)
+
+        _ckpt_raw  = torch.load(base_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
+        _data_seed = int(_ckpt_raw["config"]["data_seed"])
+        _splits_root = base_dir.parent.parent / "data_splits" / str(_data_seed)
+
+        _lab_train_idx = np.load(_splits_root / "labelled_train_idx.npy")
+        _run_test_idx  = np.load(_splits_root / "test_idx.npy")
+        if len(_lab_train_proj) != len(_lab_train_idx):
+            _lab_train_idx = np.load(_splits_root / "train_idx.npy")
+
+        n_total = len(_lab_train_idx) + len(_run_test_idx)
+        _all_z  = np.zeros((n_total, _lab_train_proj.shape[1]), dtype=np.float32)
+        _all_z[_lab_train_idx] = _lab_train_proj
+        _all_z[_run_test_idx]  = _run_test_proj
+
+        with open(sidecar_path) as _f:
+            _sidecar = _json.load(_f)
+        _ds_key   = next(k for k in _sidecar if k != "dataset_seed")
+        train_idx = np.array(_sidecar[_ds_key]["train"])
+        val_idx   = np.array(_sidecar[_ds_key]["val"])
+
+        _split_ids = np.zeros(n_total, dtype=np.int8)
+        _split_ids[np.array(_sidecar[_ds_key]["val"])]  = 1
+        _split_ids[np.array(_sidecar[_ds_key]["test"])] = 2
+
+        train_z = _all_z[_split_ids == 0]
+        val_z   = _all_z[_split_ids == 1]
+
+        lbl_path = Path(args.images_path).parent / "labels_filtered.npy"
+        _all_lbl  = np.load(lbl_path).astype(np.float32)
+        train_lbl = _all_lbl[train_idx]
+        val_lbl   = _all_lbl[val_idx]
+
+        print("Loading projections (BYOL data/byol/ layout)…")
+        print(f"  Projections : {_byol_dir}")
+        print(f"  Sidecar     : {sidecar_path}  (data_seed={_data_seed})")
+        print(f"  Train: {train_z.shape} | Val: {val_z.shape}")
+
     else:
         # ── Legacy fallback: train/val_projections.npy ────────────────────────
         proj_dir = (base_dir / "data"       if (base_dir / "data").is_dir()
@@ -423,7 +467,8 @@ def train_decoder(args, train_feats, val_feats, train_imgs, val_imgs, device, ou
     print(f"   Best val={best_val:.4f} at epoch {best_epoch + 1}")
     decoder.load_state_dict(best_state)
 
-    ckpt_path = out_dir / "decoder.pt"
+    label_suffix = args.label_subset if isinstance(args.label_subset, str) else "custom"
+    ckpt_path = out_dir / f"decoder_{label_suffix}.pt"
     torch.save({
         "model_state_dict": best_state,
         "decoder_type":     args.decoder_type,
@@ -441,6 +486,7 @@ def train_decoder(args, train_feats, val_feats, train_imgs, val_imgs, device, ou
 def train_nsf(args, train_feats, val_feats, train_y, val_y, device, out_dir):
     torch.manual_seed(args.seed)
 
+    label_suffix = args.label_subset if isinstance(args.label_subset, str) else "custom"
     feat_dim = train_feats.shape[1]
     n_labels = train_y.shape[1] if hasattr(train_y, "shape") else train_y.size(1)
 
@@ -511,7 +557,7 @@ def train_nsf(args, train_feats, val_feats, train_y, val_y, device, out_dir):
     print(f"   Best val={best_val:.4f} at epoch {best_epoch + 1}")
     flow.load_state_dict(best_state)
 
-    ckpt_path = out_dir / "nsf.pt"
+    ckpt_path = out_dir / f"nsf_{label_suffix}.pt"
     torch.save({
         "model_state_dict": best_state,
         "feat_dim":         feat_dim,
@@ -539,13 +585,12 @@ def main():
         print(f"  GPU: {torch.cuda.get_device_name(0)}  "
               f"({torch.cuda.get_device_properties(0).total_memory // 1024**3} GB)")
 
-    ts      = datetime.now().strftime("%Y%m%d_%H%M")
-    suffix  = args.run_name or f"{args.decoder_type}_{args.label_subset}"
-    out_dir = Path(args.base_dir) / "generative" / f"{suffix}_{ts}"
+    label_suffix = args.label_subset if isinstance(args.label_subset, str) else "custom"
+    out_dir = Path(args.base_dir) / "data" / "generative"
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output dir: {out_dir}")
 
-    with open(out_dir / "config.json", "w") as f:
+    with open(out_dir / f"config_{label_suffix}.json", "w") as f:
         json.dump(vars(args), f, indent=2, default=str)
 
     (train_feats, val_feats,

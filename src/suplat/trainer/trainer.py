@@ -209,6 +209,38 @@ def effective_rank(z, eps=1e-7):
 # TIER-WEIGHTED BYOL LOSS                                        # [TierW]
 # =============================================================================
 
+# =============================================================================
+# I-JEPA LOSS
+# =============================================================================
+
+def jepa_loss(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    I-JEPA prediction loss: MSE between predictor outputs and normalised
+    stop-gradient target encoder tokens (Assran et al. 2023, §3.3).
+
+    Fix C: apply per-token LayerNorm to the target patch embeddings before
+    computing the MSE.  This removes the constant-shift degree of freedom
+    that otherwise makes the zero-loss collapse solution reachable: without
+    normalisation, gradient descent can minimise the loss by collapsing all
+    representations to a single constant vector (predictions ≈ targets ≈ mean),
+    giving MSE → 0 without learning anything useful.  Normalising each target
+    token to zero mean and unit variance forces the predictor to match the
+    *direction and shape* of the target distribution, not just its mean.
+
+    Args:
+        predictions : (B, n_patches, D) — predictor output (not normalised).
+        targets     : (B, n_patches, D) — target encoder outputs (no grad).
+
+    Returns:
+        Scalar MSE loss averaged over batch, patches, and feature dimensions.
+    """
+    # Normalise each target token independently over its D-dimensional feature
+    # axis.  Predictions are left un-normalised so the predictor must learn to
+    # produce correctly-scaled, correctly-directed embeddings.
+    targets = F.layer_norm(targets, (targets.size(-1),))
+    return F.mse_loss(predictions, targets)
+
+
 def byol_loss_weighted(
     online_pred_1: torch.Tensor,
     online_pred_2: torch.Tensor,

@@ -27,7 +27,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler, label_binarize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
-from suplat.utils.class_weights import compute_sample_weights
+from suplat.utils.class_weights import compute_class_weights, compute_sample_weights
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +140,7 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         return {
             "f1_macro":      float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
             "auc_macro":     float(np.nanmean([a for a in aucs if a is not None])),
-            "accuracy":      float(accuracy_score(y_true.reshape(-1), y_pred.reshape(-1))),
+            "accuracy":      float(accuracy_score(y_true, y_pred)),
             "recall_macro":  float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
             "f1_per_class":  f1_score(y_true, y_pred, average=None, zero_division=0).tolist(),
             "auc_per_class": aucs,
@@ -167,7 +167,62 @@ def _fit_and_eval(clf, X_train, y_train, X_test, y_test, class_names,
     else:
         y_pred = clf.predict(X_test)
         y_prob = clf.predict_proba(X_test)
-    return evaluate_metrics(y_test, y_pred, y_prob, class_names), y_pred
+    return evaluate_metrics(y_test, y_pred, y_prob, class_names), y_pred, y_prob
+
+
+
+def _do_ip_eval(out: dict, clf_dir: Path, feature_type: str, run_name: str,
+                y_test_full, test_mask):
+    """Evaluate already-fitted classifiers on the initial_pure (5-class) subset.
+
+    Loads per-classifier test_probs.npy from clf_dir, applies the initial_pure
+    mask (rows with exactly one active class among the first 5), renormalises
+    the first-5 probability columns, and computes multiclass metrics.
+    When y_test_full / test_mask are None (all-cached path), the probs are
+    loaded but the mask must already be embedded in the saved label file.
+    """
+    _ip_class_names = [ALL_CLASS_NAMES[i] for i in range(5)]
+    _n_ip = None
+
+    for _cn in ("rf", "knn", "lr"):
+        _prob_path = clf_dir / f"{_cn}_{feature_type}_test_probs.npy"
+        if not _prob_path.exists():
+            continue
+        _probs = np.load(_prob_path)   # (N_test, 20) for full label set
+
+        # Determine initial_pure mask
+        if y_test_full is not None and test_mask is not None:
+            _y20 = y_test_full[test_mask]
+            _ip_mask = _y20[:, :5].sum(axis=1) == 1
+            _y_ip    = _y20[_ip_mask][:, :5].argmax(axis=1)
+        else:
+            # Fall back to stored test labels if available
+            _lbl_path = clf_dir / f"{feature_type}_test_labels.npy"
+            if not _lbl_path.exists():
+                continue
+            _y20     = np.load(_lbl_path)
+            _ip_mask = _y20[:, :5].sum(axis=1) == 1
+            _y_ip    = _y20[_ip_mask][:, :5].argmax(axis=1)
+
+        if _ip_mask.sum() == 0:
+            continue
+
+        _p5 = _probs[_ip_mask, :5]
+        _row_sum = _p5.sum(axis=1, keepdims=True).clip(min=1e-9)
+        _p5_norm = _p5 / _row_sum
+        _yp_ip   = _p5_norm.argmax(axis=1)
+
+        _ip_metrics = evaluate_metrics(_y_ip, _yp_ip, _p5_norm, _ip_class_names)
+        if _n_ip is None:
+            _n_ip = int(_ip_mask.sum())
+            print(f"    ── initial_pure subset ({_n_ip} samples) ──", flush=True)
+        print(f"    {_cn.upper()} (ip): F1={_ip_metrics['f1_macro']:.4f}  "
+              f"AUC={_ip_metrics['auc_macro']:.4f}  "
+              f"Acc={_ip_metrics['accuracy']:.4f}", flush=True)
+        out[_cn]["ip_f1_macro"]     = _ip_metrics["f1_macro"]
+        out[_cn]["ip_auc_macro"]    = _ip_metrics["auc_macro"]
+        out[_cn]["ip_accuracy"]     = _ip_metrics["accuracy"]
+        out[_cn]["ip_recall_macro"] = _ip_metrics["recall_macro"]
 
 
 def process_run(run_dir: Path, feature_type: str, label_set: str,
@@ -179,14 +234,19 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     Returns a result dict with keys rf/knn/lr (each with f1_macro, auc_macro, accuracy),
     or a failure dict (with key 'error' and 'detail').
     """
-    clf_dir          = run_dir / "data" / "classifiers" / "simple_downstream"
-    rf_path          = clf_dir / f"rf_{label_set}_{feature_type}.json"
-    knn_path         = clf_dir / f"knn_{label_set}_{feature_type}.json"
-    lr_path          = clf_dir / f"lr_{label_set}_{feature_type}.json"
-    _frac_cache_path = clf_dir / "label_fraction_metrics.json"
+    _cw_base         = f"cw{class_weight_mode}" if class_weight_mode else "cwNone"
+    _cw_tag          = _cw_base if class_weight_strength == 1.0 else f"{_cw_base}{class_weight_strength}"
+    clf_dir          = run_dir / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
+    rf_path          = clf_dir / f"rf_{feature_type}.json"
+    knn_path         = clf_dir / f"knn_{feature_type}.json"
+    lr_path          = clf_dir / f"lr_{feature_type}.json"
+    _frac_cache_path    = clf_dir / "label_fraction_metrics.json"
+    _need_ip_frac       = not label_set.endswith("_pure")
+    _frac_ip_cache_path = clf_dir / "label_fraction_metrics_initial_pure_eval.json"
 
     all_cached = (rf_path.exists() and knn_path.exists() and lr_path.exists()
-                  and _frac_cache_path.exists())
+                  and _frac_cache_path.exists()
+                  and (not _need_ip_frac or _frac_ip_cache_path.exists()))
     if all_cached and not force:
         print(f"  [{run_dir.name}] skipping (all cached — use --force to rerun)", flush=True)
         out = dict(name=run_dir.name)
@@ -199,6 +259,9 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                 "accuracy":     saved.get("accuracy",     float("nan")),
                 "recall_macro": saved.get("recall_macro", float("nan")),
             }
+        if label_set == "full":
+            _do_ip_eval(out, clf_dir, feature_type, run_dir.name,
+                        y_test_full=None, test_mask=None)
         return out
 
     print(f"  [{run_dir.name}] processing...", flush=True)
@@ -310,11 +373,61 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         y_train = y_train_raw
         y_test  = y_test_raw
 
-    # ── Per-sample weights (computed from unmasked 20-col labels, then masked) ──
-    sample_weights = compute_sample_weights(y_train_full[train_mask, :20],
-                                            class_weight_mode, class_weight_strength)
+    # ── Per-sample weights ────────────────────────────────────────────────────
+    _pure_to_base = {"initial_pure": "initial", "classical_pure": "classical",
+                     "morphology_pure": "morphology"}
+
+    if is_multiclass:
+        # Pure label sets: each row has exactly one positive → per-sample weighting is valid.
+        _eff_cw_mode = class_weight_mode
+        if class_weight_mode not in (None, "score"):
+            _eff_cw_mode = _pure_to_base.get(label_set, class_weight_mode)
+        sample_weights = compute_sample_weights(y_train_full[train_mask, :20],
+                                                _eff_cw_mode, class_weight_strength)
+    else:
+        # Multi-label label sets: mirror train_baseline_classifier.py.
+        # compute_class_weights → (20,) alpha → slice to label_set columns
+        # → per-sample weight = mean alpha over each sample's positive classes.
+        if (class_weight_mode is not None and class_weight_mode != "score"
+                and class_weight_strength > 0.0
+                and label_set != "derived"):
+            _alpha_full = compute_class_weights(
+                y_train_full[train_mask, :20],
+                class_weight_mode,
+                class_weight_strength,
+            )                                           # (20,)
+            _label_cols = LABEL_SETS[label_set]         # list of int indices
+            _alpha_arr  = _alpha_full[_label_cols]      # (n_classes,)
+            # y_train_raw: (N_train, n_classes), already filtered to label_set columns
+            _row_sums = y_train_raw.sum(axis=1)         # positives per sample
+            _pos_alpha = np.where(
+                _row_sums > 0,
+                (y_train_raw * _alpha_arr).sum(axis=1) / np.maximum(_row_sums, 1),
+                1.0,
+            )
+            sample_weights = (_pos_alpha / _pos_alpha.mean()).astype(np.float32)
+        elif class_weight_mode == "score":
+            sample_weights = compute_sample_weights(y_train_full[train_mask, :20],
+                                                    "score", class_weight_strength)
+        else:
+            sample_weights = compute_sample_weights(y_train_full[train_mask, :20],
+                                                    None, class_weight_strength)
 
     clf_dir.mkdir(parents=True, exist_ok=True)
+
+    hparams_path = clf_dir / "hparams.txt"
+    if not hparams_path.exists() or force:
+        with open(hparams_path, "w") as _fh:
+            _fh.write(f"run_dir:               {run_dir}\n")
+            _fh.write(f"label_set:             {label_set}\n")
+            _fh.write(f"feature_type:          {feature_type}\n")
+            _fh.write(f"n_estimators:          {n_estimators}\n")
+            _fh.write(f"n_neighbors:           {n_neighbors}\n")
+            _fh.write(f"lr_C:                  {lr_C}\n")
+            _fh.write(f"seed:                  {seed}\n")
+            _fh.write(f"class_weight_mode:     {class_weight_mode}\n")
+            _fh.write(f"class_weight_strength: {class_weight_strength}\n")
+
     out = dict(name=run_dir.name)
 
     # ── Classifiers ───────────────────────────────────────────────────────────
@@ -325,9 +438,15 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
          MultiOutputClassifier(RandomForestClassifier(n_estimators=n_estimators,
                                                       random_state=seed, n_jobs=-1))),
         ("knn", knn_path,
-         KNeighborsClassifier(n_neighbors=n_neighbors, metric="euclidean", n_jobs=-1)),
+         KNeighborsClassifier(n_neighbors=n_neighbors, metric="euclidean", n_jobs=-1)
+         if is_multiclass else
+         MultiOutputClassifier(KNeighborsClassifier(n_neighbors=n_neighbors,
+                                                    metric="euclidean", n_jobs=-1))),
         ("lr",  lr_path,
-         LogisticRegression(max_iter=1000, C=lr_C, random_state=seed)),
+         LogisticRegression(max_iter=1000, C=lr_C, random_state=seed)
+         if is_multiclass else
+         MultiOutputClassifier(LogisticRegression(max_iter=1000, C=lr_C,
+                                                  random_state=seed))),
     ]
 
     for clf_name, path, clf in _specs:
@@ -343,12 +462,12 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
             }
             continue
 
-        is_mo = not is_multiclass and clf_name == "rf"
+        is_mo = not is_multiclass
         # KNN does not support sample_weight; RF and LR do
         sw = None if clf_name == "knn" else sample_weights
-        metrics, y_pred_test = _fit_and_eval(clf, X_train, y_train, X_test, y_test,
-                                             class_names, label_set, is_multi_output=is_mo,
-                                             sample_weight=sw)
+        metrics, y_pred_test, y_prob_test = _fit_and_eval(
+            clf, X_train, y_train, X_test, y_test,
+            class_names, label_set, is_multi_output=is_mo, sample_weight=sw)
         print(f"    {clf_name.upper()}: F1={metrics['f1_macro']:.4f}  "
               f"AUC={metrics['auc_macro']:.4f}  Acc={metrics['accuracy']:.4f}", flush=True)
 
@@ -364,8 +483,9 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         with open(path, "w") as fh:
             json.dump(payload, fh, indent=2)
 
-        np.save(clf_dir / f"{clf_name}_{label_set}_{feature_type}_test_preds.npy", y_pred_test)
-        _lbl_path = clf_dir / f"{label_set}_{feature_type}_test_labels.npy"
+        np.save(clf_dir / f"{clf_name}_{feature_type}_test_preds.npy", y_pred_test)
+        np.save(clf_dir / f"{clf_name}_{feature_type}_test_probs.npy", y_prob_test)
+        _lbl_path = clf_dir / f"{feature_type}_test_labels.npy"
         if not _lbl_path.exists():
             np.save(_lbl_path, y_test)
 
@@ -376,19 +496,37 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
             "recall_macro": metrics["recall_macro"],
         }
 
-    # ── Label-fraction sweep (multiclass only) ────────────────────────────────
-    if is_multiclass and (not _frac_cache_path.exists() or force):
+    # ── initial_pure evaluation (when not training on a pure label set) ─────────
+    if not label_set.endswith("_pure"):
+        _do_ip_eval(out, clf_dir, feature_type, run_dir.name,
+                    y_test_full=y_test_full, test_mask=test_mask)
+
+    # ── Label-fraction sweep (all label sets except "derived") ───────────────
+    _do_frac_sweep = label_set != "derived"
+    _do_ip_frac    = _need_ip_frac and (not _frac_ip_cache_path.exists() or force)
+    if _do_frac_sweep and (not _frac_cache_path.exists() or _do_ip_frac or force):
         _FRACS = [0.01, 0.05, 0.10, 0.25, 0.50, 1.0]
         _rng   = np.random.default_rng(seed)
-        _frac_out: dict = {}
+        _frac_out: dict    = {}
+        # Pre-initialise all fraction keys so the notebook's exact-key check always passes
+        _frac_ip_out: dict = {str(_frac): {} for _frac in _FRACS}
         for _frac in _FRACS:
             _n   = max(len(class_names) * 2, int(_frac * len(X_train)))
             _idx = (_rng.choice(len(X_train), size=_n, replace=False)
                     if _frac < 1.0 else np.arange(len(X_train)))
             _Xf, _yf = X_train[_idx], y_train[_idx]
+            _Xf_fit, _yf_fit = _Xf, _yf
+            _sw_frac = sample_weights[_idx] if sample_weights is not None else None
+            _Xt_fit, _yt_fit = X_test, y_test
+            _ncls = len(class_names)
             _frac_out[str(_frac)] = {}
-            _knn_k = min(n_neighbors, len(_Xf))
-            for _cname, _clf_frac in [
+            _knn_k = min(n_neighbors, max(1, len(_Xf_fit)))
+            # Pre-compute ip mask for this fraction (constant across classifiers)
+            if _do_ip_frac:
+                _ip_mask_frac = (_yt_fit[:, :5].sum(axis=1) == 1)
+                _y_ip_frac    = (_yt_fit[_ip_mask_frac, :5].argmax(axis=1)
+                                 if _ip_mask_frac.any() else None)
+            for _cname, _clf_base in [
                 ("LogReg", LogisticRegression(max_iter=1000, C=lr_C,
                                               random_state=seed)),
                 ("KNN",    KNeighborsClassifier(n_neighbors=_knn_k,
@@ -396,33 +534,86 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                 ("RF",     RandomForestClassifier(n_estimators=50,
                                                   random_state=seed, n_jobs=-1)),
             ]:
-                _clf_frac.fit(_Xf, _yf)
-                _yp   = _clf_frac.predict(X_test)
-                _prob = _clf_frac.predict_proba(X_test)
-                _ncls = len(class_names)
-                if _prob.shape[1] != _ncls:
-                    _full_p = np.zeros((len(X_test), _ncls), dtype=np.float64)
-                    for _j, _c in enumerate(_clf_frac.classes_):
-                        _full_p[:, int(_c)] = _prob[:, _j]
-                    _prob = _full_p
-                _y_bin = label_binarize(y_test, classes=list(range(_ncls)))
+                if len(_Xf_fit) == 0:
+                    continue
+                _clf_frac = (MultiOutputClassifier(_clf_base) if not is_multiclass
+                             else _clf_base)
+                _fit_sw = None if _cname == "KNN" else _sw_frac
                 try:
-                    _auc = float(roc_auc_score(_y_bin, _prob,
-                                               multi_class="ovr", average="macro"))
-                except Exception:
-                    _auc = float("nan")
+                    if _fit_sw is not None:
+                        _clf_frac.fit(_Xf_fit, _yf_fit, sample_weight=_fit_sw)
+                    else:
+                        _clf_frac.fit(_Xf_fit, _yf_fit)
+                except ValueError:
+                    # Some label columns may be all-zero in small fractions
+                    continue
+                _yp = _clf_frac.predict(_Xt_fit)
+                if not is_multiclass:
+                    def _pos_prob(est, X):
+                        p = est.predict_proba(X)
+                        # If only one class seen during training, proba has shape (N,1)
+                        return p[:, 1] if p.shape[1] > 1 else p[:, 0]
+                    _prob = np.stack(
+                        [_pos_prob(est, _Xt_fit)
+                         for est in _clf_frac.estimators_], axis=1)
+                    _aucs = []
+                    for _i in range(_ncls):
+                        if len(np.unique(_yt_fit[:, _i])) < 2:
+                            _aucs.append(None)
+                        else:
+                            _aucs.append(float(roc_auc_score(
+                                _yt_fit[:, _i], _prob[:, _i])))
+                    _auc = float(np.nanmean([a for a in _aucs if a is not None]))
+                else:
+                    _prob = _clf_frac.predict_proba(_Xt_fit)
+                    if _prob.shape[1] != _ncls:
+                        _full_p = np.zeros((len(_Xt_fit), _ncls), dtype=np.float64)
+                        for _j, _c in enumerate(_clf_frac.classes_):
+                            _full_p[:, int(_c)] = _prob[:, _j]
+                        _prob = _full_p
+                    _y_bin = label_binarize(_yt_fit, classes=list(range(_ncls)))
+                    try:
+                        _auc = float(roc_auc_score(_y_bin, _prob,
+                                                   multi_class="ovr", average="macro"))
+                    except Exception:
+                        _auc = float("nan")
                 _frac_out[str(_frac)][_cname] = {
-                    "f1":       float(f1_score(y_test, _yp, average="macro",
+                    "f1":       float(f1_score(_yt_fit, _yp, average="macro",
                                                zero_division=0)),
                     "auc":      _auc,
-                    "accuracy": float(accuracy_score(y_test, _yp)),
-                    "recall":   float(recall_score(y_test, _yp, average="macro",
+                    "accuracy": float(accuracy_score(_yt_fit, _yp)),
+                    "recall":   float(recall_score(_yt_fit, _yp, average="macro",
                                                    zero_division=0)),
                 }
-        with open(_frac_cache_path, "w") as _fh:
-            json.dump(_frac_out, _fh, indent=2)
-        print(f"    Saved label-fraction sweep → {_frac_cache_path.name}",
-              flush=True)
+                # Cross-eval: evaluate on initial_pure (5-class) subset
+                if _do_ip_frac and _y_ip_frac is not None and not is_multiclass:
+                    _p5_f  = _prob[_ip_mask_frac, :5]
+                    _p5_fn = _p5_f / _p5_f.sum(axis=1, keepdims=True).clip(min=1e-9)
+                    _yp_ip_f  = _p5_fn.argmax(axis=1)
+                    _y_ip_bin = label_binarize(_y_ip_frac, classes=list(range(5)))
+                    try:
+                        _ip_auc = float(roc_auc_score(
+                            _y_ip_bin, _p5_fn, multi_class="ovr", average="macro"))
+                    except Exception:
+                        _ip_auc = float("nan")
+                    _frac_ip_out[str(_frac)][_cname] = {
+                        "f1":       float(f1_score(_y_ip_frac, _yp_ip_f,
+                                                   average="macro", zero_division=0)),
+                        "auc":      _ip_auc,
+                        "accuracy": float(accuracy_score(_y_ip_frac, _yp_ip_f)),
+                        "recall":   float(recall_score(_y_ip_frac, _yp_ip_f,
+                                                       average="macro", zero_division=0)),
+                    }
+        if not _frac_cache_path.exists() or force:
+            with open(_frac_cache_path, "w") as _fh:
+                json.dump(_frac_out, _fh, indent=2)
+            print(f"    Saved label-fraction sweep → {_frac_cache_path.name}",
+                  flush=True)
+        if _do_ip_frac and _frac_ip_out:
+            with open(_frac_ip_cache_path, "w") as _fh:
+                json.dump(_frac_ip_out, _fh, indent=2)
+            print(f"    Saved IP cross-eval sweep → {_frac_ip_cache_path.name}",
+                  flush=True)
 
     return out
 
@@ -475,8 +666,11 @@ def main():
     parser.add_argument("--workers",      type=int, default=1,
                         help="Number of parallel worker processes (default: 1).")
     parser.add_argument("--class-weight-mode", type=str, default=None,
-                        choices=["score", "initial", "morphology", "environment", "classical", "all"],
+                        choices=["score", "initial", "initial_pure", "morphology", "morphology_pure",
+                                 "environment", "environment_pure", "classical", "classical_pure",
+                                 "all", "all_pure", "full", "None"],
                         help="Upweight rare samples: 'score' (interest tier 1-4) or a label-set name. "
+                             "'full' is a synonym for 'all'. Pass 'None' or omit to use uniform weights. "
                              "Label-set modes (e.g. initial, morphology) require a pure label set — "
                              "each training sample must have exactly one positive in the selected columns. "
                              "Pass a *_pure label_set (e.g. initial_pure). "
@@ -486,6 +680,12 @@ def main():
                         help="Magnitude of class upweighting (0=uniform, default). "
                              "w = clip(1 + strength*(raw_norm - 1), min=0).")
     args = parser.parse_args()
+
+    # Normalise synonyms: "None" → None, "full" → "all"
+    if args.class_weight_mode in ("None", "none"):
+        args.class_weight_mode = None
+    elif args.class_weight_mode == "full":
+        args.class_weight_mode = "all"
 
     outputs_root = Path(args.outputs_root)
 
@@ -580,7 +780,78 @@ def main():
         print(sep)
 
     if results:
-        print_statistical_summary(results)
+        print_statistical_summary(
+            results,
+            title=f"RF / KNN / LR ({args.label_set} / {args.feature_type})",
+        )
+
+    # ── initial_pure summary (when not training on a pure label set) ──────────
+    if not args.label_set.endswith("_pure") and results:
+        _ip_results = [r for r in results
+                       if any("ip_f1_macro" in r.get(c, {}) for c in ("rf", "knn", "lr"))]
+        if _ip_results:
+            _ip_cols = [
+                ("RF",  "rf",  "ip_f1_macro"),
+                ("KNN", "knn", "ip_f1_macro"),
+                ("LR",  "lr",  "ip_f1_macro"),
+                ("RF",  "rf",  "ip_auc_macro"),
+                ("KNN", "knn", "ip_auc_macro"),
+                ("LR",  "lr",  "ip_auc_macro"),
+                ("RF",  "rf",  "ip_accuracy"),
+                ("KNN", "knn", "ip_accuracy"),
+                ("LR",  "lr",  "ip_accuracy"),
+                ("RF",  "rf",  "ip_recall_macro"),
+                ("KNN", "knn", "ip_recall_macro"),
+                ("LR",  "lr",  "ip_recall_macro"),
+            ]
+            _ip_short = {
+                "ip_f1_macro": "F1", "ip_auc_macro": "AUC",
+                "ip_accuracy": "Acc", "ip_recall_macro": "Rec",
+            }
+            _ip_best = {}
+            for _, clf, metric in _ip_cols:
+                vals = [r.get(clf, {}).get(metric, float("nan")) for r in _ip_results]
+                valid = [v for v in vals if v == v]
+                _ip_best[(clf, metric)] = max(valid) if valid else float("nan")
+
+            def _fmt_ip(r, clf, metric, width):
+                v = r.get(clf, {}).get(metric, float("nan"))
+                if v != v:
+                    return " " * (width - 3) + "N/A"
+                s = f"{v:.4f}"
+                if v == _ip_best[(clf, metric)]:
+                    s = f"*{s}*"
+                return f"{s:>{width}}"
+
+            _ww = max(len(r["name"]) for r in _ip_results)
+            _cw = 10
+            _ih = (f"{'Rank':>4}  " +
+                   "  ".join(f"{c[0]+' '+_ip_short[c[2]]:>{_cw}}" for c in _ip_cols) +
+                   f"  {'Run':<{_ww}}")
+            _is = "=" * len(_ih)
+            print("\n" + _is)
+            print(f"RF / KNN / LR (initial_pure eval / {args.feature_type}) — ranked by best F1-macro")
+            print(_is)
+            print(_ih)
+            print("-" * len(_ih))
+            for i, r in enumerate(
+                sorted(_ip_results,
+                       key=lambda r: max(r.get("rf", {}).get("ip_f1_macro", -1.0),
+                                         r.get("knn", {}).get("ip_f1_macro", -1.0),
+                                         r.get("lr",  {}).get("ip_f1_macro", -1.0)),
+                       reverse=True), 1
+            ):
+                _row = (f"{i:>4}  " +
+                        "  ".join(_fmt_ip(r, clf, metric, _cw)
+                                   for _, clf, metric in _ip_cols) +
+                        f"  {r['name']:<{_ww}}")
+                print(_row)
+            print(_is)
+            print_statistical_summary(
+                _ip_results,
+                metrics=("ip_f1_macro", "ip_auc_macro", "ip_accuracy", "ip_recall_macro"),
+                title=f"RF / KNN / LR (initial_pure eval / {args.feature_type})",
+            )
 
     # ── Failure summary ───────────────────────────────────────────────────────
     if failures:
@@ -638,20 +909,26 @@ def _parse_aug_type(name: str) -> str:
 
 def print_statistical_summary(results: list,
                                clfs=("rf", "knn", "lr"),
-                               metrics=("f1_macro", "auc_macro", "accuracy", "recall_macro")):
+                               metrics=("f1_macro", "auc_macro", "accuracy", "recall_macro"),
+                               title: str = None):
     """For each hyperparameter, group runs by that param's value and print mean±std + N."""
 
     metric_labels = {
-        "f1_macro":     "F1",
-        "auc_macro":    "AUC",
-        "accuracy":     "Acc",
-        "recall_macro": "Rec",
+        "f1_macro":        "F1",
+        "auc_macro":       "AUC",
+        "accuracy":        "Acc",
+        "recall_macro":    "Rec",
+        "ip_f1_macro":     "F1",
+        "ip_auc_macro":    "AUC",
+        "ip_accuracy":     "Acc",
+        "ip_recall_macro": "Rec",
     }
 
     parsed = [(r, _parse_hparams(r["name"])) for r in results]
     clf_metric_cols = [(c, m) for c in clfs for m in metrics]
     col_headers = [f"{c.upper()} {metric_labels[m]}" for c, m in clf_metric_cols]
     col_w = 12
+    _first_group = True
 
     for param in sorted(_HPARAM_RE.keys()):
         groups: dict = {}
@@ -667,6 +944,11 @@ def print_statistical_summary(results: list,
                "  ".join(f"{h:^{col_w}}" for h in col_headers))
         sep = "-" * len(hdr)
 
+        if _first_group and title:
+            print(f"\n{'#' * (len(hdr) + 2)}")
+            print(f"# Statistical summary — {title}")
+            print(f"{'#' * (len(hdr) + 2)}")
+            _first_group = False
         print(f"\n{'=' * len(hdr)}")
         print(f"Grouped by: {param}")
         print(f"{'=' * len(hdr)}")
@@ -729,6 +1011,11 @@ def print_statistical_summary(results: list,
                "  ".join(f"{h:^{col_w}}" for h in col_headers))
         sep = "-" * len(hdr)
 
+        if _first_group and title:
+            print(f"\n{'#' * (len(hdr) + 2)}")
+            print(f"# Statistical summary — {title}")
+            print(f"{'#' * (len(hdr) + 2)}")
+            _first_group = False
         print(f"\n{'=' * len(hdr)}")
         print("Grouped by: augmentation")
         print(f"{'=' * len(hdr)}")

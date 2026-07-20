@@ -40,6 +40,53 @@ from suplat.models.byol_models import (
     create_resnet50_backbone,
 )
 
+LABEL_SETS = {
+    "classical":       [0, 1],
+    "classical_pure":  [0, 1],
+    "initial":         list(range(0, 5)),
+    "initial_pure":    list(range(0, 5)),
+    "morphology":      list(range(5, 16)),
+    "morphology_pure": list(range(5, 16)),
+    "environment":     list(range(16, 20)),
+    "derived":         None,
+    "full":            list(range(0, 20)),
+}
+
+
+def _make_derived(y: np.ndarray) -> np.ndarray:
+    c = lambda i: y[:, i].astype(bool)
+    return np.stack([
+        ( c(2) & ~c(0) & ~c(1)).astype(np.int64),
+        ( c(2) &  (c(0) | c(1))).astype(np.int64),
+        ( c(0) &  (c(5) | c(6))).astype(np.int64),
+        ( c(1) &  (c(5) | c(6))).astype(np.int64),
+        (c(10) &   c(11)).astype(np.int64),
+    ], axis=1)
+
+
+def apply_label_set(labels_20: np.ndarray, label_set: str):
+    n        = len(labels_20)
+    row_mask = np.ones(n, dtype=bool)
+
+    if label_set == "derived":
+        return _make_derived(labels_20), row_mask
+
+    if label_set == "classical_pure":
+        fri_frii = labels_20[:, 0:2]
+        rest     = labels_20[:, 2:5]
+        row_mask = (fri_frii.sum(axis=1) == 1) & (rest.sum(axis=1) == 0)
+    elif label_set == "initial_pure":
+        initial  = labels_20[:, 0:5]
+        row_mask = initial.sum(axis=1) == 1
+    elif label_set == "morphology_pure":
+        morph    = labels_20[:, 5:16]
+        row_mask = morph.sum(axis=1) == 1
+
+    cols       = LABEL_SETS[label_set]
+    labels_sub = labels_20[row_mask][:, cols]
+    return labels_sub.astype(np.int64), row_mask
+
+
 TRAINING_MODE_DESCRIPTIONS = {
     1: "Freeze embeddings: frozen encoder and projector; train linear classifier only.",
     2: "Freeze features: frozen encoder; fine-tune projector and train linear classifier.",
@@ -157,7 +204,8 @@ def parse_args():
         "--class-weight-mode",
         type=str,
         default=None,
-        choices=["score", "initial", "morphology", "environment", "classical", "all"],
+        choices=["score", "initial", "initial_pure", "morphology", "morphology_pure",
+                 "environment", "environment_pure", "classical", "classical_pure", "all", "all_pure"],
         help="Upweight rare samples in training loss: 'score' (interest tier 1-4) or "
              "a label-set name (inverse frequency). Default: None (uniform).",
     )
@@ -167,6 +215,12 @@ def parse_args():
         default=0.0,
         help="Magnitude of class upweighting (0=uniform, default). "
              "w = clip(1 + strength*(raw_norm - 1), min=0).",
+    )
+    ap.add_argument(
+        "--data-seed",
+        type=int,
+        default=42,
+        help="Data split seed (overrides checkpoint config). Default: 42.",
     )
     ap.add_argument(
         "--f-label",
@@ -179,6 +233,25 @@ def parse_args():
         type=int,
         default=15,
         help="Early stopping patience (epochs with no improvement on test loss). Default: 15.",
+    )
+    ap.add_argument(
+        "--early-stopping",
+        action="store_true",
+        default=False,
+        help="Use 10%% of test set as validation for early stopping.",
+    )
+    ap.add_argument(
+        "--label-set",
+        type=str,
+        default="full",
+        choices=list(LABEL_SETS.keys()),
+        help="Classification scheme / label subset to train on (default: full).",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Re-run even if results already exist.",
     )
 
     return ap.parse_args()
@@ -238,12 +311,19 @@ class BYOLFineTuner(nn.Module):
 args = parse_args()
 
 BYOL_PATH = args.model_path / "byol_model_best.pt"
-finetune_name = "finetuning" if args.run_name == "" else f"finetuning_{args.run_name}"
+LABEL_SET = args.label_set
+_cw_base = f'cw{args.class_weight_mode}' if args.class_weight_mode else 'cwNone'
+_cw_tag = _cw_base if args.class_weight_strength == 1.0 else f'{_cw_base}{args.class_weight_strength}'
+_name_parts = (["finetuning", LABEL_SET, _cw_tag]
+               + (["ES"] if args.early_stopping else [])
+               + ([args.run_name] if args.run_name else []))
+finetune_name = "_".join(_name_parts)
 OUTPUT_DIR = args.model_path / "data" / "classifiers" / finetune_name
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 checkpoint = torch.load(BYOL_PATH, map_location="cpu", weights_only=True)
 print(checkpoint["config"])
+print(f">>> BYOL checkpoint data_seed: {checkpoint['config']['data_seed']}")
 
 # Data paths
 IMAGES_PATH = args.data_dir / 'images_filtered.npy'
@@ -254,7 +334,7 @@ labels = np.load(LABELS_PATH)
 
 print(labels.shape)
 
-DATA_SEED = checkpoint["config"]['data_seed']
+DATA_SEED = args.data_seed if args.data_seed is not None else checkpoint["config"]['data_seed']
 F_LABEL = args.f_label if args.f_label is not None else checkpoint["config"]['f_label']
 TRAINING_MODE = args.training_mode
 LEARNING_RATE = args.lr
@@ -265,16 +345,47 @@ TRAIN_RATIO, TEST_RATIO = 0.70, 0.30
 all_idx = np.arange(len(images))
 train_idx, test_idx = train_test_split(all_idx, test_size=TEST_RATIO, random_state=DATA_SEED)
 train_images, train_labels = images[train_idx], labels[train_idx]
+_train_labels_full_20 = train_labels[:, :20].copy()  # save before label set narrows columns
 test_images  = images[test_idx]
 test_labels  = labels[test_idx]
 
+# Apply label set: column selection + row filtering for pure sets
+_train_labels_sub, _train_row_mask = apply_label_set(train_labels[:, :20], LABEL_SET)
+_test_labels_sub,  _test_row_mask  = apply_label_set(test_labels[:, :20],  LABEL_SET)
+train_images = train_images[_train_row_mask]
+train_labels = _train_labels_sub.astype(np.float32)
+test_images  = test_images[_test_row_mask]
+test_labels  = _test_labels_sub.astype(np.float32)
+print(f"Label set '{LABEL_SET}': train={len(train_images)}, test={len(test_images)}, "
+      f"n_classes={train_labels.shape[1]}")
+
 byol_strong_aug = get_augmentation(args.augmentation)
 
-# Test set: no augmentation
-test_lab_ds = ImagesAndLabelsDataset(tags_data=pd.DataFrame(test_labels), img_data=test_images,
-                                     transform=None)
-labelled_test_loader = DataLoader(test_lab_ds, batch_size=args.batch_size, shuffle=False,
-                                  drop_last=False, num_workers=args.num_workers, pin_memory=use_cuda)
+EARLY_STOPPING = args.early_stopping
+if EARLY_STOPPING:
+    from sklearn.model_selection import train_test_split as _tts
+    _val_rel, _test_rel = _tts(
+        np.arange(len(test_images)), test_size=0.9, random_state=42
+    )
+    val_images,       val_labels       = test_images[_val_rel],  test_labels[_val_rel]
+    test_images_eval, test_labels_eval = test_images[_test_rel], test_labels[_test_rel]
+else:
+    val_images = val_labels = None
+    test_images_eval, test_labels_eval = test_images, test_labels
+
+test_eval_ds = ImagesAndLabelsDataset(tags_data=pd.DataFrame(test_labels_eval),
+                                      img_data=test_images_eval, transform=None)
+test_eval_loader = DataLoader(test_eval_ds, batch_size=args.batch_size, shuffle=False,
+                              drop_last=False, num_workers=args.num_workers, pin_memory=use_cuda)
+
+if EARLY_STOPPING:
+    val_lab_ds = ImagesAndLabelsDataset(tags_data=pd.DataFrame(val_labels),
+                                        img_data=val_images, transform=None)
+    val_loader = DataLoader(val_lab_ds, batch_size=args.batch_size, shuffle=False,
+                            drop_last=False, num_workers=args.num_workers, pin_memory=use_cuda)
+else:
+    val_lab_ds = None
+    val_loader = None
 
 
 def _make_labeled_loader(f_label, seed):
@@ -297,9 +408,9 @@ def _make_labeled_loader(f_label, seed):
     _lab_imgs = train_images[_mask]
     _lab_labs = train_labels[_mask]
     _alpha = compute_class_weights(
-        _lab_labs[:, :20], args.class_weight_mode, args.class_weight_strength)
-    if labels.shape[1] > 20:
-        _alpha = np.append(_alpha, np.ones(labels.shape[1] - 20, dtype=np.float32))
+        _train_labels_full_20[_mask], args.class_weight_mode, args.class_weight_strength)
+    _cols = LABEL_SETS[LABEL_SET]
+    _alpha = _alpha[_cols] if _cols is not None else np.ones(train_labels.shape[1], dtype=np.float32)
     _alpha_t   = torch.tensor(_alpha, dtype=torch.float32)
     _alpha_sum = float(_alpha_t.sum().clamp(min=1e-6))
     _lab_df = pd.DataFrame(_lab_labs)
@@ -314,12 +425,12 @@ def _make_labeled_loader(f_label, seed):
 
 lab_ds, labelled_train_loader, _alpha_t, _alpha_sum = _make_labeled_loader(F_LABEL, DATA_SEED)
 
-print(f"With current settings, Train/Test sizes are {len(lab_ds)}/{len(test_lab_ds)}")
+print(f"With current settings, Train/Test sizes are {len(lab_ds)}/{len(test_eval_ds)}")
 
 print(f"Training mode {TRAINING_MODE}: {TRAINING_MODE_DESCRIPTIONS[TRAINING_MODE]}")
 print(f"Training {N_RUNS} run(s) with different initialisations")
 
-num_classes = labels.shape[1]
+num_classes = train_labels.shape[1]
 
 NUM_EPOCHS = args.epochs
 
@@ -371,7 +482,8 @@ def build_finetune_model(model_idx):
     return finetune_model.to(device), run_seed
 
 
-def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum):
+def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum,
+                    val_loader=None, test_eval_loader=None):
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, finetune_model.parameters()),
         lr=LEARNING_RATE,
@@ -382,8 +494,9 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum):
     )
 
     train_losses = []
-    test_losses = []
-    best_test_loss = float('inf')
+    test_eval_losses = []
+    val_losses = []
+    best_loss = float('inf')
     best_state = None
     epochs_no_impr = 0
 
@@ -424,7 +537,7 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum):
         train_losses.append(avg_train_loss)
 
         # ======================
-        # TEST
+        # TEST EVAL (always)
         # ======================
         finetune_model.eval()
 
@@ -432,7 +545,7 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum):
         test_batches = 0
 
         with torch.no_grad():
-            for batch in labelled_test_loader:
+            for batch in test_eval_loader:
                 x1, x1_aug, x1_lab = batch
 
                 x1_aug = x1_aug.float().to(device)
@@ -448,31 +561,66 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum):
                 test_batches += 1
 
         avg_test_loss = test_loss / test_batches
-        test_losses.append(avg_test_loss)
-        scheduler.step(avg_test_loss)
+        test_eval_losses.append(avg_test_loss)
 
-        if avg_test_loss < best_test_loss:
-            best_test_loss = avg_test_loss
-            best_state = {k: v.cpu().clone() for k, v in finetune_model.state_dict().items()}
-            epochs_no_impr = 0
+        # ======================
+        # VALIDATION + ES (only when val_loader provided)
+        # ======================
+        if val_loader is not None:
+            val_loss = 0.0
+            val_batches = 0
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    x1, x1_aug, x1_lab = batch
+
+                    x1_aug = x1_aug.float().to(device)
+                    y = x1_lab.float().to(device)
+
+                    if y.ndim == 3 and y.shape[1] == 1:
+                        y = y.squeeze(1)
+
+                    logits = finetune_model(x1_aug)
+                    loss = F.binary_cross_entropy_with_logits(logits, y)
+
+                    val_loss += loss.detach().item()
+                    val_batches += 1
+
+            avg_val_loss = val_loss / val_batches
+            val_losses.append(avg_val_loss)
+            scheduler.step(avg_val_loss)
+
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
+                best_state = {k: v.cpu().clone() for k, v in finetune_model.state_dict().items()}
+                epochs_no_impr = 0
+            else:
+                epochs_no_impr += 1
+
+            print(
+                f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
+                f"| Train: {avg_train_loss:.4f} "
+                f"| Val: {avg_val_loss:.4f} "
+                f"| Test: {avg_test_loss:.4f} "
+                f"| lr: {optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+            if epochs_no_impr >= args.patience:
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
         else:
-            epochs_no_impr += 1
-
-        print(
-            f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
-            f"| Train: {avg_train_loss:.4f} "
-            f"| Test: {avg_test_loss:.4f} "
-            f"| lr: {optimizer.param_groups[0]['lr']:.2e}"
-        )
-
-        if epochs_no_impr >= args.patience:
-            print(f"Early stopping at epoch {epoch + 1}")
-            break
+            scheduler.step(avg_test_loss)
+            print(
+                f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
+                f"| Train: {avg_train_loss:.4f} "
+                f"| Test: {avg_test_loss:.4f} "
+                f"| lr: {optimizer.param_groups[0]['lr']:.2e}"
+            )
 
     if best_state is not None:
         finetune_model.load_state_dict(best_state)
 
-    return train_losses, test_losses, optimizer
+    return train_losses, test_eval_losses, val_losses, optimizer
 
 
 def compute_finetuning_metrics(finetune_model, dataset):
@@ -543,6 +691,7 @@ def compute_finetuning_metrics(finetune_model, dataset):
 
 all_train_losses = []
 all_test_losses = []
+all_val_losses = []
 all_train_metrics = []
 all_test_metrics = []
 
@@ -552,13 +701,27 @@ for model_idx in range(N_RUNS):
 
     finetune_model, run_seed = build_finetune_model(model_idx)
     seed_training_randomness()
-    train_losses, test_losses, optimizer = train_one_model(
-        finetune_model, labelled_train_loader, _alpha_t, _alpha_sum)
+    train_losses, test_losses, val_losses, optimizer = train_one_model(
+        finetune_model, labelled_train_loader, _alpha_t, _alpha_sum,
+        val_loader=val_loader, test_eval_loader=test_eval_loader)
 
     all_train_losses.append(train_losses)
     all_test_losses.append(test_losses)
+    all_val_losses.append(val_losses)
 
-    checkpoint_path = OUTPUT_DIR / f"finetuned_model_{run_number}.pt"
+    run_dir = OUTPUT_DIR / f'run{run_number}' if N_RUNS > 1 else OUTPUT_DIR
+    run_dir.mkdir(exist_ok=True)
+
+    if (run_dir / 'test_probs.npy').exists() and not args.force:
+        print(f"Run {run_number}/{N_RUNS}: cached — skipping (use --force to rerun).")
+        _ckpt = torch.load(run_dir / f"finetuned_model_{run_number}.pt",
+                           map_location="cpu", weights_only=True)
+        all_train_losses.append(_ckpt.get("train_losses", []))
+        all_test_losses.append(_ckpt.get("test_losses", []))
+        all_val_losses.append([])
+        continue
+
+    checkpoint_path = run_dir / f"finetuned_model_{run_number}.pt"
     torch.save(
         {
             "model_state_dict": finetune_model.state_dict(),
@@ -586,13 +749,11 @@ for model_idx in range(N_RUNS):
 
     train_metrics, _, _, _ = compute_finetuning_metrics(finetune_model, lab_ds)
     test_metrics, test_probs_arr, test_preds_arr, test_labels_arr = compute_finetuning_metrics(
-        finetune_model, test_lab_ds
+        finetune_model, test_eval_ds
     )
     all_train_metrics.append(train_metrics)
     all_test_metrics.append(test_metrics)
 
-    run_dir = OUTPUT_DIR / f'run{run_number}' if N_RUNS > 1 else OUTPUT_DIR
-    run_dir.mkdir(exist_ok=True)
     np.save(run_dir / 'test_probs.npy',  test_probs_arr.astype(np.float32))
     np.save(run_dir / 'test_preds.npy',  test_preds_arr)
     np.save(run_dir / 'test_labels.npy', test_labels_arr)
@@ -604,21 +765,14 @@ for model_idx in range(N_RUNS):
 
 fig, ax = plt.subplots(figsize=(6, 4))
 curve_alpha = 0.45 if N_RUNS > 1 else 1.0
-for model_idx, (train_losses, test_losses) in enumerate(
-    zip(all_train_losses, all_test_losses)
+for i, (train_losses, test_losses, val_losses) in enumerate(
+    zip(all_train_losses, all_test_losses, all_val_losses)
 ):
-    ax.plot(
-        train_losses,
-        'b-',
-        alpha=curve_alpha,
-        label="train" if model_idx == 0 else None,
-    )
-    ax.plot(
-        test_losses,
-        'r--',
-        alpha=curve_alpha,
-        label="test" if model_idx == 0 else None,
-    )
+    a = curve_alpha
+    ax.plot(train_losses, 'b-',  alpha=a, label="train"      if i == 0 else None)
+    ax.plot(test_losses,  'r--', alpha=a, label="test"        if i == 0 else None)
+    if val_losses:
+        ax.plot(val_losses, 'g:', alpha=a, label="validation" if i == 0 else None)
 ax.set_xlabel("Epoch")
 ax.set_ylabel("Loss")
 ax.set_title("Finetuning")
@@ -631,18 +785,18 @@ fig.savefig(curve_path, dpi=150, bbox_inches="tight")
 plt.close(fig)
 print(f"Learning curve saved to {curve_path}")
 
-metrics = {
-    key: {
-        "train": [run_metrics[key] for run_metrics in all_train_metrics],
-        "test": [run_metrics[key] for run_metrics in all_test_metrics],
+if all_train_metrics:
+    metrics = {
+        key: {
+            "train": [run_metrics[key] for run_metrics in all_train_metrics],
+            "test": [run_metrics[key] for run_metrics in all_test_metrics],
+        }
+        for key in all_train_metrics[0]
     }
-    for key in all_train_metrics[0]
-}
-
-metrics_path = OUTPUT_DIR / "finetuning_metrics.json"
-with open(metrics_path, "w") as f:
-    json.dump(metrics, f, indent=2)
-print(f"Finetuning metrics saved to {metrics_path}")
+    metrics_path = OUTPUT_DIR / "finetuning_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Finetuning metrics saved to {metrics_path}")
 
 # =============================================================================
 # LABEL-FRACTION SWEEP
@@ -686,9 +840,10 @@ for _frac in _FRACS_SUB:
 
         _ft_model, _ = build_finetune_model(_ri - 1)
         seed_training_randomness()
-        train_one_model(_ft_model, _train_loader, _a_t, _a_sum)
+        train_one_model(_ft_model, _train_loader, _a_t, _a_sum,
+                        val_loader=val_loader, test_eval_loader=test_eval_loader)
 
-        _, _probs, _, _lbls = compute_finetuning_metrics(_ft_model, test_lab_ds)
+        _, _probs, _, _lbls = compute_finetuning_metrics(_ft_model, test_eval_ds)
         np.save(_run_dir / "test_probs.npy",  _probs.astype(np.float32))
         np.save(_run_dir / "test_labels.npy", _lbls)
         print(f"  run{_ri}: saved to {_run_dir}")
