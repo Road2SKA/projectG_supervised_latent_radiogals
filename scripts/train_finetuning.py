@@ -314,11 +314,11 @@ BYOL_PATH = args.model_path / "byol_model_best.pt"
 LABEL_SET = args.label_set
 _cw_base = f'cw{args.class_weight_mode}' if args.class_weight_mode else 'cwNone'
 _cw_tag = _cw_base if args.class_weight_strength == 1.0 else f'{_cw_base}{args.class_weight_strength}'
-_name_parts = (["finetuning", LABEL_SET, _cw_tag]
+_name_parts = ([LABEL_SET, _cw_tag]
                + (["ES"] if args.early_stopping else [])
                + ([args.run_name] if args.run_name else []))
 finetune_name = "_".join(_name_parts)
-OUTPUT_DIR = args.model_path / "data" / "classifiers" / finetune_name
+OUTPUT_DIR = args.model_path / "data" / "classifiers" / "finetuning" / finetune_name
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 checkpoint = torch.load(BYOL_PATH, map_location="cpu", weights_only=True)
@@ -345,13 +345,13 @@ TRAIN_RATIO, TEST_RATIO = 0.70, 0.30
 all_idx = np.arange(len(images))
 train_idx, test_idx = train_test_split(all_idx, test_size=TEST_RATIO, random_state=DATA_SEED)
 train_images, train_labels = images[train_idx], labels[train_idx]
-_train_labels_full_20 = train_labels[:, :20].copy()  # save before label set narrows columns
 test_images  = images[test_idx]
 test_labels  = labels[test_idx]
 
 # Apply label set: column selection + row filtering for pure sets
 _train_labels_sub, _train_row_mask = apply_label_set(train_labels[:, :20], LABEL_SET)
 _test_labels_sub,  _test_row_mask  = apply_label_set(test_labels[:, :20],  LABEL_SET)
+_train_labels_full_20 = train_labels[_train_row_mask][:, :20].copy()  # save after row filtering
 train_images = train_images[_train_row_mask]
 train_labels = _train_labels_sub.astype(np.float32)
 test_images  = test_images[_test_row_mask]
@@ -390,20 +390,21 @@ else:
 
 def _make_labeled_loader(f_label, seed):
     """Create a labelled-subset DataLoader at fraction f_label using the given seed."""
+    _n_train = len(train_images)
     if f_label <= 0.0:
-        _mask = np.zeros(len(train_idx), dtype=bool)
+        _mask = np.zeros(_n_train, dtype=bool)
     elif f_label >= 1.0:
-        _mask = np.ones(len(train_idx), dtype=bool)
+        _mask = np.ones(_n_train, dtype=bool)
     else:
         _strat_key = np.argmax(train_labels[:, :min(5, train_labels.shape[1])], axis=1)
-        _n_lab = max(2, int(round(f_label * len(train_idx))))
+        _n_lab = max(2, int(round(f_label * _n_train)))
         try:
             _sss = StratifiedShuffleSplit(n_splits=1, train_size=_n_lab, random_state=seed)
             _lab_rel, _ = next(_sss.split(train_images, _strat_key))
         except ValueError:
             print("Stratification failed, falling back to random selection")
-            _lab_rel = np.random.choice(len(train_idx), _n_lab, replace=False)
-        _mask = np.zeros(len(train_idx), dtype=bool)
+            _lab_rel = np.random.choice(_n_train, _n_lab, replace=False)
+        _mask = np.zeros(_n_train, dtype=bool)
         _mask[_lab_rel] = True
     _lab_imgs = train_images[_mask]
     _lab_labs = train_labels[_mask]
@@ -609,7 +610,7 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum,
                 print(f"Early stopping at epoch {epoch + 1}")
                 break
         else:
-            scheduler.step(avg_test_loss)
+            scheduler.step(avg_train_loss)
             print(
                 f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
                 f"| Train: {avg_train_loss:.4f} "
@@ -699,16 +700,6 @@ for model_idx in range(N_RUNS):
     run_number = model_idx + 1
     print(f"Starting run {run_number}/{N_RUNS}")
 
-    finetune_model, run_seed = build_finetune_model(model_idx)
-    seed_training_randomness()
-    train_losses, test_losses, val_losses, optimizer = train_one_model(
-        finetune_model, labelled_train_loader, _alpha_t, _alpha_sum,
-        val_loader=val_loader, test_eval_loader=test_eval_loader)
-
-    all_train_losses.append(train_losses)
-    all_test_losses.append(test_losses)
-    all_val_losses.append(val_losses)
-
     run_dir = OUTPUT_DIR / f'run{run_number}' if N_RUNS > 1 else OUTPUT_DIR
     run_dir.mkdir(exist_ok=True)
 
@@ -720,6 +711,16 @@ for model_idx in range(N_RUNS):
         all_test_losses.append(_ckpt.get("test_losses", []))
         all_val_losses.append([])
         continue
+
+    finetune_model, run_seed = build_finetune_model(model_idx)
+    seed_training_randomness()
+    train_losses, test_losses, val_losses, optimizer = train_one_model(
+        finetune_model, labelled_train_loader, _alpha_t, _alpha_sum,
+        val_loader=val_loader, test_eval_loader=test_eval_loader)
+
+    all_train_losses.append(train_losses)
+    all_test_losses.append(test_losses)
+    all_val_losses.append(val_losses)
 
     checkpoint_path = run_dir / f"finetuned_model_{run_number}.pt"
     torch.save(

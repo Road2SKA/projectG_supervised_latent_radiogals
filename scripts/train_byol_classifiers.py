@@ -59,6 +59,7 @@ LABEL_SETS = {
     "environment":     list(range(16, 20)),
     "derived":         None,
     "full":            list(range(0, 20)),
+    "full_pure":       list(range(0, 20)),
 }
 
 
@@ -235,7 +236,9 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     or a failure dict (with key 'error' and 'detail').
     """
     _cw_base         = f"cw{class_weight_mode}" if class_weight_mode else "cwNone"
-    _cw_tag          = _cw_base if class_weight_strength == 1.0 else f"{_cw_base}{class_weight_strength}"
+    _cw_tag          = ("cwNone" if not class_weight_mode
+                        else _cw_base if class_weight_strength == 1.0
+                        else f"{_cw_base}{class_weight_strength}")
     clf_dir          = run_dir / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
     rf_path          = clf_dir / f"rf_{feature_type}.json"
     knn_path         = clf_dir / f"knn_{feature_type}.json"

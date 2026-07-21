@@ -24,27 +24,50 @@ NUM_WORKERS=4
 # MODE: which label set to balance. Empty string = no weighting (uniform).
 #   Options: initial | morphology | environment | classical | all | score
 # STRENGTH: 0.0 = uniform (no effect), 1.0 = each class contributes equally.
-CLASS_WEIGHT_MODE="initial_pure"
-CLASS_WEIGHT_STRENGTH=0.3
+CLASS_WEIGHT_MODE="all"
+CLASS_WEIGHT_STRENGTH=1.0
 # =============================================================================
 
-echo ""
-echo "=== Mode 2: frozen encoder, fine-tune projector + head ==="
-LR_MODE2=1e-5
-EPOCHS_MODE2=40
-python scripts/train_finetuning.py \
-    --model-path=${BEST_RUN} \
-    --training-mode=2 \
-    --label-set=initial_pure \
-    --epochs=${EPOCHS_MODE2} \
-    --lr=${LR_MODE2} \
-    --weight-decay=${WD} \
-    --n-runs=${N_RUNS} \
-    --num-workers=${NUM_WORKERS} \
-    --augmentation=quart_ext \
-    --run-name=mode2_lr${LR_MODE2}_ep${EPOCHS_MODE2} \
-    ${CLASS_WEIGHT_MODE:+--class-weight-mode=${CLASS_WEIGHT_MODE}} \
-    ${CLASS_WEIGHT_MODE:+--class-weight-strength=${CLASS_WEIGHT_STRENGTH}}
+LR=1e-5
+EPOCHS=40
+
+# CONFIGS: "label_set  cw_mode  cw_strength"
+# cw_mode=none / cw_strength=0.0 → no weighting (cwNone)
+CONFIGS=(
+    "full          none          0.0"
+    "full          all           0.3"
+    "full          all           1.0"
+    "initial       none          0.0"
+    "initial       initial       0.3"
+    "initial       initial       1.0"
+    "initial_pure  none          0.0"
+    "initial_pure  initial_pure  0.3"
+    "initial_pure  initial_pure  1.0"
+)
+
+for cfg in "${CONFIGS[@]}"; do
+    read -r LS CWM CWS <<< "$cfg"
+    echo ""
+    echo "=== label_set=${LS}  cw_mode=${CWM}  cw_strength=${CWS} ==="
+
+    CW_ARGS=()
+    if [ "${CWM}" != "none" ]; then
+        CW_ARGS+=(--class-weight-mode="${CWM}" --class-weight-strength="${CWS}")
+    fi
+
+    python scripts/train_finetuning.py \
+        --model-path=${BEST_RUN} \
+        --training-mode=3 \
+        --label-set="${LS}" \
+        --epochs=${EPOCHS} \
+        --lr=${LR} \
+        --weight-decay=${WD} \
+        --n-runs=${N_RUNS} \
+        --num-workers=${NUM_WORKERS} \
+        --augmentation=quart_ext \
+        --run-name="mode3_lr${LR}_ep${EPOCHS}" \
+        "${CW_ARGS[@]}"
+done
 
 echo ""
 echo "END: $(date)"

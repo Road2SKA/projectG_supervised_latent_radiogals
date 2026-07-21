@@ -27,14 +27,6 @@ mkdir -p outputs/logs
 # Set to "" to sweep ALL matching run directories instead.
 # =============================================================================
 BYOL_RUN_DIR=""
-
-# ── Class weighting ───────────────────────────────────────────────────────────
-# MODE: which label set to balance. Empty string = no weighting (uniform).
-#   Options: initial | morphology | environment | classical | all | score
-#   Label-set modes require --label-set to be a *_pure variant (e.g. initial_pure).
-# STRENGTH: 0.0 = uniform (no effect), 1.0 = each class contributes equally.
-CLASS_WEIGHT_MODE="all" # Leave empty for uniform (no weighting)
-CLASS_WEIGHT_STRENGTH=0.3
 # =============================================================================
 
 if [ -n "$BYOL_RUN_DIR" ]; then
@@ -43,19 +35,40 @@ else
     RUN_GLOB="enb0_*"
 fi
 
-echo "Starting BYOL classifiers sweep — $(date)"
+echo "Starting BYOL classifiers sweep (all CW variants, --force) — $(date)"
 echo "Node: ${SLURMD_NODENAME:-local}  CPUs: ${SLURM_CPUS_PER_TASK:-8}"
 echo "Run glob: ${RUN_GLOB}"
-echo "Class weighting: ${CLASS_WEIGHT_MODE:-none}  strength=${CLASS_WEIGHT_STRENGTH}"
 
-python scripts/train_byol_classifiers.py \
-    --outputs-root outputs/byol_runs \
-    --run-glob     "${RUN_GLOB}" \
-    --feature-type projections \
-    --label-set    full \
-    --n-estimators 200 \
-    --workers      8 \
-    ${CLASS_WEIGHT_MODE:+--class-weight-mode=${CLASS_WEIGHT_MODE}} \
-    ${CLASS_WEIGHT_MODE:+--class-weight-strength=${CLASS_WEIGHT_STRENGTH}}
+# ── Class weighting variants to (re)train ─────────────────────────────────────
+# Each entry: "label_set mode strength"  ("None" mode = cwNone)
+VARIANTS=(
+    "full          None          1.0"  # cwNone
+    "full          all           0.3"  # cwall0.3
+    "full          all           1.0"  # cwall
+    "initial       None          1.0"  # cwNone
+    "initial       initial       0.3"  # cwinitial
+    "initial       initial       1.0"  # cwinitial_pure
+    "initial_pure  None          0.0"  # cwNone
+    "initial_pure  initial_pure  0.3"  # cwinitial_pure0.3
+    "initial_pure  initial_pure  1.0"  # cwinitial_pure
+)
 
+for VARIANT in "${VARIANTS[@]}"; do
+    LS=$(echo      "$VARIANT" | awk '{print $1}')
+    CW_MODE=$(echo "$VARIANT" | awk '{print $2}')
+    CW_STR=$(echo  "$VARIANT" | awk '{print $3}')
+    echo ""
+    echo "── label_set=${LS}  cw_mode=${CW_MODE}  strength=${CW_STR} ──────────────────────"
+    python scripts/train_byol_classifiers.py \
+        --outputs-root          outputs/byol_runs \
+        --run-glob              "${RUN_GLOB}" \
+        --feature-type          projections \
+        --label-set             "${LS}" \
+        --n-estimators          200 \
+        --workers               8 \
+        --class-weight-mode     "${CW_MODE}" \
+        --class-weight-strength "${CW_STR}"
+done
+
+echo ""
 echo "Done — $(date)"

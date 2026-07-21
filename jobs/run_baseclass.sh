@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --time=8:00:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
 #SBATCH --mail-type=END
@@ -29,11 +29,7 @@ DATA_SEED=42
 # Main training results are cached in results.json — only the fraction sweep reruns.
 # Format: "LABEL_SET CLASS_WEIGHT_MODE CLASS_WEIGHT_STRENGTH"
 CONFIGS=(
-    "full         all            1.0"
-    "full         all            0.3"
-    "initial      initial        1.0"
-    "initial      initial        0.3"
-    "initial_pure initial_pure   0.3"
+    "initial_pure initial_pure   1.0"
 )
 
 run_config() {
@@ -43,7 +39,7 @@ run_config() {
 
     local CW_TAG="cw${CW_MODE}$([ "${CW_STR}" != "1.0" ] && echo "${CW_STR}")"
     local RUN_NAME="${MODEL}_${LABEL_SET}_${CW_TAG}"
-    local OUT="${RUN_DIR}/${RUN_NAME}"
+    local OUT="${RUN_DIR}/without_generative/${RUN_NAME}"
 
     echo "════════════════════════════════════════════════════════"
     echo "Run name    : ${RUN_NAME}"
