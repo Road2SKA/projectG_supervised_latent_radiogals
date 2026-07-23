@@ -43,6 +43,8 @@ from astronomaly.feature_extraction import shape_features as _sf
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_sample_weights, LABEL_COLS, TIERS
 
+_LABEL_COL_IDX = {c: i for i, c in enumerate(LABEL_COLS)}
+
 # ---------------------------------------------------------------------------
 # Hardcoded paths and constants
 # ---------------------------------------------------------------------------
@@ -61,10 +63,15 @@ PROTEGE_INITIAL_STEPS = 200
 def _get_splits_dir(run_dir: Path) -> Path:
     ckpt = torch.load(run_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
     seed = int(ckpt["config"]["data_seed"])
-    return run_dir.parent / "data_splits" / str(seed)
+    return run_dir.parent.parent / "data_splits" / str(seed)
 
 
-def _load_split(splits_dir: Path, data_dir: Path, filename: str) -> np.ndarray:
+def _load_split(splits_dir: Path, data_dir: Path, filename: str, f_str: str = None) -> np.ndarray:
+    if f_str is not None:
+        stem, ext = filename.rsplit('.', 1)
+        p_f = splits_dir / f"{stem}_f{f_str}.{ext}"
+        if p_f.exists():
+            return np.load(p_f)
     p = splits_dir / filename
     return np.load(p if p.exists() else data_dir / filename)
 
@@ -109,8 +116,12 @@ def _check_run_data(rd: Path, latent: str = "proj"):
             err_type = "missing_enc_data" if latent == "enc" else "missing_data"
             return (err_type, f"Missing data file: '{p}'")
 
-    lab_idx   = _load_split(splits_dir, data_dir, "labelled_train_idx.npy")
-    unlab_idx = _load_split(splits_dir, data_dir, "unlabelled_train_idx.npy")
+    _ckpt_cfg = torch.load(rd / "byol_model_best.pt", map_location="cpu", weights_only=False)["config"]
+    _f_label  = _ckpt_cfg.get("f_label", 1.0)
+    _f_str    = str(_f_label).rstrip('0').rstrip('.') if '.' in str(_f_label) else str(int(_f_label))
+
+    lab_idx   = _load_split(splits_dir, data_dir, "labelled_train_idx.npy",   _f_str)
+    unlab_idx = _load_split(splits_dir, data_dir, "unlabelled_train_idx.npy", _f_str)
     test_idx  = _load_split(splits_dir, data_dir, "test_idx.npy")
 
     if latent == "proj":
@@ -241,6 +252,7 @@ def run_GP_active_learning(features, labels, input_anomaly_scores, output_dir,
         )
         gpr = GaussianProcessRegressor(
             kernel=kernel,
+            normalize_y=True,
             optimizer=None if fitted_kernel is not None else 'fmin_l_bfgs_b',
         )
         gpr.fit(X_train, y_train)
@@ -452,15 +464,18 @@ def process_run(run_dir: Path, epsilon: float,
     np.random.seed(data_seed)
     print(f"  data_seed={data_seed}  latent={latent}", flush=True)
 
+    _f_label  = ckpt["config"].get("f_label", 1.0)
+    _f_str    = str(_f_label).rstrip('0').rstrip('.') if '.' in str(_f_label) else str(int(_f_label))
+
     data_dir     = run_dir / "data"
     byol_dir     = data_dir / "byol"
-    splits_dir   = run_dir.parent / "data_splits" / str(data_seed)
+    splits_dir   = run_dir.parent.parent / "data_splits" / str(data_seed)
     protege_dir  = data_dir / "protege"
     protege_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Load features and indices (proj or enc) ---
-    lab_idx   = _load_split(splits_dir, data_dir, "labelled_train_idx.npy")
-    unlab_idx = _load_split(splits_dir, data_dir, "unlabelled_train_idx.npy")
+    lab_idx   = _load_split(splits_dir, data_dir, "labelled_train_idx.npy",   _f_str)
+    unlab_idx = _load_split(splits_dir, data_dir, "unlabelled_train_idx.npy", _f_str)
     test_idx  = _load_split(splits_dir, data_dir, "test_idx.npy")
 
     if latent == "proj":
@@ -500,9 +515,18 @@ def process_run(run_dir: Path, epsilon: float,
 
     # --- Labels ---
     labels_split = labels_all[all_idx]
-    human_labels = compute_sample_weights(labels_split[:, :20], class_weight_mode,
-                                          class_weight_strength).astype(float)
-    labels_df = pd.DataFrame({"human_label": human_labels}, index=source_names)
+    # Raw tier scores (1–4) for GP labelling and evaluation
+    _raw_tiers = np.ones(len(labels_split), dtype=float)
+    for _sv, _cols in reversed(TIERS):
+        _ci = [_LABEL_COL_IDX[c] for c in _cols]
+        _raw_tiers[labels_split[:, _ci].any(axis=1)] = float(_sv)
+    labels_df = pd.DataFrame({"human_label": _raw_tiers}, index=source_names)
+    # Normalised weights for GP seed initialisation (class-imbalance-aware)
+    _seed_weights = pd.Series(
+        compute_sample_weights(labels_split[:, :20], class_weight_mode,
+                               class_weight_strength).astype(float),
+        index=source_names,
+    )
 
     # --- Features: optional PCA (no scaling — matches notebook APPLY_PCA=False default) ---
     if use_pca:
@@ -537,9 +561,7 @@ def process_run(run_dir: Path, epsilon: float,
     anomaly_scores = pd.DataFrame(
         {"score": np.zeros(len(features_pca))}, index=features_pca.index
     )
-    anomaly_scores.loc[seed_names, "score"] = (
-        labels_df.loc[seed_names, "human_label"].values.astype(float)
-    )
+    anomaly_scores.loc[seed_names, "score"] = _seed_weights.loc[seed_names].values.astype(float)
 
     # --- ScoreConverter ---
     score_converter = human_loop_learning.ScoreConverter(
