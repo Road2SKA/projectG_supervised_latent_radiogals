@@ -32,7 +32,7 @@ from scipy.special import ndtr
 from scipy.stats import norm
 from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
@@ -214,7 +214,8 @@ class _NumpyImageDataset(_AstroDataset):
 # ---------------------------------------------------------------------------
 def run_GP_active_learning(features, labels, input_anomaly_scores, output_dir,
                            steps=10, initial_steps=None, N_labels=100, epsilon=0.5,
-                           max_queries=None, record_timing=False, labelable_mask=None):
+                           max_queries=None, record_timing=False, labelable_mask=None,
+                           kernel_amplitude=True, refit_every=None):
     """Direct sklearn GP implementation (transductive when labelable_mask is given).
 
     When labelable_mask is a bool array of length n_total:
@@ -234,30 +235,73 @@ def run_GP_active_learning(features, labels, input_anomaly_scores, output_dir,
     fitted_kernel = None
     gpr           = None
     fit_times     = []   # list of (n_labelled, elapsed_s)
+    next_refit_at = [None]   # list so closure can mutate
 
     # Default: all sources are labelable
     if labelable_mask is None:
         labelable_mask = np.ones(n_total, dtype=bool)
+
+    def _check_gp_bounds(kernel, tol=0.01):
+        """Print fitted kernel and warn if any hyperparameter is near a bound."""
+        print(f"    [GP kernel] {kernel}", flush=True)
+        names  = [h.name for h in kernel.hyperparameters]
+        theta  = kernel.theta   # log-scale optimised values
+        bounds = kernel.bounds  # log-scale (lo, hi) pairs
+        for name, val, (lo, hi) in zip(names, theta, bounds):
+            span = hi - lo
+            if span <= 0:
+                continue
+            frac_from_lo = (val - lo) / span
+            frac_from_hi = (hi - val) / span
+            if frac_from_lo < tol:
+                print(f"    WARNING: {name}={np.exp(val):.4g} within {tol*100:.0f}% of "
+                      f"lower bound ({np.exp(lo):.4g})", flush=True)
+            if frac_from_hi < tol:
+                print(f"    WARNING: {name}={np.exp(val):.4g} within {tol*100:.0f}% of "
+                      f"upper bound ({np.exp(hi):.4g})", flush=True)
 
     def _fit_and_acquire():
         nonlocal fitted_kernel, gpr
         labelled  = h_labels != -1
         X_train   = feature_arr[labelled]
         y_train   = h_labels[labelled]
+        n_lab     = int(labelled.sum())
 
-        # First call: optimise hyperparameters.  Subsequent calls: fixed kernel.
-        kernel = fitted_kernel if fitted_kernel is not None else (
-            Matern(length_scale_bounds=(1e-2, 1e2)) +
+        # Decide whether to run hyperparameter optimisation this call
+        if fitted_kernel is None:
+            do_optimise = True           # always optimise on first fit
+        elif refit_every == 0:
+            do_optimise = False          # --refit-every 0 → original freeze behaviour
+        elif next_refit_at[0] is not None and n_lab >= next_refit_at[0]:
+            do_optimise = True
+            print(f"    [GP refit @ {n_lab} labels]", flush=True)
+        else:
+            do_optimise = False
+
+        _base_kernel = (
+            ConstantKernel(constant_value_bounds=(1e-3, 1e3)) *
+            Matern(length_scale_bounds=(1e-3, 1e4)) +
+            WhiteKernel(noise_level_bounds=(1e-3, 1e1))
+        ) if kernel_amplitude else (
+            Matern(length_scale_bounds=(1e-3, 1e4)) +
             WhiteKernel(noise_level_bounds=(1e-3, 1e1))
         )
+        kernel = _base_kernel if do_optimise else fitted_kernel
         gpr = GaussianProcessRegressor(
             kernel=kernel,
             normalize_y=True,
-            optimizer=None if fitted_kernel is not None else 'fmin_l_bfgs_b',
+            optimizer='fmin_l_bfgs_b' if do_optimise else None,
         )
         gpr.fit(X_train, y_train)
-        if fitted_kernel is None:
+
+        if do_optimise:
             fitted_kernel = gpr.kernel_
+            _check_gp_bounds(gpr.kernel_)
+            # Schedule next refit
+            if refit_every is None:
+                next_refit_at[0] = n_lab * 2   # doubling heuristic
+            else:
+                next_refit_at[0] = n_lab + refit_every
 
         # Acquisition only for unlabelled AND labelable sources.
         acquire_mask = (~labelled) & labelable_mask
@@ -450,7 +494,9 @@ def process_run(run_dir: Path, epsilon: float,
                 latent: str = "proj",
                 use_pca: bool = False, max_queries: int = None, timing_plot: bool = False,
                 pca_components: int = None, outputs_root: Path = None, force: bool = False,
-                class_weight_mode: str = "score", class_weight_strength: float = 1.0):
+                class_weight_mode: str = "score", class_weight_strength: float = 1.0,
+                scale: bool = True, l2norm: bool = False,
+                kernel_amplitude: bool = True, refit_every: int = None):
     # Encoder features are 1280-dim: always apply PCA to keep GP tractable.
     if latent == "enc":
         use_pca = True
@@ -528,7 +574,13 @@ def process_run(run_dir: Path, epsilon: float,
         index=source_names,
     )
 
-    # --- Features: optional PCA (no scaling — matches notebook APPLY_PCA=False default) ---
+    # --- Features: optional L2 norm, optional PCA, optional StandardScaler ---
+    # --- Optional L2 row-normalisation (preserves angular structure for cosine-trained BYOL) ---
+    if l2norm:
+        norms = np.linalg.norm(all_proj, axis=1, keepdims=True)
+        all_proj = all_proj / np.where(norms == 0, 1.0, norms)
+        print(f"  L2-normalised rows before scaling", flush=True)
+
     if use_pca:
         if pca_components is not None:
             pca = PCA(n_components=pca_components, svd_solver="full")
@@ -540,10 +592,14 @@ def process_run(run_dir: Path, epsilon: float,
             proj_final = pca.fit_transform(all_proj)
             print(f"  PCA: {all_proj.shape[1]}D -> {proj_final.shape[1]}D  "
                   f"(explained var >= 0.95)", flush=True)
-        proj_final = StandardScaler().fit_transform(proj_final)
     else:
         proj_final = all_proj
         print(f"  Features: {proj_final.shape[1]}D (no PCA)", flush=True)
+
+    # Always scale unless --no-scale (was previously inside PCA branch only)
+    if scale:
+        proj_final = StandardScaler().fit_transform(proj_final)
+        print(f"  StandardScaler applied ({proj_final.shape[1]}D)", flush=True)
 
     # Build full feature DataFrame (train + test) for transductive GP
     features_pca = pd.DataFrame(proj_final, index=source_names)
@@ -591,6 +647,8 @@ def process_run(run_dir: Path, epsilon: float,
             max_queries=max_queries,
             record_timing=timing_plot,
             labelable_mask=labelable_mask,
+            kernel_amplitude=kernel_amplitude,
+            refit_every=refit_every,
         )
 
     # active_output has rows for ALL sources (train + test)
@@ -776,7 +834,7 @@ def process_run(run_dir: Path, epsilon: float,
 # Multiprocessing worker (must be top-level for pickling)
 # ---------------------------------------------------------------------------
 def _worker_process_run(args):
-    rd, epsilon, steps, suffix, csv_df, labels_all, latent, use_pca, max_queries, timing_plot, pca_components, outputs_root, force, cw_mode, cw_strength = args
+    rd, epsilon, steps, suffix, csv_df, labels_all, latent, use_pca, max_queries, timing_plot, pca_components, outputs_root, force, cw_mode, cw_strength, scale, l2norm, kernel_amplitude, refit_every = args
     m      = re.search(r'_f([\d.]+)_sw([\d.]+)', rd.name)
     f_val  = float(m.group(1)) if m else float('nan')
     sw_val = float(m.group(2)) if m else float('nan')
@@ -788,7 +846,10 @@ def _worker_process_run(args):
                                                      timing_plot=timing_plot, pca_components=pca_components,
                                                      outputs_root=outputs_root, force=force,
                                                      class_weight_mode=cw_mode,
-                                                     class_weight_strength=cw_strength)
+                                                     class_weight_strength=cw_strength,
+                                                     scale=scale, l2norm=l2norm,
+                                                     kernel_amplitude=kernel_amplitude,
+                                                     refit_every=refit_every)
         return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, auc=auc, train_auc=train_auc,
                     n_eval=n_eval, n_pos=n_pos)
     except FileNotFoundError as exc:
@@ -843,6 +904,15 @@ def main():
     parser.add_argument("--class-weight-strength", type=float, default=1.0,
                         help="Magnitude of class weighting for GP seeds (default: 1.0). "
                              "w = clip(1 + strength*(raw_norm - 1), min=0).")
+    parser.add_argument("--no-scale",              action="store_true",
+                        help="Disable StandardScaler on features (default: scaling on).")
+    parser.add_argument("--l2norm",                action="store_true",
+                        help="L2-normalise feature rows before PCA/scaling (preserves angular structure).")
+    parser.add_argument("--no-kernel-amplitude",   action="store_true",
+                        help="Omit ConstantKernel amplitude from GP kernel (default: included).")
+    parser.add_argument("--refit-every",           type=int, default=None,
+                        help="Refit GP hyperparameters every N new labels (0=never refit after first; "
+                             "default: doubling heuristic).")
     args = parser.parse_args()
 
     outputs_root = Path(args.outputs_root)
@@ -904,7 +974,9 @@ def main():
                     worker_args.append((rd, args.epsilon, args.steps, suffix, csv_df, labels_all,
                                         latent, args.pca, args.max_queries, args.timing_plot,
                                         args.pca_components, outputs_root, args.force,
-                                        args.class_weight_mode, args.class_weight_strength))
+                                        args.class_weight_mode, args.class_weight_strength,
+                                        not args.no_scale, args.l2norm,
+                                        not args.no_kernel_amplitude, args.refit_every))
 
     if worker_args:
         n_workers = min(args.workers, len(worker_args))
