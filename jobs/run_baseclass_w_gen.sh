@@ -20,9 +20,7 @@ BYOL_RUN="outputs/byol_runs/enb0_mlp_pd128_clos_lrconst_wd1e-4_lfull_ema0.996_vi
 RUN_DIR="outputs/supervised_baseline_classifiers/with_generative"
 DATA_DIR="data/preprocessed/lotss"
 GEN_DIR="${BYOL_RUN}/data/generative"
-GEN_VARIANT="initial_pure"    # "all" or "initial" — selects decoder_<variant>.pt / nsf_<variant>.pt
 MODEL="enb0"
-LABEL_SET="initial_pure"  # initial_pure | morphology_pure | environment_pure | classical_pure | all_pure | score_pure
 N_RUNS=3
 EPOCHS=200
 BATCH_SIZE=256
@@ -32,57 +30,77 @@ SEED=42
 DATA_SEED=42
 NUM_WORKERS=4
 
-# ── Class weighting ───────────────────────────────────────────────────────────
-# MODE: which label set to balance. Empty string = no weighting (uniform).
-#   Options: initial | morphology | environment | classical | all | score
-#   Label-set modes require LABEL_SET to be a *_pure variant (e.g. initial_pure).
-# STRENGTH: 0.0 = uniform (no effect), 1.0 = each class contributes equally.
-CLASS_WEIGHT_MODE="initial_pure"
-CLASS_WEIGHT_STRENGTH=1.0
-# =============================================================================
-
-# ── Build compact output name ──────────────────────────────────────────────────
-# Extract BYOL timestamp: e.g. 20260709_2203 → 2607092203 (strip century, no underscore)
+# ── Build BYOL compact tag (shared across all configs) ────────────────────────
 _BYOL_TS_FULL=$(basename "${BYOL_RUN}" | grep -oP '\d{8}_\d{4}$')
 _BYOL_SHORT_TS=$(echo "${_BYOL_TS_FULL}" | sed 's/^20//' | tr -d '_')
-# Extract BYOL label: _l<label>_ where label is a known label-set name
 _BYOL_LABEL=$(basename "${BYOL_RUN}" | grep -oP '(?<=_l)(full|initial|morphology|environment|classical|score)(?=_)')
-# Format: {model}_{label_set}_cw{mode}_{byol_short_ts}{byol_label}_gen{gen_variant}
-CW_TAG="${CLASS_WEIGHT_MODE:-None}$([ "${CLASS_WEIGHT_STRENGTH}" != "1.0" ] && echo "${CLASS_WEIGHT_STRENGTH}")"
-RUN_NAME="${MODEL}_${LABEL_SET}_cw${CW_TAG}_${_BYOL_SHORT_TS}${_BYOL_LABEL}_gen${GEN_VARIANT}"
 
 mkdir -p "${RUN_DIR}"
 
-echo "────────────────────────────────────────────────────────"
-echo "Run name    : ${RUN_NAME}"
-echo "Output dir  : ${RUN_DIR}/${RUN_NAME}"
-echo "BYOL run    : $(basename ${BYOL_RUN})"
-echo "Label set   : ${LABEL_SET}"
-echo "Gen variant : ${GEN_VARIANT}"
-echo "Model       : ${MODEL}"
-echo "N runs      : ${N_RUNS}"
-echo "Epochs      : ${EPOCHS}  LR=${LR}  BS=${BATCH_SIZE}  Patience=${PATIENCE}"
-echo "Class wt    : ${CLASS_WEIGHT_MODE:-none}  strength=${CLASS_WEIGHT_STRENGTH}"
-echo "Seeds       : data=${DATA_SEED}  train=${SEED}"
-echo "────────────────────────────────────────────────────────"
+# Format: "LABEL_SET  CW_MODE  CW_STR  GEN_VARIANT"
+# GEN_VARIANT selects decoder_<variant>.pt / nsf_<variant>.pt in GEN_DIR.
+# CW_MODE "none" → uniform weights (--class_weight_mode omitted).
+# _binary label sets score element-wise accuracy (each label column independently).
+CONFIGS=(
+    "initial_pure   initial_pure  1.0  initial_pure"
+    "initial_binary none          0.0  initial"
+    "initial_binary initial       0.3  initial"
+    "initial_binary initial       1.0  initial"
+    "full_binary    none          0.0  all"
+    "full_binary    all           0.3  all"
+    "full_binary    all           1.0  all"
+)
 
-python scripts/train_baseline_classifier.py \
-    --run_dir      "${RUN_DIR}" \
-    --run_name     "${RUN_NAME}" \
-    --byol_run_dir "${BYOL_RUN}" \
-    --data_dir     "${DATA_DIR}" \
-    --model        "${MODEL}" \
-    --label_set    "${LABEL_SET}" \
-    --gen_dir      "${GEN_DIR}" \
-    --gen_variant  "${GEN_VARIANT}" \
-    --n_runs       "${N_RUNS}" \
-    --epochs       "${EPOCHS}" \
-    --batch_size   "${BATCH_SIZE}" \
-    --lr           "${LR}" \
-    --seed         "${SEED}" \
-    --data_seed    "${DATA_SEED}" \
-    --num_workers  "${NUM_WORKERS}" \
-    ${CLASS_WEIGHT_MODE:+--class_weight_mode=${CLASS_WEIGHT_MODE}} \
-    ${CLASS_WEIGHT_MODE:+--class_weight_strength=${CLASS_WEIGHT_STRENGTH}}
+run_config() {
+    local LABEL_SET="$1"
+    local CW_MODE="$2"
+    local CW_STR="$3"
+    local GEN_VARIANT="$4"
+
+    local CW_TAG
+    if [ "${CW_MODE}" = "none" ] || [ "${CW_MODE}" = "None" ]; then
+        CW_TAG="None"
+    else
+        CW_TAG="${CW_MODE}$([ "${CW_STR}" != "1.0" ] && echo "${CW_STR}")"
+    fi
+    local RUN_NAME="${MODEL}_${LABEL_SET}_cw${CW_TAG}_${_BYOL_SHORT_TS}${_BYOL_LABEL}_gen${GEN_VARIANT}"
+
+    echo "════════════════════════════════════════════════════════"
+    echo "Run name    : ${RUN_NAME}"
+    echo "Label set   : ${LABEL_SET}  Gen variant: ${GEN_VARIANT}"
+    echo "Class wt    : ${CW_MODE}  strength=${CW_STR}"
+    echo "════════════════════════════════════════════════════════"
+
+    CW_ARGS=()
+    if [ "${CW_MODE}" != "none" ] && [ "${CW_MODE}" != "None" ]; then
+        CW_ARGS+=(--class_weight_mode "${CW_MODE}" --class_weight_strength "${CW_STR}")
+    fi
+
+    python scripts/train_baseline_classifier.py \
+        --run_dir      "${RUN_DIR}" \
+        --run_name     "${RUN_NAME}" \
+        --byol_run_dir "${BYOL_RUN}" \
+        --data_dir     "${DATA_DIR}" \
+        --model        "${MODEL}" \
+        --label_set    "${LABEL_SET}" \
+        --gen_dir      "${GEN_DIR}" \
+        --gen_variant  "${GEN_VARIANT}" \
+        --n_runs       "${N_RUNS}" \
+        --epochs       "${EPOCHS}" \
+        --batch_size   "${BATCH_SIZE}" \
+        --lr           "${LR}" \
+        --seed         "${SEED}" \
+        --data_seed    "${DATA_SEED}" \
+        --num_workers  "${NUM_WORKERS}" \
+        --patience     "${PATIENCE}" \
+        "${CW_ARGS[@]}"
+
+    echo "  Done: $(date)"
+}
+
+for cfg in "${CONFIGS[@]}"; do
+    read -r LS CWM CWS GV <<< "$cfg"
+    run_config "$LS" "$CWM" "$CWS" "$GV"
+done
 
 echo "END: $(date)"

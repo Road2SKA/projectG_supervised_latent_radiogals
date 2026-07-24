@@ -34,15 +34,16 @@ EPOCHS=40
 # CONFIGS: "label_set  cw_mode  cw_strength"
 # cw_mode=none / cw_strength=0.0 → no weighting (cwNone)
 CONFIGS=(
-    "full          none          0.0"
-    "full          all           0.3"
-    "full          all           1.0"
-    "initial       none          0.0"
-    "initial       initial       0.3"
-    "initial       initial       1.0"
-    "initial_pure  none          0.0"
-    "initial_pure  initial_pure  0.3"
-    "initial_pure  initial_pure  1.0"
+    "full            none          0.0"
+    "full            all           0.3"
+    "full            all           1.0"
+    "initial         none          0.0"
+    "initial         initial       0.3"
+    "initial         initial       1.0"
+    "initial_pure    none          0.0"
+    "initial_pure    initial_pure  0.3"
+    "initial_pure    initial_pure  1.0"
+    "initial_binary  none          0.0"
 )
 
 for cfg in "${CONFIGS[@]}"; do

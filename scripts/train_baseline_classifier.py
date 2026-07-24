@@ -2,13 +2,17 @@
 Train end-to-end baseline classifiers for radio galaxy classification.
 
 Usage:
-    python train_baseline_classifiers.py \\
+    python train_baseline_classifier2.py \\
         --run_dir /path/to/byol/run \\
         --data_dir /path/to/data \\
         --model cnn \\
         --label_set classical
 
 Models: cnn | scatternet | simplescatternet | vit | dualssn | enb0
+
+Refactored version of train_baseline_classifier.py.  All three execution
+paths (full-label training, generative-aug, label-fraction sweep) share a
+single ``_train_one_run`` function to avoid silent divergence.
 """
 
 import sys
@@ -24,7 +28,6 @@ if not hasattr(scipy.special, 'sph_harm'):
         )
     scipy.special.sph_harm = dummy_sph_harm
 
-# Now proceed with your original imports
 import argparse
 import json
 import sys
@@ -124,7 +127,7 @@ def weighted_bce_loss(logits, targets, alpha, n_classes):
     return ((unreduced * alpha).sum(1) / alpha_sum).mean()
 
 
-def evaluate_metrics(y_true, y_pred, y_prob, class_names):
+def evaluate_metrics(y_true, y_pred, y_prob, class_names, is_binary=False):
     n = len(class_names)
     aucs = []
     for i in range(n):
@@ -137,7 +140,7 @@ def evaluate_metrics(y_true, y_pred, y_prob, class_names):
     f1_mac  = f1_score(y_true, y_pred, average='macro', zero_division=0)
     rec_per = recall_score(y_true, y_pred, average=None, zero_division=0).tolist()
     rec_mac = recall_score(y_true, y_pred, average='macro', zero_division=0)
-    acc     = accuracy_score(y_true, y_pred)
+    acc     = float((y_true == y_pred).mean()) if is_binary else accuracy_score(y_true, y_pred)
     mac_auc = float(np.nanmean(aucs))
 
     return {
@@ -243,6 +246,258 @@ def compute_scattering(images, J=2, L=8, device='cpu'):
     return torch.cat(all_coeffs, dim=0).numpy(), scat_shape
 
 
+# ── Core training function ────────────────────────────────────────────────────
+def _train_one_run(
+    train_imgs, train_lbs,       # training images + labels (already filtered/augmented)
+    test_imgs, test_lbs,         # test images + labels (subset-filtered)
+    te_labels_20,                # full 20-col test labels
+    *,
+    model_name, n_classes, class_names, device, args,
+    alpha,                       # class-weight tensor (n_classes,), on CPU
+    val_imgs=None, val_lbs=None, # optional early-stopping validation set
+    scat_tr=None, scat_va=None, scat_te=None,  # precomputed scattering (or None)
+    extra_results=None,          # dict merged into results (e.g. gen_frac, n_gen)
+    seed=42,
+    run_dir=None,                # if provided: save outputs here; if None: skip saving
+    test_source_idx=None,        # saved as test_source_idx.npy when run_dir set
+):
+    """Train one classifier run and optionally save outputs.
+
+    Returns:
+        (results_dict, test_probs, test_preds, test_labels_arr,
+         (train_losses, test_losses, val_losses))
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # Derive shapes
+    H, W       = train_imgs.shape[-2], train_imgs.shape[-1]
+    img_shape  = (1, H, W)
+    scat_shape = tuple(scat_tr.shape[1:]) if scat_tr is not None else None
+
+    # Transforms (derived from model_name, same logic as original per-fold setup)
+    if model_name == 'vit':
+        tf_train = transforms.Compose([
+            transforms.Resize(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(degrees=180),
+        ])
+        tf_val = transforms.Compose([transforms.Resize(224)])
+        print(f"  Upsampling images to 224×224 for {model_name} (train: +flip/rotate aug)")
+    elif model_name == 'enb0':
+        tf_train = get_augmentation('quart_ext')
+        tf_val   = None
+        print(f"  Training at native 89×89 for {model_name} (train: quart_ext aug)")
+    else:
+        tf_train = None
+        tf_val   = None
+
+    # Move alpha to device
+    alpha = alpha.to(device)
+
+    # Build model
+    print(f"Building model: {model_name}")
+    model = build_model(model_name, n_classes, img_shape, scat_shape)
+    model = model.to(device)
+    if args.compile:
+        model = torch.compile(model)
+        print("  torch.compile() applied")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Parameters: {n_params:,}")
+
+    # DataLoaders
+    _nw = args.num_workers
+    def _mk(ds, bs, shuf):
+        return DataLoader(ds, batch_size=bs, shuffle=shuf,
+                          num_workers=_nw, pin_memory=True)
+
+    use_scat_only = model_name in ('scatternet', 'simplescatternet')
+    if model_name in ('scatternet', 'simplescatternet', 'dualssn'):
+        train_dl = _mk(ScatterDataset(train_imgs, scat_tr, train_lbs),  args.batch_size, True)
+        test_dl  = _mk(ScatterDataset(test_imgs,  scat_te, test_lbs),   args.batch_size, False)
+        val_dl   = (_mk(ScatterDataset(val_imgs, scat_va, val_lbs),      args.batch_size, False)
+                    if val_imgs is not None else None)
+    else:
+        train_dl = _mk(RadioImageDataset(train_imgs, train_lbs, tf_train), args.batch_size, True)
+        test_dl  = _mk(RadioImageDataset(test_imgs,  test_lbs,  tf_val),   args.batch_size, False)
+        val_dl   = (_mk(RadioImageDataset(val_imgs,  val_lbs,   tf_val),   args.batch_size, False)
+                    if val_imgs is not None else None)
+
+    print(f"  Train: {len(train_imgs)}, Val: {len(val_imgs) if val_imgs is not None else 0}")
+
+    # Optimiser + scheduler
+    optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimiser, mode='min', factor=0.5, patience=5)
+
+    # Forward helper (training + validation)
+    def _forward(mdl, batch):
+        if model_name == 'dualssn':
+            imgs, scats, labels_b = batch
+            imgs, scats, labels_b = imgs.to(device), scats.to(device), labels_b.to(device)
+            return mdl(imgs, scats), labels_b
+        elif use_scat_only:
+            _, scats, labels_b = batch
+            scats, labels_b = scats.to(device), labels_b.to(device)
+            return mdl(scats), labels_b
+        else:
+            imgs, labels_b = batch
+            imgs, labels_b = imgs.to(device), labels_b.to(device)
+            return mdl(imgs), labels_b
+
+    # Training loop
+    train_losses, val_losses, test_losses = [], [], []
+    best_val_loss  = float('inf')
+    best_state     = None
+    epochs_no_impr = 0
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        for batch in train_dl:
+            logits, labels_b = _forward(model, batch)
+            loss = weighted_bce_loss(logits, labels_b, alpha, n_classes)
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+            epoch_loss += loss.item() * len(labels_b)
+        train_losses.append(epoch_loss / len(train_dl.dataset))
+
+        # Test loss (always, for curve)
+        model.eval()
+        test_loss_total = 0.0
+        with torch.no_grad():
+            for batch in test_dl:
+                logits, labels_b = _forward(model, batch)
+                test_loss_total += F.binary_cross_entropy_with_logits(
+                    logits, labels_b.float()).item() * len(labels_b)
+        test_losses.append(test_loss_total / len(test_dl.dataset))
+
+        # Validation loss + early stopping (only when val_dl is provided)
+        if val_dl is not None:
+            val_loss_total = 0.0
+            with torch.no_grad():
+                for batch in val_dl:
+                    logits, labels_b = _forward(model, batch)
+                    val_loss_total += F.binary_cross_entropy_with_logits(
+                        logits, labels_b.float()).item() * len(labels_b)
+            val_loss = val_loss_total / len(val_dl.dataset)
+            val_losses.append(val_loss)
+            scheduler.step(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss  = val_loss
+                best_state     = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_impr = 0
+            else:
+                epochs_no_impr += 1
+                if epochs_no_impr >= args.patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+        else:
+            scheduler.step(train_losses[-1])
+
+        if epoch % 10 == 0 or epoch == 1:
+            _msg = (f"Epoch {epoch:3d}  train={train_losses[-1]:.4f}  "
+                    f"test={test_losses[-1]:.4f}")
+            if val_dl is not None:
+                _msg += f"  val={val_losses[-1]:.4f}"
+            _msg += f"  lr={optimiser.param_groups[0]['lr']:.2e}"
+            print(_msg)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"Restored best model (val loss = {best_val_loss:.4f})")
+
+    # Test inference
+    model.eval()
+    all_probs, all_preds, all_labels = [], [], []
+    with torch.no_grad():
+        for batch in test_dl:
+            if model_name == 'dualssn':
+                imgs, scats, labels_b = batch
+                imgs, scats = imgs.to(device), scats.to(device)
+                logits = model(imgs, scats)
+            elif use_scat_only:
+                _, scats, labels_b = batch
+                scats = scats.to(device)
+                logits = model(scats)
+            else:
+                imgs, labels_b = batch
+                imgs = imgs.to(device)
+                logits = model(imgs)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            preds = (probs >= 0.5).astype(int)
+            all_probs.append(probs)
+            all_preds.append(preds)
+            all_labels.append(labels_b.numpy())
+
+    test_probs      = np.concatenate(all_probs,  axis=0)
+    test_preds      = np.concatenate(all_preds,  axis=0)
+    test_labels_arr = np.concatenate(all_labels, axis=0)
+
+    # Metrics
+    results = evaluate_metrics(test_labels_arr, test_preds, test_probs, class_names,
+                               is_binary=args.label_set.endswith('_binary'))
+    results['label_set']          = args.label_set
+    results['eval_fri_frii_pure'] = args.eval_fri_frii_pure
+    if extra_results:
+        results.update(extra_results)
+
+    print(f"\nMacro F1:     {results['f1_macro']:.4f}")
+    print(f"Macro AUC:    {results['auc_macro']:.4f}")
+    print(f"Macro Recall: {results['recall_macro']:.4f}")
+    print(f"Accuracy:     {results['accuracy']:.4f}")
+
+    # Save outputs
+    if run_dir is not None:
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        np.save(run_dir / 'test_probs.npy',     test_probs)
+        np.save(run_dir / 'test_preds.npy',     test_preds)
+        np.save(run_dir / 'test_labels.npy',    test_labels_arr)
+        np.save(run_dir / 'test_labels_20.npy', te_labels_20)
+        if test_source_idx is not None:
+            np.save(run_dir / 'test_source_idx.npy', test_source_idx)
+
+        torch.save({
+            'state_dict':  best_state,
+            'model':       model_name,
+            'label_set':   args.label_set,
+            'class_names': class_names,
+            'n_classes':   n_classes,
+            'scat_shape':  scat_shape,
+            'img_shape':   img_shape,
+            'seed':        seed,
+        }, run_dir / 'model_best.pt')
+        torch.save(model, run_dir / 'model_best_full.pt')
+
+        with open(run_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
+        # Per-run training curve
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(train_losses, 'b-',  label='train')
+        ax.plot(test_losses,  'r--', label='test')
+        if val_losses:
+            ax.plot(val_losses, 'g:', label='validation')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title(f'{model_name} — {args.label_set}')
+        ax.set_yscale('log')
+        ax.legend()
+        ax.grid(True)
+        fig.tight_layout()
+        fig.savefig(run_dir / 'training_curve.png', dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+        print(f"\nAll outputs saved to: {run_dir}")
+
+    return results, test_probs, test_preds, test_labels_arr, (train_losses, test_losses, val_losses)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
@@ -252,7 +507,7 @@ def main():
                         choices=['cnn', 'scatternet', 'simplescatternet',
                                  'vit', 'dualssn', 'enb0'])
     parser.add_argument('--label_set',  default='initial_pure',
-                        choices=list(LABEL_SETS.keys()))
+                        help="Label set. Append '_binary' for element-wise accuracy (e.g. initial_binary).")
     parser.add_argument('--eval_fri_frii_pure', action='store_true',
                         help='(with --label_set full) evaluate on FRI/FRII-pure sources only')
     parser.add_argument('--seed',       type=int, default=42)
@@ -303,6 +558,9 @@ def main():
     parser.add_argument('--early_stopping', action='store_true', default=False,
                         help='Use 10%% of test set as validation for early stopping.')
     args = parser.parse_args()
+    _ls_base = args.label_set[:-7] if args.label_set.endswith('_binary') else args.label_set
+    if _ls_base not in LABEL_SETS:
+        parser.error(f"Unknown label set: {args.label_set!r}")
     if args.gen_variant == 'full':
         args.gen_variant = 'all'
     _byol_run_dir_explicit = args.byol_run_dir is not None
@@ -314,18 +572,11 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    # Shadow module-level make_loader with num_workers from args
-    _nw = args.num_workers
-    make_loader = lambda ds, bs, shuffle: DataLoader(  # noqa: E731
-        ds, batch_size=bs, shuffle=shuffle, num_workers=_nw, pin_memory=True
-    )
-
     # ── Output directory ──────────────────────────────────────────────────
     _cw_base = f'cw{args.class_weight_mode}' if args.class_weight_mode else 'cwNone'
     _cw_tag  = _cw_base if args.class_weight_strength == 1.0 else f'{_cw_base}{args.class_weight_strength}'
     _es_tag = '_ES' if args.early_stopping else ''
     if args.run_name:
-        # run_name is used as the full directory stem (no model/cw/es appended)
         _dir_name = args.run_name
     else:
         _dir_name = f'{args.run_dir.name}_{args.model}_{_cw_tag}{_es_tag}'
@@ -368,7 +619,8 @@ def main():
             (c(10) &   c(11)).astype(np.int64),
         ], axis=1)
 
-    label_cols  = LABEL_SETS[args.label_set]
+    _ls_base    = args.label_set[:-7] if args.label_set.endswith('_binary') else args.label_set
+    label_cols  = LABEL_SETS[_ls_base]
     if args.label_set == "derived":
         class_names = DERIVED_CLASS_NAMES
     else:
@@ -378,7 +630,6 @@ def main():
 
     # ── Train/test split ──────────────────────────────────────────────────
     if args.data_seed is not None and not _byol_run_dir_explicit:
-        # No BYOL run given: derive splits path from run_dir
         _splits_dir = args.run_dir.parent / "data_splits" / str(args.data_seed)
         split_label = f"data_seed={args.data_seed}"
     elif args.data_seed is not None:
@@ -417,7 +668,7 @@ def main():
     else:
         test_labels = labels[actual_test_idx][:, label_cols]
 
-    # ── Pure-source filtering (test set only for "full", both splits otherwise)
+    # ── Pure-source filtering (test set) ─────────────────────────────────
     test_pure_mask = None
     if args.label_set == "pure":
         test_pure_mask  = labels[actual_test_idx].sum(axis=1) == 1
@@ -443,8 +694,7 @@ def main():
     if test_pure_mask is not None:
         _te_labels_20_arr = _te_labels_20_arr[test_pure_mask]
 
-    # Pre-compute initial_pure mask over the actual test set.
-    # Used in sweep/gen-aug sections to evaluate on initial_pure when label_set=="full".
+    # Pre-compute initial_pure mask over the actual test set (for sweep cross-eval).
     _ip_mask = (labels[actual_test_idx][:, :5].sum(axis=1) == 1)
 
     # ── Fold definitions ──────────────────────────────────────────────────
@@ -459,6 +709,9 @@ def main():
         ]
         print(f"K-fold CV: {args.cv_folds} folds on {len(trainval_idx)} trainval samples")
 
+    # ════════════════════════════════════════════════════════════════════
+    # PATH A — Full-label training (only when gen_dir is not set)
+    # ════════════════════════════════════════════════════════════════════
     all_run_results = []
     all_train_losses, all_test_losses, all_val_losses = [], [], []
 
@@ -478,308 +731,107 @@ def main():
         fold_results_list = []
 
         for fold_i, (fold_train_idx, fold_val_idx) in enumerate(fold_splits):
-          fold_out = run_out / f'fold{fold_i + 1}' if args.cv_folds > 1 else run_out
-          if (fold_out / 'results.json').exists() and not args.force:
-              print(f"  [cached] Run {run_i} — loading from {fold_out.name}")
-              with open(fold_out / 'results.json') as _f:
-                  results = json.load(_f)
-              fold_results_list.append(results)
-              continue
+            fold_out = run_out / f'fold{fold_i + 1}' if args.cv_folds > 1 else run_out
+            if (fold_out / 'results.json').exists() and not args.force:
+                print(f"  [cached] Run {run_i} — loading from {fold_out.name}")
+                with open(fold_out / 'results.json') as _f:
+                    results = json.load(_f)
+                fold_results_list.append(results)
+                continue
 
-          if args.cv_folds > 1:
-              print(f"\n{'='*60}\nFold {fold_i + 1} / {args.cv_folds}\n{'='*60}")
+            if args.cv_folds > 1:
+                print(f"\n{'='*60}\nFold {fold_i + 1} / {args.cv_folds}\n{'='*60}")
 
-          train_images2 = images[fold_train_idx]
-          if args.label_set == "derived":
-              train_labels2 = _make_derived(labels[fold_train_idx])
-          else:
-              train_labels2 = labels[fold_train_idx][:, label_cols]
+            train_images2 = images[fold_train_idx]
+            if args.label_set == "derived":
+                train_labels2 = _make_derived(labels[fold_train_idx])
+            else:
+                train_labels2 = labels[fold_train_idx][:, label_cols]
 
-          if fold_val_idx is not None:
-              val_images = images[fold_val_idx]
-              if args.label_set == "derived":
-                  val_labels = _make_derived(labels[fold_val_idx])
-              else:
-                  val_labels = labels[fold_val_idx][:, label_cols]
-          else:
-              val_images = val_labels = None
+            if fold_val_idx is not None:
+                val_images = images[fold_val_idx]
+                if args.label_set == "derived":
+                    val_labels = _make_derived(labels[fold_val_idx])
+                else:
+                    val_labels = labels[fold_val_idx][:, label_cols]
+            else:
+                val_images = val_labels = None
 
-          # Pure-source filtering on training and val splits
-          tr_mask = np.ones(len(fold_train_idx), dtype=bool)
-          if args.label_set == "pure":
-              tr_mask = labels[fold_train_idx].sum(axis=1) == 1
-              train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
-              if val_images is not None:
-                  va_mask = labels[fold_val_idx].sum(axis=1) == 1
-                  val_images, val_labels = val_images[va_mask], val_labels[va_mask]
-          elif args.label_set in ("classical_pure", "initial_pure"):
-              tr_mask = labels[fold_train_idx][:, 0:5].sum(axis=1) == 1
-              train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
-              if val_images is not None:
-                  va_mask = labels[fold_val_idx][:, 0:5].sum(axis=1) == 1
-                  val_images, val_labels = val_images[va_mask], val_labels[va_mask]
+            # Pure-source filtering on training and val splits
+            tr_mask = np.ones(len(fold_train_idx), dtype=bool)
+            if args.label_set == "pure":
+                tr_mask = labels[fold_train_idx].sum(axis=1) == 1
+                train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
+                if val_images is not None:
+                    va_mask = labels[fold_val_idx].sum(axis=1) == 1
+                    val_images, val_labels = val_images[va_mask], val_labels[va_mask]
+            elif args.label_set in ("classical_pure", "initial_pure"):
+                tr_mask = labels[fold_train_idx][:, 0:5].sum(axis=1) == 1
+                train_images2, train_labels2 = train_images2[tr_mask], train_labels2[tr_mask]
+                if val_images is not None:
+                    va_mask = labels[fold_val_idx][:, 0:5].sum(axis=1) == 1
+                    val_images, val_labels = val_images[va_mask], val_labels[va_mask]
 
-          # Per-class alpha (computed from full 20-col labels, filtered consistently)
-          if args.label_set == 'derived':
-              _dc = train_labels2.sum(axis=0).astype(float)
-              _mean_dc = _dc.mean()
-              if args.class_weight_mode is None or args.class_weight_strength == 0.0:
-                  _alpha_arr = np.ones(n_classes, dtype=np.float32)
-              else:
-                  _alpha_arr = (_mean_dc / np.maximum(_dc, 1)) ** args.class_weight_strength
-          else:
-              _alpha_full = compute_class_weights(
-                  labels[fold_train_idx][tr_mask, :20],
-                  args.class_weight_mode,
-                  args.class_weight_strength,
-              )                                               # (20,)
-              _alpha_arr = _alpha_full[label_cols]            # (n_classes,)
-          alpha = torch.tensor(_alpha_arr, dtype=torch.float32, device=device)
-          print(f"  Train: {len(train_images2)}, Val: {len(val_images) if val_images is not None else 0}")
+            # Per-class alpha (on CPU — moved to device inside _train_one_run)
+            if args.label_set == 'derived':
+                _dc = train_labels2.sum(axis=0).astype(float)
+                _mean_dc = _dc.mean()
+                if args.class_weight_mode is None or args.class_weight_strength == 0.0:
+                    _alpha_arr = np.ones(n_classes, dtype=np.float32)
+                else:
+                    _alpha_arr = (_mean_dc / np.maximum(_dc, 1)) ** args.class_weight_strength
+            else:
+                _alpha_full = compute_class_weights(
+                    labels[fold_train_idx][tr_mask, :20],
+                    args.class_weight_mode,
+                    args.class_weight_strength,
+                )                                               # (20,)
+                _alpha_arr = _alpha_full[label_cols]            # (n_classes,)
+            alpha = torch.tensor(_alpha_arr, dtype=torch.float32)  # CPU
 
-          fold_out = run_out / f'fold{fold_i + 1}' if args.cv_folds > 1 else run_out
-          fold_out.mkdir(parents=True, exist_ok=True)
+            fold_out = run_out / f'fold{fold_i + 1}' if args.cv_folds > 1 else run_out
+            fold_out.mkdir(parents=True, exist_ok=True)
 
-          # ── Image size ────────────────────────────────────────────────────
-          H, W = train_images2.shape[-2], train_images2.shape[-1]
-          img_shape = (1, H, W)
+            # Scattering coefficients (computed once per fold, passed into _train_one_run)
+            scat_tr = scat_va = scat_te = None
+            if args.model in ('scatternet', 'simplescatternet', 'dualssn'):
+                print("Computing scattering coefficients...")
+                _scat_parts = [train_images2]
+                if val_images is not None:
+                    _scat_parts.append(val_images)
+                _scat_parts.append(test_images)
+                all_scat, _scat_shape = compute_scattering(
+                    np.concatenate(_scat_parts, axis=0), J=2, L=8, device=str(device))
+                n_tr2 = len(train_images2)
+                scat_tr = all_scat[:n_tr2]
+                if val_images is not None:
+                    n_va    = len(val_images)
+                    scat_va = all_scat[n_tr2:n_tr2 + n_va]
+                    scat_te = all_scat[n_tr2 + n_va:]
+                else:
+                    scat_va = None
+                    scat_te = all_scat[n_tr2:]
+                print(f"  Scattering done: train={scat_tr.shape}, "
+                      f"val={'None' if scat_va is None else scat_va.shape}, "
+                      f"test={scat_te.shape}")
 
-          # ── Transforms ───────────────────────────────────────────────────
-          _aug = transforms.Compose([
-              transforms.RandomHorizontalFlip(),
-              transforms.RandomVerticalFlip(),
-              transforms.RandomRotation(degrees=180),
-          ])
-          if args.model == 'vit':
-              tf_train = transforms.Compose([transforms.Resize(224), transforms.RandomHorizontalFlip(),
-                                             transforms.RandomVerticalFlip(), transforms.RandomRotation(degrees=180)])
-              tf_val   = transforms.Compose([transforms.Resize(224)])
-              print(f"  Upsampling images to 224×224 for {args.model} (train: +flip/rotate aug)")
-          elif args.model == 'enb0':
-              tf_train = get_augmentation('quart_ext')
-              tf_val   = None
-              print(f"  Training at native 89×89 for {args.model} (train: quart_ext aug)")
-          else:
-              tf_train = None
-              tf_val   = None
+            results, _, _, _, (trl, tel, val) = _train_one_run(
+                train_images2, train_labels2,
+                test_images, test_labels,
+                _te_labels_20_arr,
+                model_name=args.model, n_classes=n_classes, class_names=class_names,
+                device=device, args=args, alpha=alpha,
+                val_imgs=val_images, val_lbs=val_labels,
+                scat_tr=scat_tr, scat_va=scat_va, scat_te=scat_te,
+                seed=run_seed, run_dir=fold_out,
+                test_source_idx=test_idx,
+            )
+            all_train_losses.append(trl)
+            all_test_losses.append(tel)
+            all_val_losses.append(val)
+            fold_results_list.append(results)
 
-          # ── Scattering coefficients ───────────────────────────────────────
-          scat_shape = None
-          if args.model in ('scatternet', 'simplescatternet', 'dualssn'):
-              print("Computing scattering coefficients...")
-              _scat_parts = [train_images2]
-              if val_images is not None:
-                  _scat_parts.append(val_images)
-              _scat_parts.append(test_images)
-              all_scat, scat_shape = compute_scattering(
-                  np.concatenate(_scat_parts, axis=0), J=2, L=8, device=str(device))
-              n_tr2 = len(train_images2)
-              scat_tr = all_scat[:n_tr2]
-              if val_images is not None:
-                  n_va   = len(val_images)
-                  scat_va = all_scat[n_tr2:n_tr2 + n_va]
-                  scat_te = all_scat[n_tr2 + n_va:]
-              else:
-                  scat_va = None
-                  scat_te = all_scat[n_tr2:]
-              n_te = len(test_images)
-              print(f"  Scattering done: train={scat_tr.shape}, "
-                    f"val={'None' if scat_va is None else scat_va.shape}, "
-                    f"test={scat_te.shape}")
-
-          # ── Build model ───────────────────────────────────────────────────
-          print(f"Building model: {args.model}")
-          model = build_model(args.model, n_classes, img_shape, scat_shape)
-          model = model.to(device)
-          if args.compile:
-              model = torch.compile(model)
-              print("  torch.compile() applied")
-          n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-          print(f"  Parameters: {n_params:,}")
-
-          # ── DataLoaders ───────────────────────────────────────────────────
-          if args.model in ('scatternet', 'simplescatternet'):
-              # Only scattering input (no raw image)
-              train_dl = make_loader(ScatterDataset(train_images2, scat_tr, train_labels2),
-                                     args.batch_size, shuffle=True)
-              test_dl  = make_loader(ScatterDataset(test_images, scat_te, test_labels),
-                                     args.batch_size, shuffle=False)
-              val_dl   = (make_loader(ScatterDataset(val_images, scat_va, val_labels),
-                                      args.batch_size, shuffle=False)
-                          if val_images is not None else None)
-              use_scat_only = True
-          elif args.model == 'dualssn':
-              train_dl = make_loader(ScatterDataset(train_images2, scat_tr, train_labels2),
-                                     args.batch_size, shuffle=True)
-              test_dl  = make_loader(ScatterDataset(test_images, scat_te, test_labels),
-                                     args.batch_size, shuffle=False)
-              val_dl   = (make_loader(ScatterDataset(val_images, scat_va, val_labels),
-                                      args.batch_size, shuffle=False)
-                          if val_images is not None else None)
-              use_scat_only = False
-          else:
-              train_dl = make_loader(RadioImageDataset(train_images2, train_labels2, tf_train),
-                                     args.batch_size, shuffle=True)
-              test_dl  = make_loader(RadioImageDataset(test_images, test_labels, tf_val),
-                                     args.batch_size, shuffle=False)
-              val_dl   = (make_loader(RadioImageDataset(val_images, val_labels, tf_val),
-                                      args.batch_size, shuffle=False)
-                          if val_images is not None else None)
-              use_scat_only = False
-
-          # ── Optimiser ─────────────────────────────────────────────────────
-          optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-          scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-              optimiser, mode='min', factor=0.5, patience=5
-          )
-
-          # ── Training loop ─────────────────────────────────────────────────
-          train_losses, val_losses, test_losses = [], [], []
-          best_val_loss  = float('inf')
-          best_state     = None
-          epochs_no_impr = 0
-
-          def _forward(mdl, batch):
-              if args.model == 'dualssn':
-                  imgs, scats, labels_b = batch
-                  imgs, scats, labels_b = imgs.to(device), scats.to(device), labels_b.to(device)
-                  return mdl(imgs, scats), labels_b
-              elif use_scat_only:
-                  _, scats, labels_b = batch
-                  scats, labels_b = scats.to(device), labels_b.to(device)
-                  return mdl(scats), labels_b
-              else:
-                  imgs, labels_b = batch
-                  imgs, labels_b = imgs.to(device), labels_b.to(device)
-                  return mdl(imgs), labels_b
-
-          for epoch in range(1, args.epochs + 1):
-              model.train()
-              epoch_loss = 0.0
-
-              for batch in train_dl:
-                  logits, labels_b = _forward(model, batch)
-                  loss = weighted_bce_loss(logits, labels_b, alpha, n_classes)
-                  optimiser.zero_grad()
-                  loss.backward()
-                  optimiser.step()
-                  epoch_loss += loss.item() * len(labels_b)
-
-              train_losses.append(epoch_loss / len(train_dl.dataset))
-
-              # Test loss (always, for curve)
-              model.eval()
-              test_loss_total = 0.0
-              with torch.no_grad():
-                  for batch in test_dl:
-                      logits, labels_b = _forward(model, batch)
-                      test_loss_total += F.binary_cross_entropy_with_logits(
-                          logits, labels_b.float()).item() * len(labels_b)
-              test_losses.append(test_loss_total / len(test_dl.dataset))
-
-              # Validation loss + early stopping (only when val_dl is provided)
-              if val_dl is not None:
-                  val_loss_total = 0.0
-                  with torch.no_grad():
-                      for batch in val_dl:
-                          logits, labels_b = _forward(model, batch)
-                          val_loss_total += F.binary_cross_entropy_with_logits(
-                              logits, labels_b.float()).item() * len(labels_b)
-                  val_loss = val_loss_total / len(val_dl.dataset)
-                  val_losses.append(val_loss)
-                  scheduler.step(val_loss)
-
-                  if val_loss < best_val_loss:
-                      best_val_loss  = val_loss
-                      best_state     = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                      epochs_no_impr = 0
-                  else:
-                      epochs_no_impr += 1
-                      if epochs_no_impr >= args.patience:
-                          print(f"Early stopping at epoch {epoch}")
-                          break
-              else:
-                  scheduler.step(train_losses[-1])
-
-              if epoch % 10 == 0 or epoch == 1:
-                  _msg = (f"Epoch {epoch:3d}  train={train_losses[-1]:.4f}  "
-                          f"test={test_losses[-1]:.4f}")
-                  if val_dl is not None:
-                      _msg += f"  val={val_losses[-1]:.4f}"
-                  _msg += f"  lr={optimiser.param_groups[0]['lr']:.2e}"
-                  print(_msg)
-
-          if best_state is not None:
-              model.load_state_dict(best_state)
-              print(f"Restored best model (val loss = {best_val_loss:.4f})")
-
-          all_train_losses.append(train_losses)
-          all_test_losses.append(test_losses)
-          all_val_losses.append(val_losses)
-
-          # ── Test inference ────────────────────────────────────────────────
-          model.eval()
-          all_probs, all_preds, all_labels = [], [], []
-
-          with torch.no_grad():
-              for batch in test_dl:
-                  if args.model == 'dualssn':
-                      imgs, scats, labels_b = batch
-                      imgs, scats = imgs.to(device), scats.to(device)
-                      logits = model(imgs, scats)
-                  elif use_scat_only:
-                      _, scats, labels_b = batch
-                      scats = scats.to(device)
-                      logits = model(scats)
-                  else:
-                      imgs, labels_b = batch
-                      imgs = imgs.to(device)
-                      logits = model(imgs)
-
-                  probs = torch.sigmoid(logits).cpu().numpy()
-                  preds = (probs >= 0.5).astype(int)
-                  all_probs.append(probs)
-                  all_preds.append(preds)
-                  all_labels.append(labels_b.numpy())
-
-          test_probs      = np.concatenate(all_probs,  axis=0)
-          test_preds      = np.concatenate(all_preds,  axis=0)
-          test_labels_arr = np.concatenate(all_labels, axis=0)
-
-          # ── Metrics ───────────────────────────────────────────────────────
-          results = evaluate_metrics(test_labels_arr, test_preds, test_probs, class_names)
-          print(f"\nMacro F1:     {results['f1_macro']:.4f}")
-          print(f"Macro AUC:    {results['auc_macro']:.4f}")
-          print(f"Macro Recall: {results['recall_macro']:.4f}")
-          print(f"Accuracy:     {results['accuracy']:.4f}")
-
-          # ── Save outputs ──────────────────────────────────────────────────
-          np.save(fold_out / 'test_probs.npy',      test_probs)
-          np.save(fold_out / 'test_preds.npy',      test_preds)
-          np.save(fold_out / 'test_labels.npy',     test_labels_arr)
-          np.save(fold_out / 'test_labels_20.npy',  _te_labels_20_arr)
-          np.save(fold_out / 'test_source_idx.npy', test_idx)
-
-          torch.save({
-              'state_dict':  best_state,
-              'model':       args.model,
-              'label_set':   args.label_set,
-              'class_names': class_names,
-              'n_classes':   n_classes,
-              'scat_shape':  scat_shape,
-              'img_shape':   img_shape,
-              'seed':        args.seed,
-          }, fold_out / 'model_best.pt')
-          torch.save(model, fold_out / 'model_best_full.pt')
-
-          results['label_set']          = args.label_set
-          results['eval_fri_frii_pure'] = args.eval_fri_frii_pure
-          with open(fold_out / 'results.json', 'w') as f:
-              json.dump(results, f, indent=2)
-
-          print(f"\nAll outputs saved to: {fold_out}")
-          fold_results_list.append(results)
-
+        # K-fold aggregation
         if args.cv_folds > 1:
             f1s  = [r['f1_macro']     for r in fold_results_list]
             aucs = [r['auc_macro']    for r in fold_results_list]
@@ -807,6 +859,7 @@ def main():
 
         all_run_results.append(fold_results_list)
 
+    # Aggregated multi-run training curve
     if all_train_losses:
         curve_alpha = max(0.2, 1.0 / max(1, len(all_train_losses)))
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -850,7 +903,7 @@ def main():
             print(f"  {label}: {mean:.4f} ± {std:.4f}"
                   f"  (min={np.min(vals):.4f}, max={np.max(vals):.4f})")
 
-        # ── Ensemble scores ───────────────────────────────────────────────────
+        # Ensemble scores
         all_probs_runs = []
         for run_i in range(1, args.n_runs + 1):
             p = np.load(out_dir / f'run{run_i}' / 'test_probs.npy')
@@ -858,7 +911,7 @@ def main():
         test_labels_arr = np.load(out_dir / 'run1' / 'test_labels.npy')
 
         f1_vals  = [r['f1_macro'] for r in run_results]
-        ranked   = list(np.argsort(f1_vals)[::-1])   # indices, best first
+        ranked   = list(np.argsort(f1_vals)[::-1])
 
         print(f"\n  Ensemble scores (runs ranked by F1, threshold 0.5):")
         ensemble_summary = {}
@@ -891,23 +944,12 @@ def main():
             json.dump(summary_out, f, indent=2)
         print(f"\n  Summary saved to: {out_dir / 'run_summary.json'}")
 
-    # ── Label-fraction sweep ───────────────────────────────────────────────────
-    # Runs n_runs independent sweeps (one per training run, matching seeds).
-    # 100% fraction is read from the already-completed results.json — no
-    # retraining.  Sub-100% fractions are retrained from scratch with the
-    # run's seed so that std is meaningful across all fractions.
-    # One label_fraction_metrics.json is saved per run_out directory so that
-    # the notebook's rglob() picks them all up and computes mean ± std.
-    # Skipped for scatter-based models (dualssn, scatternet, simplescatternet).
+    # ════════════════════════════════════════════════════════════════════
+    # Shared preamble for sweep (Path C) and gen-aug (Path B)
+    # ════════════════════════════════════════════════════════════════════
     _skip_sweep = args.skip_sweep or args.model in ('dualssn', 'scatternet', 'simplescatternet')
 
-    # Shared preamble for sweep and gen-aug
-    _H, _W     = images.shape[-2], images.shape[-1]
-    _aug_sw = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(degrees=180),
-    ])
+    _H, _W = images.shape[-2], images.shape[-1]
     if args.model == 'vit':
         _tf_sw       = transforms.Compose([transforms.Resize(224)])
         _tf_train_sw = transforms.Compose([transforms.Resize(224), transforms.RandomHorizontalFlip(),
@@ -920,8 +962,9 @@ def main():
         _tf_train_sw = None
     print(f"  Transforms: val={'Resize(224)' if args.model == 'vit' else 'none'}  "
           f"train={'quart_ext' if args.model == 'enb0' else ('+flip/rotate' if args.model == 'vit' else 'none')}")
+
     if args.label_set == 'derived':
-        _alpha_sw = torch.ones(n_classes, dtype=torch.float32, device=device)
+        _alpha_sw = torch.ones(n_classes, dtype=torch.float32)  # CPU
     else:
         _tr_pure_mask_sw = np.ones(len(train_idx), dtype=bool)
         if args.label_set in ("classical_pure", "initial_pure"):
@@ -931,9 +974,9 @@ def main():
             args.class_weight_mode,
             args.class_weight_strength,
         )
-        _alpha_sw = torch.tensor(_alpha_full_sw[label_cols], dtype=torch.float32, device=device)
+        _alpha_sw = torch.tensor(_alpha_full_sw[label_cols], dtype=torch.float32)  # CPU
 
-    # Val images / labels for sweep (from val_test_idx when early stopping, else None)
+    # Val images/labels for sweep and gen-aug (from val_test_idx when early stopping)
     if val_test_idx is not None:
         _va_images_sw = images[val_test_idx]
         _va_labels_sw = (_make_derived(labels[val_test_idx]) if args.label_set == "derived"
@@ -945,12 +988,10 @@ def main():
     else:
         _va_images_sw = _va_labels_sw = None
 
-    _te_dl_sw = make_loader(
-        RadioImageDataset(test_images, test_labels, _tf_sw),
-        args.batch_size, shuffle=False)
-
+    # ════════════════════════════════════════════════════════════════════
+    # PATH B — Generative augmentation
+    # ════════════════════════════════════════════════════════════════════
     if args.gen_dir is not None:
-        # ── Generative augmentation experiment ────────────────────────────────
         GEN_FRACS = [0.5, 1.0, 2.0]
 
         import zuko
@@ -1003,7 +1044,7 @@ def main():
                 torch.manual_seed(_run_seed)
                 np.random.seed(_run_seed)
 
-                # ── Real training images (full set, with pure filter if applicable) ──
+                # Real training images (full set, with pure filter if applicable)
                 _tr_im = images[train_idx]
                 _tr_lb = (_make_derived(labels[train_idx]) if args.label_set == "derived"
                           else labels[train_idx][:, label_cols])
@@ -1016,13 +1057,12 @@ def main():
                     _pm = labels[train_idx].sum(axis=1) == 1
                     _tr_im, _tr_lb, _tr_initial = _tr_im[_pm], _tr_lb[_pm], _tr_initial[_pm]
 
-                n_real  = len(_tr_im)
-                n_gen   = int(_gfrac * n_real)
+                n_real = len(_tr_im)
+                n_gen  = int(_gfrac * n_real)
                 print(f"\n  frac={_gfrac}  run={_ri}  real={n_real}  gen={n_gen}", flush=True)
 
-                # ── Generate images ────────────────────────────────────────────────
-                # Sample conditions by cycling through training labels
-                _cond_idx = np.resize(np.arange(n_real), n_gen)  # tile if n_gen > n_real
+                # Generate images by cycling through training labels
+                _cond_idx = np.resize(np.arange(n_real), n_gen)
                 _cond     = torch.tensor(_tr_initial[_cond_idx], dtype=torch.float32)
                 _gen_imgs_list, _gen_lbs_list = [], []
 
@@ -1033,7 +1073,6 @@ def main():
                         _cy   = _cond[_b0:_b1].to(device)
                         _z    = _nsf(_cy).sample()          # (B, feat_dim)
                         _xgen = _decoder.sample(_z)          # (B, 1, 89, 89) float [0,1]
-                        # Convert to uint8 to match images_filtered.npy dtype
                         _xgen_u8 = (_xgen.squeeze(1).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
                         _gen_imgs_list.append(_xgen_u8)
                         _gen_lbs_list.append(
@@ -1045,104 +1084,49 @@ def main():
                 _gen_imgs = np.concatenate(_gen_imgs_list, axis=0)   # (n_gen, 89, 89) uint8
                 _gen_lbs  = np.concatenate(_gen_lbs_list, axis=0)    # (n_gen, n_classes)
 
-                # ── Combine real + generated ───────────────────────────────────────
+                # Combine real + generated
                 _aug_imgs = np.concatenate([_tr_im, _gen_imgs], axis=0)
                 _aug_lbs  = np.concatenate([_tr_lb, _gen_lbs],  axis=0)
-                print(f"    Augmented training set: {len(_aug_imgs)} total ({n_real} real + {n_gen} gen)", flush=True)
+                print(f"    Augmented training set: {len(_aug_imgs)} total "
+                      f"({n_real} real + {n_gen} gen)", flush=True)
 
-                # ── Train classifier ───────────────────────────────────────────────
-                torch.manual_seed(_run_seed); np.random.seed(_run_seed)
-                _mdl_g = build_model(args.model, n_classes, (1, _H, _W)).to(device)
-                if args.compile:
-                    _mdl_g = torch.compile(_mdl_g)
-                _opt_g = torch.optim.AdamW(_mdl_g.parameters(), lr=args.lr, weight_decay=1e-4)
-                _sch_g = torch.optim.lr_scheduler.ReduceLROnPlateau(_opt_g, mode='min', factor=0.5, patience=5)
-                _alpha_g = torch.ones(n_classes, dtype=torch.float32, device=device)
+                # Uniform alpha for gen-aug (on CPU)
+                _alpha_g = torch.ones(n_classes, dtype=torch.float32)
 
-                _tr_dl_g = make_loader(RadioImageDataset(_aug_imgs, _aug_lbs, _tf_train_sw), args.batch_size, shuffle=True)
-                _va_dl_g = (make_loader(RadioImageDataset(_va_images_sw, _va_labels_sw, _tf_sw), args.batch_size, shuffle=False)
-                            if _va_images_sw is not None else None)
+                results, _, _, _, _ = _train_one_run(
+                    _aug_imgs, _aug_lbs,
+                    test_images, test_labels,
+                    _te_labels_20_arr,
+                    model_name=args.model, n_classes=n_classes, class_names=class_names,
+                    device=device, args=args, alpha=_alpha_g,
+                    val_imgs=_va_images_sw, val_lbs=_va_labels_sw,
+                    extra_results={"gen_frac": _gfrac, "n_real": n_real, "n_gen": n_gen},
+                    seed=_run_seed, run_dir=_run_dir,
+                )
+                print(f"      F1={results['f1_macro']:.4f}  AUC={results['auc_macro']:.4f}"
+                      f"  Rec={results['recall_macro']:.4f}  Acc={results['accuracy']:.4f}",
+                      flush=True)
+                _frac_run_results.append(results)
 
-                _bv_g, _bs_g, _ni_g = float('inf'), None, 0
-                _tr_losses_g, _va_losses_g = [], []
-                for _ep_g in range(1, args.epochs + 1):
-                    _mdl_g.train()
-                    _ep_tr_loss = 0.0
-                    for _im_g, _lb_g in _tr_dl_g:
-                        _im_g, _lb_g = _im_g.to(device), _lb_g.to(device)
-                        _loss_g = weighted_bce_loss(_mdl_g(_im_g), _lb_g, _alpha_g, n_classes)
-                        _opt_g.zero_grad(); _loss_g.backward(); _opt_g.step()
-                        _ep_tr_loss += _loss_g.item() * len(_lb_g)
-                    _tr_losses_g.append(_ep_tr_loss / len(_tr_dl_g.dataset))
-                    if _va_dl_g is not None:
-                        _mdl_g.eval()
-                        _vl_g = 0.0
-                        with torch.no_grad():
-                            for _im_g, _lb_g in _va_dl_g:
-                                _im_g, _lb_g = _im_g.to(device), _lb_g.to(device)
-                                _vl_g += F.binary_cross_entropy_with_logits(
-                                    _mdl_g(_im_g), _lb_g.float()).item() * len(_lb_g)
-                        _vl_g /= len(_va_dl_g.dataset)
-                        _va_losses_g.append(_vl_g)
-                        _sch_g.step(_vl_g)
-                        if _vl_g < _bv_g:
-                            _bv_g, _bs_g, _ni_g = _vl_g, {k: v.cpu().clone() for k, v in _mdl_g.state_dict().items()}, 0
-                        else:
-                            _ni_g += 1
-                            if _ni_g >= args.patience:
-                                print(f"      Early stop ep {_ep_g}", flush=True); break
-                if _bs_g is not None:
-                    _mdl_g.load_state_dict(_bs_g)
-
-                # ── Training curve ────────────────────────────────────────────────
-                _fig_tc, _ax_tc = plt.subplots(figsize=(8, 4))
-                _ax_tc.plot(range(1, len(_tr_losses_g) + 1), _tr_losses_g, label="train")
-                if _va_losses_g:
-                    _ax_tc.plot(range(1, len(_va_losses_g) + 1), _va_losses_g, label="val")
-                _ax_tc.set_xlabel("Epoch")
-                _ax_tc.set_ylabel("Loss")
-                _ax_tc.set_title(f"Gen-aug  frac={_gfrac:.2f}  run={_ri}  real={n_real}  gen={n_gen}")
-                _ax_tc.legend()
-                _ax_tc.grid(True, alpha=0.3)
-                _fig_tc.tight_layout()
-                _fig_tc.savefig(_run_dir / 'training_curve.png', dpi=100)
-                plt.close(_fig_tc)
-
-                # ── Evaluate on test set ───────────────────────────────────────────
-                _mdl_g.eval()
-                _pb_g, _pd_g, _lb_g_all = [], [], []
-                with torch.no_grad():
-                    for _im_g, _lb_g in _te_dl_sw:
-                        _im_g = _im_g.to(device)
-                        _pb   = torch.sigmoid(_mdl_g(_im_g)).cpu().numpy()
-                        _pb_g.append(_pb); _pd_g.append((_pb >= 0.5).astype(int)); _lb_g_all.append(_lb_g.numpy())
-                _pb_g_cat = np.concatenate(_pb_g)
-                _pd_g_cat = np.concatenate(_pd_g)
-                _lb_g_cat = np.concatenate(_lb_g_all)
-                _ms_g = evaluate_metrics(_lb_g_cat, _pd_g_cat, _pb_g_cat, class_names)
-                print(f"      F1={_ms_g['f1_macro']:.4f}  AUC={_ms_g['auc_macro']:.4f}  Rec={_ms_g['recall_macro']:.4f}  Acc={_ms_g['accuracy']:.4f}", flush=True)
-
-                _res_g = {"gen_frac": _gfrac, "n_real": n_real, "n_gen": n_gen,
-                          "f1_macro": _ms_g["f1_macro"], "auc_macro": _ms_g["auc_macro"],
-                          "accuracy": _ms_g["accuracy"], "recall_macro": _ms_g["recall_macro"]}
-                with open(_res_path, "w") as _f: json.dump(_res_g, _f, indent=2)
-                np.save(_run_dir / 'test_probs.npy',     _pb_g_cat)
-                np.save(_run_dir / 'test_labels_20.npy', _te_labels_20_arr)
-                _frac_run_results.append(_res_g)
-
-            # Aggregate across runs
+            # Aggregate across runs for this fraction
             _metrics_agg = {m: float(np.mean([r[m] for r in _frac_run_results]))
                             for m in ("f1_macro", "auc_macro", "accuracy", "recall_macro")}
             if args.n_runs > 1:
                 _metrics_agg.update({f"{m}_std": float(np.std([r[m] for r in _frac_run_results]))
                                      for m in ("f1_macro", "auc_macro", "accuracy", "recall_macro")})
             _gen_summary[str(_gfrac)] = _metrics_agg
-            print(f"\n  frac={_gfrac}: mean F1={_metrics_agg['f1_macro']:.4f}  AUC={_metrics_agg['auc_macro']:.4f}  Rec={_metrics_agg['recall_macro']:.4f}  Acc={_metrics_agg['accuracy']:.4f}", flush=True)
+            print(f"\n  frac={_gfrac}: mean F1={_metrics_agg['f1_macro']:.4f}"
+                  f"  AUC={_metrics_agg['auc_macro']:.4f}"
+                  f"  Rec={_metrics_agg['recall_macro']:.4f}"
+                  f"  Acc={_metrics_agg['accuracy']:.4f}", flush=True)
 
         with open(out_dir / "gen_aug_summary.json", "w") as _f:
             json.dump(_gen_summary, _f, indent=2)
         print(f"\nGen-aug summary saved → {out_dir / 'gen_aug_summary.json'}")
 
+    # ════════════════════════════════════════════════════════════════════
+    # PATH C — Label-fraction sweep (only when gen_dir is None)
+    # ════════════════════════════════════════════════════════════════════
     elif not _skip_sweep:
         _FRACS_SUB = [0.01, 0.05, 0.10, 0.25, 0.50]  # 100% loaded from results.json
 
@@ -1213,12 +1197,8 @@ def main():
             else:
                 print(f"    100%: results.json not found — skipping 100% point.", flush=True)
 
-            # Sub-100% fractions: retrain with this run's seed
+            # Sub-100% fractions: retrain with this run's seed, no file saving
             _rng_sw = np.random.default_rng(_run_seed)
-            _va_dl_sw = (make_loader(
-                RadioImageDataset(_va_images_sw, _va_labels_sw, _tf_sw),
-                args.batch_size, shuffle=False)
-                if _va_images_sw is not None else None)
 
             for _frac in _FRACS_SUB:
                 print(f"\n    Fraction {_frac:.0%}:", flush=True)
@@ -1239,81 +1219,32 @@ def main():
                     continue
                 print(f"      Training on {len(_tr_im_sw)} samples", flush=True)
 
-                torch.manual_seed(_run_seed)
-                np.random.seed(_run_seed)
-                _mdl_sw = build_model(args.model, n_classes, (1, _H, _W)).to(device)
-                if args.compile:
-                    _mdl_sw = torch.compile(_mdl_sw)
-                _opt_sw = torch.optim.AdamW(_mdl_sw.parameters(),
-                                           lr=args.lr, weight_decay=1e-4)
-                _sch_sw = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    _opt_sw, mode='min', factor=0.5, patience=5)
-                _tr_dl_sw = make_loader(
-                    RadioImageDataset(_tr_im_sw, _tr_lb_sw, _tf_train_sw),
-                    args.batch_size, shuffle=True)
-
-                _bv_sw, _bs_sw, _ni_sw = float('inf'), None, 0
-                for _ep_sw in range(1, args.epochs + 1):
-                    _mdl_sw.train()
-                    for _im_sw, _lb_sw in _tr_dl_sw:
-                        _im_sw, _lb_sw = _im_sw.to(device), _lb_sw.to(device)
-                        _loss_sw = weighted_bce_loss(
-                            _mdl_sw(_im_sw), _lb_sw, _alpha_sw, n_classes)
-                        _opt_sw.zero_grad()
-                        _loss_sw.backward()
-                        _opt_sw.step()
-                    if _va_dl_sw is not None:
-                        _mdl_sw.eval()
-                        _vl_sw = 0.0
-                        with torch.no_grad():
-                            for _im_sw, _lb_sw in _va_dl_sw:
-                                _im_sw, _lb_sw = _im_sw.to(device), _lb_sw.to(device)
-                                _vl_sw += F.binary_cross_entropy_with_logits(
-                                    _mdl_sw(_im_sw), _lb_sw.float()).item() * len(_lb_sw)
-                        _vl_sw /= len(_va_dl_sw.dataset)
-                        _sch_sw.step(_vl_sw)
-                        if _vl_sw < _bv_sw:
-                            _bv_sw = _vl_sw
-                            _bs_sw = {k: v.cpu().clone()
-                                      for k, v in _mdl_sw.state_dict().items()}
-                            _ni_sw = 0
-                        else:
-                            _ni_sw += 1
-                            if _ni_sw >= args.patience:
-                                print(f"      Early stop ep {_ep_sw}", flush=True)
-                                break
-                if _bs_sw is not None:
-                    _mdl_sw.load_state_dict(_bs_sw)
-
-                _mdl_sw.eval()
-                _pb_sw, _pd_sw, _lb_sw_all = [], [], []
-                with torch.no_grad():
-                    for _im_sw, _lb_sw in _te_dl_sw:
-                        _im_sw = _im_sw.to(device)
-                        _pb = torch.sigmoid(_mdl_sw(_im_sw)).cpu().numpy()
-                        _pb_sw.append(_pb)
-                        _pd_sw.append((_pb >= 0.5).astype(int))
-                        _lb_sw_all.append(_lb_sw.numpy())
-                _tp_sw = np.concatenate(_pb_sw)
-                _yp_sw = np.concatenate(_pd_sw)
-                _yt_sw = np.concatenate(_lb_sw_all)
-                _ms = evaluate_metrics(_yt_sw, _yp_sw, _tp_sw, class_names)
+                results, _tp_sw, _, _yt_sw, _ = _train_one_run(
+                    _tr_im_sw, _tr_lb_sw,
+                    test_images, test_labels,
+                    _te_labels_20_arr,
+                    model_name=args.model, n_classes=n_classes, class_names=class_names,
+                    device=device, args=args, alpha=_alpha_sw,
+                    val_imgs=_va_images_sw, val_lbs=_va_labels_sw,
+                    seed=_run_seed, run_dir=None,  # no file saving for sweep fractions
+                )
                 _frac_out[str(_frac)] = {"Supervised": {
-                    "f1":       _ms["f1_macro"],
-                    "auc":      _ms["auc_macro"],
-                    "accuracy": _ms["accuracy"],
-                    "recall":   _ms["recall_macro"],
+                    "f1":       results["f1_macro"],
+                    "auc":      results["auc_macro"],
+                    "accuracy": results["accuracy"],
+                    "recall":   results["recall_macro"],
                 }}
-                print(f"      F1={_ms['f1_macro']:.4f}  AUC={_ms['auc_macro']:.4f}"
-                      f"  Acc={_ms['accuracy']:.4f}", flush=True)
+                print(f"      F1={results['f1_macro']:.4f}  AUC={results['auc_macro']:.4f}"
+                      f"  Acc={results['accuracy']:.4f}", flush=True)
+
                 # ip cross-eval
                 if _need_ip_frac and _yt_sw.ndim == 2 and _yt_sw.shape[1] >= 5:
-                    _ipm_f  = _yt_sw[:, :5].sum(axis=1) == 1
+                    _ipm_f = _yt_sw[:, :5].sum(axis=1) == 1
                     if _ipm_f.any():
-                        _p5f    = _tp_sw[_ipm_f, :5]
-                        _p5fn   = _p5f / _p5f.sum(axis=1, keepdims=True).clip(min=1e-9)
-                        _yt5f   = _yt_sw[_ipm_f, :5].argmax(axis=1)
-                        _yp5f   = _p5fn.argmax(axis=1)
+                        _p5f  = _tp_sw[_ipm_f, :5]
+                        _p5fn = _p5f / _p5f.sum(axis=1, keepdims=True).clip(min=1e-9)
+                        _yt5f = _yt_sw[_ipm_f, :5].argmax(axis=1)
+                        _yp5f = _p5fn.argmax(axis=1)
                         from sklearn.metrics import (f1_score as _f1s, accuracy_score as _accs,
                             recall_score as _recs, roc_auc_score as _aucs)
                         from sklearn.preprocessing import label_binarize as _lbin

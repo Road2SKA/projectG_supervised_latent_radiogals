@@ -42,6 +42,7 @@ from astronomaly.feature_extraction import shape_features as _sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_sample_weights, LABEL_COLS, TIERS
+from suplat.models.byol_models import BYOLEfficientNetB0 as _BYOLModel
 
 _LABEL_COL_IDX = {c: i for i, c in enumerate(LABEL_COLS)}
 
@@ -487,6 +488,255 @@ def compute_baselines(outputs_root, data_dir, csv_df, labels_all, data_seed,
 
 
 # ---------------------------------------------------------------------------
+# Noisy training sweep: BYOL GP + Ellipses GP trained on noisy images
+# ---------------------------------------------------------------------------
+def _add_noise_to_images(images, sigma_rel, rng):
+    """Add Gaussian noise scaled by per-image std. Returns float32 array."""
+    if sigma_rel == 0.0:
+        return images.astype(np.float32)
+    per_std = images.astype(np.float32).std(axis=(-2, -1), keepdims=True).clip(1e-6)
+    return (images.astype(np.float32)
+            + rng.normal(0, sigma_rel, images.shape).astype(np.float32) * per_std)
+
+
+def _byol_encode(model, images_01, device, batch_size=64):
+    """Encode (N, H, W) float32 images in [0, 1] -> (N, D) numpy via BYOL online_encoder."""
+    model.eval()
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(images_01), batch_size):
+            x = torch.from_numpy(images_01[i:i+batch_size]).unsqueeze(1).float().to(device)
+            out.append(model.online_encoder(x).float().cpu().numpy())
+    return np.vstack(out)
+
+
+def _nr_recall_auc(scores, true_hl, pos_thresh=3):
+    """Area under the cumulative recall curve."""
+    order  = np.argsort(scores)[::-1]
+    binary = (true_hl[order] >= pos_thresh).astype(int)
+    cum    = np.cumsum(binary)
+    n_pos  = int(binary.sum())
+    x      = np.arange(1, len(cum) + 1)
+    return float(np.trapezoid(cum, x) / (len(cum) * n_pos)) if n_pos > 0 else 0.0
+
+
+def run_noisy_training_sweep(
+    run_dir: Path,
+    csv_df: pd.DataFrame,
+    labels_all: np.ndarray,
+    noise_sigmas=None,
+    *,
+    latent: str = "proj",
+    use_pca: bool = True,
+    pca_components: int = None,
+    scale: bool = True,
+    l2norm: bool = False,
+    kernel_amplitude: bool = True,
+    rng_seed: int = 42,
+    encode_batch_size: int = 64,
+    outputs_root: Path = None,
+    force: bool = False,
+) -> dict:
+    """Train BYOL GP and Ellipses GP on noisy images, evaluate on the same noise level.
+
+    For each σ in noise_sigmas:
+    - Adds Gaussian noise (scaled by per-image std) to train AND test images at level σ
+    - Re-encodes with the BYOL checkpoint (for σ>0; σ=0 uses saved projections/encodings)
+    - Fits a GP on all train sources using ground-truth tier labels (no active-learning loop)
+    - Predicts on noisy test sources, computes recall-curve AUC
+
+    This is the "train on noisy, evaluate on noisy" counterpart to the notebook's
+    "train on clean, evaluate on noisy" noise robustness cell.
+
+    Output saved to {run_dir}/anomaly_baselines/noise_robustness/noisy_train_noise_robustness.json.
+    Returns the saved result dict.
+    """
+    if noise_sigmas is None:
+        noise_sigmas = [0.0, 0.25, 0.5, 1.0, 2.0]
+
+    out_path = run_dir / "anomaly_baselines" / "noise_robustness" / "noisy_train_noise_robustness.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_path.exists() and not force:
+        print(f"  noisy_train sweep: loaded from cache ({out_path.name})", flush=True)
+        with open(out_path) as fh:
+            return json.load(fh)
+
+    # ── Load checkpoint and data splits ──────────────────────────────────────
+    ckpt      = torch.load(run_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
+    data_seed = int(ckpt["config"]["data_seed"])
+    _f_label  = ckpt["config"].get("f_label", 1.0)
+    _f_str    = str(_f_label).rstrip('0').rstrip('.') if '.' in str(_f_label) else str(int(_f_label))
+
+    data_dir   = run_dir / "data"
+    byol_dir   = data_dir / "byol"
+    splits_dir = run_dir.parent.parent / "data_splits" / str(data_seed)
+
+    lab_idx   = _load_split(splits_dir, data_dir, "labelled_train_idx.npy",   _f_str)
+    unlab_idx = _load_split(splits_dir, data_dir, "unlabelled_train_idx.npy", _f_str)
+    test_idx  = _load_split(splits_dir, data_dir, "test_idx.npy")
+
+    if latent == "proj":
+        lab_feat        = np.load(byol_dir / "labelled_train_projections.npy")
+        test_feat_clean = np.load(byol_dir / "test_projections.npy")
+        unlab_feat_path = byol_dir / "unlabelled_train_projections.npy"
+    else:
+        lab_feat        = np.load(byol_dir / "labelled_train_encodings.npy")
+        test_feat_clean = np.load(byol_dir / "test_encodings.npy")
+        unlab_feat_path = byol_dir / "unlabelled_train_encodings.npy"
+
+    if unlab_feat_path.exists() and len(lab_idx) > 0 and len(unlab_idx) > 0:
+        unlab_feat       = np.load(unlab_feat_path)
+        train_feat_clean = np.concatenate([lab_feat, unlab_feat], axis=0)
+        train_idx        = np.concatenate([lab_idx, unlab_idx])
+    elif len(lab_idx) == 0:
+        train_feat_clean = lab_feat
+        train_idx        = unlab_idx
+    else:
+        train_feat_clean = lab_feat
+        train_idx        = lab_idx
+
+    n_train = len(train_idx)
+
+    # ── Ground-truth tier labels for train and test ───────────────────────────
+    all_idx      = np.concatenate([train_idx, test_idx])
+    labels_split = labels_all[all_idx]
+    raw_tiers    = np.ones(len(labels_split), dtype=float)
+    for sv, cols in reversed(TIERS):
+        ci = [_LABEL_COL_IDX[c] for c in cols]
+        raw_tiers[labels_split[:, ci].any(axis=1)] = float(sv)
+    train_hl = raw_tiers[:n_train]
+    test_hl  = raw_tiers[n_train:]
+    print(f"  Train: {n_train} sources ({int((train_hl >= 3).sum())} positives)  "
+          f"Test: {len(test_idx)} sources ({int((test_hl >= 3).sum())} positives)", flush=True)
+
+    # ── BYOL model (for σ>0 re-encoding) ─────────────────────────────────────
+    _model = _BYOLModel(
+        projection_dim=ckpt["config"].get("projection_dim", 256),
+        hidden_dim=ckpt["config"].get("hidden_dim", 4096),
+    )
+    _sd = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in _sd):
+        _sd = {k.removeprefix("_orig_mod."): v for k, v in _sd.items()}
+    _model.load_state_dict(_sd, strict=False)
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _model  = _model.to(_device)
+    print(f"  BYOL model loaded (device={_device})", flush=True)
+
+    # ── Raw images (copy train/test slices into RAM once) ─────────────────────
+    _images_mmap = np.load(IMAGES_PATH, mmap_mode="r")
+    train_imgs   = np.array(_images_mmap[train_idx])
+    test_imgs    = np.array(_images_mmap[test_idx])
+    del _images_mmap
+
+    # ── Clean ellipse features (σ=0; reuse anomaly_baselines cache) ───────────
+    _ell_root = (outputs_root or run_dir.parent.parent) / "anomaly_baselines" / f"_ell_cache_{data_seed}"
+    _ell_root.mkdir(parents=True, exist_ok=True)
+    _all_images_mmap = np.load(IMAGES_PATH, mmap_mode="r")
+    _ds_clean  = _NumpyImageDataset(_all_images_mmap.astype(np.float32) / 255.0,
+                                    output_dir=str(_ell_root), force_rerun=False)
+    _ext_clean = _sf.EllipseFitFeatures(percentiles=[90, 80, 70, 60, 50, 0], channel=0,
+                                         output_dir=str(_ell_root), force_rerun=False)
+    _all_ell_clean   = _ext_clean.run_on_dataset(_ds_clean)
+    train_ell_clean  = _all_ell_clean.iloc[train_idx]
+    test_ell_clean   = _all_ell_clean.iloc[test_idx]
+    del _all_images_mmap
+    print(f"  Ellipse features (clean) loaded: {_all_ell_clean.shape}", flush=True)
+
+    rng = np.random.default_rng(rng_seed)
+
+    # ── Inner helpers ─────────────────────────────────────────────────────────
+    def _byol_auc_for(tr_feat, te_feat):
+        """PCA + scale + simple GP fit on all train labels, return test AUC."""
+        all_feat = np.concatenate([tr_feat, te_feat], axis=0)
+        if l2norm:
+            norms    = np.linalg.norm(all_feat, axis=1, keepdims=True)
+            all_feat = all_feat / np.where(norms == 0, 1.0, norms)
+        if use_pca or latent == "enc":
+            n_comp   = pca_components if pca_components is not None else 0.95
+            pca      = PCA(n_components=n_comp, svd_solver="full")
+            all_feat = pca.fit_transform(all_feat)
+        if scale:
+            all_feat = StandardScaler().fit_transform(all_feat)
+        X_tr = all_feat[:n_train]
+        X_te = all_feat[n_train:]
+        _base = (
+            ConstantKernel(constant_value_bounds=(1e-3, 1e3)) *
+            Matern(length_scale_bounds=(1e-3, 1e4)) +
+            WhiteKernel(noise_level_bounds=(1e-3, 1e1))
+        ) if kernel_amplitude else (
+            Matern(length_scale_bounds=(1e-3, 1e4)) +
+            WhiteKernel(noise_level_bounds=(1e-3, 1e1))
+        )
+        gpr = GaussianProcessRegressor(kernel=_base, normalize_y=True)
+        gpr.fit(X_tr, train_hl)
+        return _nr_recall_auc(gpr.predict(X_te), test_hl)
+
+    def _ell_auc_for(tr_ell_df, te_ell_df):
+        """Impute NaN with train medians, scale, simple GP fit, return test AUC."""
+        tr_nan     = tr_ell_df.isna().any(axis=1)
+        tr_medians = tr_ell_df[~tr_nan].median()
+        _scaler = StandardScaler().fit(tr_ell_df.fillna(tr_medians).values)
+        X_tr    = _scaler.transform(tr_ell_df.fillna(tr_medians).values)
+        X_te    = _scaler.transform(te_ell_df.fillna(tr_medians).values)
+        gpr = GaussianProcessRegressor(
+            kernel=Matern(length_scale_bounds=(1e-2, 1e2)) + WhiteKernel(noise_level_bounds=(1e-3, 1e1)),
+            normalize_y=True,
+        )
+        gpr.fit(X_tr, train_hl)
+        return _nr_recall_auc(gpr.predict(X_te), test_hl)
+
+    # ── Sweep ─────────────────────────────────────────────────────────────────
+    byol_auc = []
+    ell_auc  = []
+
+    for sigma in noise_sigmas:
+        print(f"  σ={sigma} ...", end=" ", flush=True)
+
+        if sigma == 0.0:
+            # Use saved (clean) features and clean ellipse features
+            bauc = _byol_auc_for(train_feat_clean, test_feat_clean)
+            eauc = _ell_auc_for(train_ell_clean, test_ell_clean)
+        else:
+            # Add independent noise to train and test
+            noisy_train = _add_noise_to_images(train_imgs, sigma, rng)
+            noisy_test  = _add_noise_to_images(test_imgs,  sigma, rng)
+
+            # BYOL: re-encode noisy images (/255 matches train_byol.py normalisation)
+            noisy_tr_enc = _byol_encode(_model, noisy_train / 255.0, _device, encode_batch_size)
+            noisy_te_enc = _byol_encode(_model, noisy_test  / 255.0, _device, encode_batch_size)
+            bauc = _byol_auc_for(noisy_tr_enc, noisy_te_enc)
+
+            # Ellipses: extract features from noisy images (cached per sigma)
+            _noisy_dir = run_dir / "anomaly_baselines" / "noise_robustness" / f"ell_noisy_train_sigma{sigma}"
+            _noisy_dir.mkdir(parents=True, exist_ok=True)
+            _noisy_all = np.concatenate([noisy_train, noisy_test], axis=0) / 255.0
+            _ds_noisy  = _NumpyImageDataset(_noisy_all, output_dir=str(_noisy_dir), force_rerun=False)
+            _ext_noisy = _sf.EllipseFitFeatures(percentiles=[90, 80, 70, 60, 50, 0], channel=0,
+                                                 output_dir=str(_noisy_dir), force_rerun=False)
+            _all_ell_noisy = _ext_noisy.run_on_dataset(_ds_noisy)
+            eauc = _ell_auc_for(_all_ell_noisy.iloc[:n_train], _all_ell_noisy.iloc[n_train:])
+
+        byol_auc.append(bauc)
+        ell_auc.append(eauc)
+        print(f"BYOL={bauc:.4f}  Ell={eauc:.4f}", flush=True)
+
+    result = {
+        "noise_sigmas": list(noise_sigmas),
+        "byol_auc":     byol_auc,
+        "ell_auc":      ell_auc,
+        "run_dir":      str(run_dir),
+        "data_seed":    data_seed,
+        "rng_seed":     rng_seed,
+        "latent":       latent,
+    }
+    with open(out_path, "w") as fh:
+        json.dump(result, fh, indent=2)
+    print(f"  Saved → {out_path}", flush=True)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Per-run processing
 # ---------------------------------------------------------------------------
 def process_run(run_dir: Path, epsilon: float,
@@ -913,6 +1163,18 @@ def main():
     parser.add_argument("--refit-every",           type=int, default=None,
                         help="Refit GP hyperparameters every N new labels (0=never refit after first; "
                              "default: doubling heuristic).")
+    # ── Noisy training sweep ─────────────────────────────────────────────────
+    parser.add_argument("--noise-sweep",    action="store_true",
+                        help="Run noisy-training sweep (train on noisy, evaluate on noisy) "
+                             "for a single run instead of the full Protege sweep.")
+    parser.add_argument("--noise-run-dir",  type=str, default=None,
+                        help="Path to a specific BYOL run directory for --noise-sweep. "
+                             "If omitted, the first directory matched by --run-glob is used.")
+    parser.add_argument("--noise-sigmas",   type=float, nargs="+",
+                        default=[0.0, 0.25, 0.5, 1.0, 2.0],
+                        help="Noise levels σ for the noisy training sweep (default: 0 0.25 0.5 1 2).")
+    parser.add_argument("--noise-rng-seed", type=int, default=42,
+                        help="RNG seed for noise generation in --noise-sweep (default: 42).")
     args = parser.parse_args()
 
     outputs_root = Path(args.outputs_root)
@@ -921,6 +1183,35 @@ def main():
     # Pre-load shared data once
     csv_df     = pd.read_csv(CSV_PATH)
     labels_all = np.load(LABELS_PATH)
+
+    # ── Noisy training sweep mode ─────────────────────────────────────────────
+    if args.noise_sweep:
+        if args.noise_run_dir:
+            _nr_run_dir = Path(args.noise_run_dir)
+        else:
+            _nr_candidates = sorted(outputs_root.glob(args.run_glob))
+            _nr_candidates = [rd for rd in _nr_candidates if re.search(r'_f[\d.]+_sw[\d.]+', rd.name)]
+            if not _nr_candidates:
+                print(f"No run directories found matching '{args.run_glob}' under {outputs_root}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _nr_run_dir = _nr_candidates[0]
+            print(f"--noise-run-dir not specified; using first match: {_nr_run_dir.name}")
+        print(f"Noisy training sweep: {_nr_run_dir.name}")
+        run_noisy_training_sweep(
+            _nr_run_dir, csv_df, labels_all,
+            noise_sigmas=args.noise_sigmas,
+            latent="proj",
+            use_pca=args.pca,
+            pca_components=args.pca_components,
+            scale=not args.no_scale,
+            l2norm=args.l2norm,
+            kernel_amplitude=not args.no_kernel_amplitude,
+            rng_seed=args.noise_rng_seed,
+            outputs_root=outputs_root,
+            force=args.force,
+        )
+        return
 
     # Discover run directories
     run_dirs = sorted(outputs_root.glob(args.run_glob))

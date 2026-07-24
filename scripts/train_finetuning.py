@@ -82,7 +82,8 @@ def apply_label_set(labels_20: np.ndarray, label_set: str):
         morph    = labels_20[:, 5:16]
         row_mask = morph.sum(axis=1) == 1
 
-    cols       = LABEL_SETS[label_set]
+    _base      = label_set[:-7] if label_set.endswith('_binary') else label_set
+    cols       = LABEL_SETS[_base]
     labels_sub = labels_20[row_mask][:, cols]
     return labels_sub.astype(np.int64), row_mask
 
@@ -244,8 +245,8 @@ def parse_args():
         "--label-set",
         type=str,
         default="full",
-        choices=list(LABEL_SETS.keys()),
-        help="Classification scheme / label subset to train on (default: full).",
+        help="Classification scheme / label subset to train on (default: full). "
+             "Append '_binary' for element-wise accuracy (e.g. full_binary).",
     )
     ap.add_argument(
         "--force",
@@ -254,7 +255,11 @@ def parse_args():
         help="Re-run even if results already exist.",
     )
 
-    return ap.parse_args()
+    _args = ap.parse_args()
+    _ls_base = _args.label_set[:-7] if _args.label_set.endswith('_binary') else _args.label_set
+    if _ls_base not in LABEL_SETS:
+        ap.error(f"Unknown label set: {_args.label_set!r}")
+    return _args
 
 
 class BYOLFineTuner(nn.Module):
@@ -410,7 +415,7 @@ def _make_labeled_loader(f_label, seed):
     _lab_labs = train_labels[_mask]
     _alpha = compute_class_weights(
         _train_labels_full_20[_mask], args.class_weight_mode, args.class_weight_strength)
-    _cols = LABEL_SETS[LABEL_SET]
+    _cols = LABEL_SETS[LABEL_SET[:-7] if LABEL_SET.endswith('_binary') else LABEL_SET]
     _alpha = _alpha[_cols] if _cols is not None else np.ones(train_labels.shape[1], dtype=np.float32)
     _alpha_t   = torch.tensor(_alpha, dtype=torch.float32)
     _alpha_sum = float(_alpha_t.sum().clamp(min=1e-6))

@@ -42,15 +42,18 @@ echo "Run glob: ${RUN_GLOB}"
 # ── Class weighting variants to (re)train ─────────────────────────────────────
 # Each entry: "label_set mode strength"  ("None" mode = cwNone)
 VARIANTS=(
-    "full          None          1.0"  # cwNone
-    "full          all           0.3"  # cwall0.3
-    "full          all           1.0"  # cwall
-    "initial       None          1.0"  # cwNone
-    "initial       initial       0.3"  # cwinitial
-    "initial       initial       1.0"  # cwinitial_pure
-    "initial_pure  None          0.0"  # cwNone
-    "initial_pure  initial_pure  0.3"  # cwinitial_pure0.3
-    "initial_pure  initial_pure  1.0"  # cwinitial_pure
+    "full            None          1.0"  # cwNone
+    "full            all           0.3"  # cwall0.3
+    "full            all           1.0"  # cwall
+    "initial         None          1.0"  # cwNone
+    "initial         initial       0.3"  # cwinitial
+    "initial         initial       1.0"  # cwinitial_pure
+    "initial_pure    None          0.0"  # cwNone
+    "initial_pure    initial_pure  0.3"  # cwinitial_pure0.3
+    "initial_pure    initial_pure  1.0"  # cwinitial_pure
+    "initial_binary  None          0.0"  # cwNone, element-wise accuracy
+    "initial_binary  initial_binary  0.3"  # cwinitial_binary0.3
+    "initial_binary  initial_binary  1.0"  # cwinitial_binary
 )
 
 for VARIANT in "${VARIANTS[@]}"; do

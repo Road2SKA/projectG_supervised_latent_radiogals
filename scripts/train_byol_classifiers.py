@@ -60,6 +60,12 @@ LABEL_SETS = {
     "derived":         None,
     "full":            list(range(0, 20)),
     "full_pure":       list(range(0, 20)),
+    # _binary variants: same columns as base set; evaluated element-wise (not exact-match)
+    "classical_binary":   [0, 1],
+    "initial_binary":     list(range(0, 5)),
+    "morphology_binary":  list(range(5, 16)),
+    "environment_binary": list(range(16, 20)),
+    "full_binary":        list(range(0, 20)),
 }
 
 
@@ -102,13 +108,15 @@ def apply_label_set(labels_20: np.ndarray, label_set: str):
         morph    = labels_20[:, 5:16]
         row_mask = morph.sum(axis=1) == 1
 
-    cols       = LABEL_SETS[label_set]
+    _base      = label_set[:-7] if label_set.endswith('_binary') else label_set
+    cols       = LABEL_SETS[_base]
     labels_sub = labels_20[row_mask][:, cols]
     return labels_sub.astype(np.int64), row_mask
 
 
 def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
-                     y_prob: np.ndarray, class_names: list) -> dict:
+                     y_prob: np.ndarray, class_names: list,
+                     is_binary: bool = False) -> dict:
     n = len(class_names)
 
     if y_true.ndim == 1:
@@ -138,10 +146,11 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
                 aucs.append(None)
             else:
                 aucs.append(float(roc_auc_score(y_true[:, i], y_prob[:, i])))
+        _acc = float((y_true == y_pred).mean()) if is_binary else float(accuracy_score(y_true, y_pred))
         return {
             "f1_macro":      float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
             "auc_macro":     float(np.nanmean([a for a in aucs if a is not None])),
-            "accuracy":      float(accuracy_score(y_true, y_pred)),
+            "accuracy":      _acc,
             "recall_macro":  float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
             "f1_per_class":  f1_score(y_true, y_pred, average=None, zero_division=0).tolist(),
             "auc_per_class": aucs,
@@ -168,7 +177,8 @@ def _fit_and_eval(clf, X_train, y_train, X_test, y_test, class_names,
     else:
         y_pred = clf.predict(X_test)
         y_prob = clf.predict_proba(X_test)
-    return evaluate_metrics(y_test, y_pred, y_prob, class_names), y_pred, y_prob
+    return evaluate_metrics(y_test, y_pred, y_prob, class_names,
+                            is_binary=label_set.endswith('_binary')), y_pred, y_prob
 
 
 
@@ -356,7 +366,8 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     if label_set == "derived":
         class_names = DERIVED_CLASS_NAMES
     else:
-        class_names = [ALL_CLASS_NAMES[i] for i in LABEL_SETS[label_set]]
+        _base_ls    = label_set[:-7] if label_set.endswith('_binary') else label_set
+        class_names = [ALL_CLASS_NAMES[i] for i in LABEL_SETS[_base_ls]]
 
     print(f"    train={len(X_train)}  test={len(X_test)}  "
           f"classes={len(class_names)}", flush=True)
@@ -399,7 +410,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                 class_weight_mode,
                 class_weight_strength,
             )                                           # (20,)
-            _label_cols = LABEL_SETS[label_set]         # list of int indices
+            _label_cols = LABEL_SETS[label_set[:-7] if label_set.endswith('_binary') else label_set]  # list of int indices
             _alpha_arr  = _alpha_full[_label_cols]      # (n_classes,)
             # y_train_raw: (N_train, n_classes), already filtered to label_set columns
             _row_sums = y_train_raw.sum(axis=1)         # positives per sample
@@ -584,7 +595,8 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                     "f1":       float(f1_score(_yt_fit, _yp, average="macro",
                                                zero_division=0)),
                     "auc":      _auc,
-                    "accuracy": float(accuracy_score(_yt_fit, _yp)),
+                    "accuracy": (float((_yt_fit == _yp).mean()) if label_set.endswith('_binary')
+                                 else float(accuracy_score(_yt_fit, _yp))),
                     "recall":   float(recall_score(_yt_fit, _yp, average="macro",
                                                    zero_division=0)),
                 }
@@ -654,8 +666,8 @@ def main():
                         choices=["projections", "encodings"],
                         help="Feature vectors to use (default: projections).")
     parser.add_argument("--label-set",    default="classical_pure",
-                        choices=list(LABEL_SETS.keys()),
-                        help="Classification scheme (default: classical_pure).")
+                        help="Classification scheme (default: classical_pure). "
+                             "Append '_binary' for element-wise accuracy (e.g. initial_binary).")
     parser.add_argument("--n-estimators", type=int, default=200,
                         help="Number of RF trees (default: 200).")
     parser.add_argument("--n-neighbors",  type=int, default=15,
@@ -683,6 +695,11 @@ def main():
                         help="Magnitude of class upweighting (0=uniform, default). "
                              "w = clip(1 + strength*(raw_norm - 1), min=0).")
     args = parser.parse_args()
+
+    # Validate label_set (allow _binary suffix on any known base label set)
+    _ls_base = args.label_set[:-7] if args.label_set.endswith('_binary') else args.label_set
+    if _ls_base not in LABEL_SETS:
+        parser.error(f"Unknown label set: {args.label_set!r}")
 
     # Normalise synonyms: "None" → None, "full" → "all"
     if args.class_weight_mode in ("None", "none"):
