@@ -861,6 +861,15 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         if _compute_val:
             history['val_friend_loss'].append(avg_val_friend_loss)
 
+        # Incremental flush — survives OOM / walltime kills
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == NUM_EPOCHS:
+            with open(BYOL_DIR / 'training_history_partial.json', 'w') as _fh:
+                json.dump(
+                    {k: [float(x) if x is not None else None for x in v]
+                     for k, v in history.items()},
+                    _fh,
+                )
+
         sup_str = f" | sup: {current_supervision_weight:.3f}"
         mon_str = f" | mon: {avg_monitor_loss:.4f}" if USE_CURRICULUM else ""
         _loss_str = f"t_aug: {avg_train_aug_loss:.4f}"
@@ -1359,46 +1368,40 @@ for _item in _items:
         _split_masks_all[_tr_key] = _mask_tr
         _split_masks_all['Test'] = _mask_te
 
-        for _col in ('initial', 'morphology', 'train_labelled'):
-            plot_umap_single(
-                _all_2d, _all_lf, _col, CLASS_NAMES, LABEL_RANGES,
-                title=f'All — {_col}',
-                save_path=UMAP_DIR / f'umap_all_{_col}{_suffix}.png',
-                split_masks=_split_masks_all,
+        for _space, _2d, _prefix in [('Encodings', _all_2d, 'enc'), ('Projections', _proj_2d, 'proj')]:
+            for _col in ('initial', 'morphology', 'train_labelled'):
+                plot_umap_single(
+                    _2d, _all_lf, _col, CLASS_NAMES, LABEL_RANGES,
+                    title=f'{_space} — {_col}',
+                    save_path=UMAP_DIR / f'{_prefix}_all_{_col}{_suffix}.png',
+                    split_masks=_split_masks_all,
+                )
+
+            plot_umap_scalar(
+                _2d, _all_pixel_sum,
+                title=f'{_space} — brightness',
+                cbar_label='Total pixel sum',
+                save_path=UMAP_DIR / f'{_prefix}_all_brightness{_suffix}.png',
+                cmap='plasma',
             )
 
-        plot_umap_single(
-            _proj_2d, _all_lf, 'initial', CLASS_NAMES, LABEL_RANGES,
-            title='All (projections) — initial',
-            save_path=UMAP_DIR / f'umap_proj_initial{_suffix}.png',
-            split_masks=_split_masks_all,
-        )
+            plot_umap_scalar(
+                _2d, _interest,
+                title=f'{_space} — interest score',
+                cbar_label='Interest score',
+                save_path=UMAP_DIR / f'{_prefix}_all_interest{_suffix}.png',
+                cmap='plasma',
+                vmin=1, vmax=4,
+                cbar_ticks=[1, 2, 3, 4],
+            )
 
-        plot_umap_scalar(
-            _all_2d, _all_pixel_sum,
-            title='All — brightness',
-            cbar_label='Total pixel sum',
-            save_path=UMAP_DIR / f'umap_all_brightness{_suffix}.png',
-            cmap='plasma',
-        )
-
-        plot_umap_scalar(
-            _all_2d, _interest,
-            title='All — interest score',
-            cbar_label='Interest score',
-            save_path=UMAP_DIR / f'umap_all_interest{_suffix}.png',
-            cmap='plasma',
-            vmin=1, vmax=4,
-            cbar_ticks=[1, 2, 3, 4],
-        )
-
-        plot_umap_outliers(
-            _all_2d[:_n_tr],
-            train_images[:_n_tr],
-            OUTPUT_DIR=UMAP_DIR,
-            labels=train_labels[:_n_tr],
-            save_prefix=f"umap_outliers{_suffix}",
-        )
+            plot_umap_outliers(
+                _2d[:_n_tr],
+                train_images[:_n_tr],
+                OUTPUT_DIR=UMAP_DIR,
+                labels=train_labels[:_n_tr],
+                save_prefix=f"{_prefix}_outliers{_suffix}",
+            )
 
         print(f"\nUMAP plots saved to {UMAP_DIR}/")
 
@@ -1456,167 +1459,7 @@ print(f"{'='*70}")
 print(f"All outputs saved to: {OUTPUT_DIR.absolute()}")
 print(f"{'='*70}\n")
 
-# =============================================================================
-# PROTEGE GP ACTIVE LEARNING  (--run-protege)
-# =============================================================================
-if args.run_protege:
-    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.decomposition import PCA
-    from astronomaly.anomaly_detection import human_loop_learning, protege
-
-    print(f"\n{'='*70}")
-    print("PROTEGE GP ACTIVE LEARNING")
-    print(f"{'='*70}\n")
-
-    PROTEGE_DIR = OUTPUT_DIR / "protege"
-    PROTEGE_DIR.mkdir(parents=True, exist_ok=True)
-
-    lab_proj  = np.load(BYOL_DIR / "labelled_train_projections.npy")
-    lab_idx   = np.load(SPLITS_DIR / "labelled_train_idx.npy")
-    unlab_proj_path = BYOL_DIR / "unlabelled_train_projections.npy"
-    if unlab_proj_path.exists():
-        unlab_proj = np.load(unlab_proj_path)
-        unlab_idx  = np.load(SPLITS_DIR / "unlabelled_train_idx.npy")
-        cat_proj   = np.concatenate([lab_proj, unlab_proj], axis=0)
-        cat_idx    = np.concatenate([lab_idx, unlab_idx])
-    else:
-        cat_proj = lab_proj
-        cat_idx  = lab_idx
-    test_proj_prot   = np.load(BYOL_DIR / "test_projections.npy")
-    test_idx_prot    = np.load(SPLITS_DIR / "test_idx.npy")
-
-    _csv_df    = pd.read_csv("/users/mbredber/p3_SUPLAT/data/metadata/lotss_classifications_horton_et_al_2025_filtered.csv")
-    _labels_all = np.load("/users/mbredber/p3_SUPLAT/data/preprocessed/lotss/labels_filtered.npy")
-
-    train_source_names = _csv_df.iloc[cat_idx]["Source_Name"].values
-    test_source_names  = _csv_df.iloc[test_idx_prot]["Source_Name"].values
-
-    _labels_train_df = pd.DataFrame(_labels_all[cat_idx].astype(bool), columns=LABEL_COLS)
-    _human_train = np.ones(len(_labels_train_df), dtype=int)
-    for _sv, _sc in reversed(TIERS):
-        _human_train[_labels_train_df[_sc].any(axis=1).values] = _sv
-    labels_df = pd.DataFrame({"human_label": _human_train}, index=train_source_names)
-
-    _labels_test_df = pd.DataFrame(_labels_all[test_idx_prot].astype(bool), columns=LABEL_COLS)
-    _human_test = np.ones(len(_labels_test_df), dtype=int)
-    for _sv, _sc in reversed(TIERS):
-        _human_test[_labels_test_df[_sc].any(axis=1).values] = _sv
-    test_labels_df = pd.DataFrame({"human_label": _human_test}, index=test_source_names)
-
-    np.random.seed(DATA_SEED)
-    scaler      = StandardScaler()
-    cat_scaled  = scaler.fit_transform(cat_proj)
-    test_scaled = scaler.transform(test_proj_prot)
-    if args.protege_pca:
-        pca     = PCA(n_components=0.95, svd_solver="full", random_state=DATA_SEED)
-        cat_pca = pca.fit_transform(cat_scaled)
-        test_pca = pca.transform(test_scaled)
-        print(f"  Protege PCA: {cat_proj.shape[1]}D -> {cat_pca.shape[1]}D")
-    else:
-        cat_pca  = cat_scaled
-        test_pca = test_scaled
-        print(f"  Protege features: {cat_pca.shape[1]}D (no PCA)")
-
-    features_train = pd.DataFrame(cat_pca, index=train_source_names)
-    features_test  = pd.DataFrame(test_pca, index=test_source_names)
-    n_train = len(features_train)
-
-    _sorted_order   = np.argsort(cat_pca[:, 0])
-    _seed_positions = np.linspace(0, n_train - 1, PROTEGE_INITIAL_STEPS, dtype=int)
-    _seed_rows      = _sorted_order[_seed_positions]
-    seed_names      = features_train.index[_seed_rows]
-
-    anomaly_scores = pd.DataFrame({"score": np.zeros(n_train)}, index=features_train.index)
-    anomaly_scores.loc[seed_names, "score"] = labels_df.loc[seed_names, "human_label"].values.astype(float)
-
-    score_converter = human_loop_learning.ScoreConverter(force_rerun=True, output_dir=str(PROTEGE_DIR))
-    anomaly_scores  = score_converter.run(anomaly_scores)
-
-    def _run_GP_exhaustive(features, labels, input_anomaly_scores, output_dir, steps=10, initial_steps=None, epsilon=0.5):
-        _as = input_anomaly_scores.copy()
-        _as['human_label'] = [-1] * len(_as)
-        _gp = protege.GaussianProcess(features, force_rerun=True, output_dir=output_dir, ei_tradeoff=epsilon)
-        if initial_steps is not None:
-            _as.sort_values('score', ascending=False, inplace=True)
-            _inds = _as[_as.human_label == -1].index[:initial_steps]
-            _as.loc[_inds, 'human_label'] = labels.loc[_inds, 'human_label']
-            _fwl = _gp.combine_data_frames(features, _as)
-            _out = _gp.run(_fwl)
-            _as['trained_score'] = _out['trained_score']
-            _as['acquisition']   = _out['acquisition']
-        while True:
-            if _as[_as.human_label == -1].empty:
-                break
-            _as.sort_values('acquisition', ascending=False, inplace=True)
-            _inds = _as[_as.human_label == -1].index[:steps]
-            _as.loc[_inds, 'human_label'] = labels.loc[_inds, 'human_label']
-            _fwl = _gp.combine_data_frames(features, _as)
-            _out = _gp.run(_fwl)
-            _as['trained_score'] = _out['trained_score']
-            _as['acquisition']   = _out['acquisition']
-        return _as, _gp
-
-    print(f"  Running GP (initial_steps={PROTEGE_INITIAL_STEPS}, exhausting all {n_train} train sources)...")
-    active_output, gp_pipeline = _run_GP_exhaustive(
-        features_train, labels_df, anomaly_scores,
-        output_dir=str(PROTEGE_DIR),
-        steps=10,
-        initial_steps=PROTEGE_INITIAL_STEPS,
-        epsilon=0.0,
-    )
-
-    test_scores = gp_pipeline.estimator.predict(features_test.values)
-    test_output = pd.DataFrame({"trained_score": test_scores, "human_label": -2}, index=features_test.index)
-
-    true_labels = test_labels_df["human_label"]
-    true_pos    = (true_labels >= POSITIVE_THRESHOLD).astype(int)
-    n_pos  = int(true_pos.sum())
-    n_eval = len(test_output)
-
-    sorted_idx = test_output["trained_score"].sort_values(ascending=False).index
-    sorted_pos = true_pos.loc[sorted_idx].values
-    cum_found  = np.cumsum(sorted_pos)
-    x = np.arange(1, n_eval + 1)
-    auc = float(np.trapz(cum_found, x) / (n_eval * n_pos)) if n_pos > 0 else 0.0
-    print(f"  Test-set AUC={auc:.4f}  ({n_pos} positives in {n_eval} eval sources)")
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(x, cum_found, label=f"Protege (AUC={auc:.4f})", linewidth=2)
-    ax.plot(x, x * (n_pos / n_eval), "k--", label="Random baseline", linewidth=1.5, alpha=0.7)
-    ax.set_xlabel("Sources inspected (ranked by Protege score)")
-    ax.set_ylabel(f"Interesting sources found (label >= {POSITIVE_THRESHOLD})")
-    ax.set_title(f"{OUTPUT_DIR.name}  (AUC={auc:.4f}, {n_pos} positives / {n_eval} eval)")
-    ax.legend(); ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    fig.savefig(PROTEGE_DIR / "recall_curve.png", dpi=120)
-    plt.close(fig)
-
-    combined_output = pd.concat([active_output, test_output])
-    combined_output.to_parquet(PROTEGE_DIR / "protege_scores.parquet")
-
-    summary = {
-        "run_dir":          str(OUTPUT_DIR),
-        "data_seed":        DATA_SEED,
-        "n_labelled_seed":  PROTEGE_INITIAL_STEPS,
-        "pca_seeded":       True,
-        "steps":            10,
-        "epsilon":          0.0,
-        "n_eval":           n_eval,
-        "n_eval_positives": n_pos,
-        "auc":              auc,
-        "pca_components":   int(cat_pca.shape[1]),
-    }
-    with open(PROTEGE_DIR / "protege_summary.json", "w") as _fh:
-        json.dump(summary, _fh, indent=2)
-
-    import logging as _logging, shutil as _shutil
-    for _h in list(_logging.getLogger().handlers):
-        if isinstance(_h, _logging.FileHandler) and 'astronomaly.log' in _h.baseFilename:
-            _h.close()
-            _logging.getLogger().removeHandler(_h)
-            _shutil.move(_h.baseFilename, LOGS_DIR / 'protege.log')
-            break
-
-    print(f"\nProtege outputs saved to {PROTEGE_DIR}/")
-    print(f"  recall_curve.png, protege_scores.parquet, protege_summary.json")
+# Signal successful completion for downstream scripts
+with open(OUTPUT_DIR / 'status.json', 'w') as _fh:
+    json.dump({'status': 'complete',
+               'finished_at': datetime.now().isoformat()}, _fh)
