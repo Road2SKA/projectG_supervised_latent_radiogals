@@ -249,7 +249,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     _cw_tag          = ("cwNone" if not class_weight_mode
                         else _cw_base if class_weight_strength == 1.0
                         else f"{_cw_base}{class_weight_strength}")
-    clf_dir          = run_dir / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
+    clf_dir          = run_dir / f"seed{seed}" / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
     rf_path          = clf_dir / f"rf_{feature_type}.json"
     knn_path         = clf_dir / f"knn_{feature_type}.json"
     lr_path          = clf_dir / f"lr_{feature_type}.json"
@@ -284,8 +284,10 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         if (_search / "data_splits").is_dir():
             break
         _search = _search.parent
-    splits_dir = _search / "data_splits" / "42"
-    feat_dir   = run_dir / "data" / "byol"
+    splits_dir = _search / "data_splits" / str(seed)
+    feat_dir   = run_dir / f"seed{seed}" / "data" / "byol"
+    _f_m  = re.search(r'_f([\d.]+)', run_dir.name)
+    _f_tag = f"_f{_f_m.group(1)}" if _f_m else ""
 
     # ── Load features ────────────────────────────────────────────────────────
     train_feat_path = feat_dir / f"labelled_train_{feature_type}.npy"
@@ -305,7 +307,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     # Prefer per-run labels saved alongside projections (avoids shared splits_dir
     # being overwritten by a different run with a different f_label).
     run_lab_labels_path = feat_dir / "labelled_train_labels.npy"
-    lab_labels_path     = splits_dir / "labelled_train_labels.npy"
+    lab_labels_path     = splits_dir / f"labelled_train_labels{_f_tag}.npy"
 
     if run_lab_labels_path.exists():
         y_train_full = np.load(run_lab_labels_path)
@@ -314,9 +316,9 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         # If sizes don't match, try to reconstruct full train labels from splits.
         if len(y_train_full) != len(X_train_raw):
             train_idx_path   = splits_dir / "train_idx.npy"
-            lab_idx_path     = splits_dir / "labelled_train_idx.npy"
-            unlab_idx_path   = splits_dir / "unlabelled_train_idx.npy"
-            unlab_labels_path = splits_dir / "unlabelled_train_labels.npy"
+            lab_idx_path     = splits_dir / f"labelled_train_idx{_f_tag}.npy"
+            unlab_idx_path   = splits_dir / f"unlabelled_train_idx{_f_tag}.npy"
+            unlab_labels_path = splits_dir / f"unlabelled_train_labels{_f_tag}.npy"
             if (train_idx_path.exists() and lab_idx_path.exists()
                     and unlab_idx_path.exists() and unlab_labels_path.exists()):
                 train_idx   = np.load(train_idx_path)
@@ -711,7 +713,7 @@ def main():
 
     # ── Discover run directories ───────────────────────────────────────────────
     run_dirs = sorted(outputs_root.glob(args.run_glob))
-    run_dirs = [rd for rd in run_dirs if re.search(r'_f[\d.]+_sw(?:cos|lin)?[\d.]+', rd.name)]
+    run_dirs = [rd for rd in run_dirs if re.search(r'_sw(?:cos|lin)?[\d.]+_f[\d.]+', rd.name)]
     if not run_dirs:
         print(f"No run directories found matching '{args.run_glob}' under {outputs_root}",
               file=sys.stderr)

@@ -64,7 +64,12 @@ PROTEGE_INITIAL_STEPS = 200
 def _get_splits_dir(run_dir: Path) -> Path:
     ckpt = torch.load(run_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
     seed = int(ckpt["config"]["data_seed"])
-    return run_dir.parent.parent / "data_splits" / str(seed)
+    _search = run_dir.parent
+    for _ in range(6):
+        if (_search / "data_splits").is_dir():
+            return _search / "data_splits" / str(seed)
+        _search = _search.parent
+    return run_dir.parent.parent / "data_splits" / str(seed)  # fallback
 
 
 def _load_split(splits_dir: Path, data_dir: Path, filename: str, f_str: str = None) -> np.ndarray:
@@ -94,7 +99,17 @@ def _check_run_data(rd: Path, latent: str = "proj"):
     byol_dir   = data_dir / "byol"
     splits_dir = _get_splits_dir(rd)
 
+    # Extract f-label tag from the run name (rd may be a seed subdir)
+    _run_name = rd.parent.name if re.match(r'^seed\d+$', rd.name) else rd.name
+    _fm = re.search(r'_f([\d.]+)', _run_name)
+    _f_str = str(float(_fm.group(1))).rstrip('0').rstrip('.') if _fm else None
+
     def _idx_path(name):
+        if _f_str is not None:
+            stem, ext = name.rsplit('.', 1)
+            p_f = splits_dir / f"{stem}_f{_f_str}.{ext}"
+            if p_f.exists():
+                return p_f
         p = splits_dir / name
         return p if p.exists() else data_dir / name
 
@@ -570,7 +585,7 @@ def run_noisy_training_sweep(
 
     data_dir   = run_dir / "data"
     byol_dir   = data_dir / "byol"
-    splits_dir = run_dir.parent.parent / "data_splits" / str(data_seed)
+    splits_dir = _get_splits_dir(run_dir)
 
     lab_idx   = _load_split(splits_dir, data_dir, "labelled_train_idx.npy",   _f_str)
     unlab_idx = _load_split(splits_dir, data_dir, "unlabelled_train_idx.npy", _f_str)
@@ -630,7 +645,7 @@ def run_noisy_training_sweep(
     del _images_mmap
 
     # ── Clean ellipse features (σ=0; reuse anomaly_baselines cache) ───────────
-    _ell_root = (outputs_root or run_dir.parent.parent) / "anomaly_baselines" / f"_ell_cache_{data_seed}"
+    _ell_root = (outputs_root or _get_splits_dir(run_dir).parent.parent) / "anomaly_baselines" / f"_ell_cache_{data_seed}"
     _ell_root.mkdir(parents=True, exist_ok=True)
     _all_images_mmap = np.load(IMAGES_PATH, mmap_mode="r")
     _ds_clean  = _NumpyImageDataset(_all_images_mmap.astype(np.float32) / 255.0,
@@ -765,7 +780,7 @@ def process_run(run_dir: Path, epsilon: float,
 
     data_dir     = run_dir / "data"
     byol_dir     = data_dir / "byol"
-    splits_dir   = run_dir.parent.parent / "data_splits" / str(data_seed)
+    splits_dir   = _get_splits_dir(run_dir)
     protege_dir  = data_dir / "protege"
     protege_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1085,7 +1100,7 @@ def process_run(run_dir: Path, epsilon: float,
 # ---------------------------------------------------------------------------
 def _worker_process_run(args):
     rd, epsilon, steps, suffix, csv_df, labels_all, latent, use_pca, max_queries, timing_plot, pca_components, outputs_root, force, cw_mode, cw_strength, scale, l2norm, kernel_amplitude, refit_every = args
-    m      = re.search(r'_f([\d.]+)_sw([\d.]+)', rd.name)
+    m      = re.search(r'_sw([\d.]+)_f([\d.]+)', rd.name)
     f_val  = float(m.group(1)) if m else float('nan')
     sw_val = float(m.group(2)) if m else float('nan')
     print(f"[{rd.name}]  latent={latent}  f={f_val}  sw={sw_val}", flush=True)
@@ -1175,6 +1190,9 @@ def main():
                         help="Noise levels σ for the noisy training sweep (default: 0 0.25 0.5 1 2).")
     parser.add_argument("--noise-rng-seed", type=int, default=42,
                         help="RNG seed for noise generation in --noise-sweep (default: 42).")
+    parser.add_argument("--byol-seed",      type=int, default=None,
+                        help="Seed subdirectory under each run dir where BYOL artifacts live "
+                             "(e.g. 2 → <run>/seed2/). If omitted, artifacts are expected at the run root.")
     args = parser.parse_args()
 
     outputs_root = Path(args.outputs_root)
@@ -1190,7 +1208,7 @@ def main():
             _nr_run_dir = Path(args.noise_run_dir)
         else:
             _nr_candidates = sorted(outputs_root.glob(args.run_glob))
-            _nr_candidates = [rd for rd in _nr_candidates if re.search(r'_f[\d.]+_sw[\d.]+', rd.name)]
+            _nr_candidates = [rd for rd in _nr_candidates if re.search(r'_sw[\d.]+_f[\d.]+', rd.name)]
             if not _nr_candidates:
                 print(f"No run directories found matching '{args.run_glob}' under {outputs_root}",
                       file=sys.stderr)
@@ -1215,7 +1233,7 @@ def main():
 
     # Discover run directories
     run_dirs = sorted(outputs_root.glob(args.run_glob))
-    run_dirs = [rd for rd in run_dirs if re.search(r'_f[\d.]+_sw[\d.]+', rd.name)]
+    run_dirs = [rd for rd in run_dirs if re.search(r'_sw[\d.]+_f[\d.]+', rd.name)]
     if not run_dirs:
         print(f"No run directories found matching '{args.run_glob}' under {outputs_root}",
               file=sys.stderr)
@@ -1232,15 +1250,17 @@ def main():
     failures     = []
     worker_args  = []
     for rd in run_dirs:
-        m      = re.search(r'_f([\d.]+)_sw([\d.]+)', rd.name)
-        f_val  = float(m.group(1)) if m else float('nan')
-        sw_val = float(m.group(2)) if m else float('nan')
+        m      = re.search(r'_sw([\d.]+)_f([\d.]+)', rd.name)
+        sw_val = float(m.group(1)) if m else float('nan')
+        f_val  = float(m.group(2)) if m else float('nan')
+
+        seed_dir = rd / f"seed{args.byol_seed}" if args.byol_seed is not None else rd
 
         for latent in ["proj", "enc"]:
             _ftag        = _pca_tag_for(latent)
             _full_suffix = suffix + f"_{latent}_{_ftag}"
-            summary_path = rd / "data" / "protege" / f"protege_summary{_full_suffix}.json"
-            pca_var_path = rd / "figures" / "pca_variance.png"
+            summary_path = seed_dir / "data" / "protege" / f"protege_summary{_full_suffix}.json"
+            pca_var_path = seed_dir / "figures" / "pca_variance.png"
 
             if summary_path.exists() and (latent == "enc" or pca_var_path.exists()) and not args.force:
                 print(f"[{rd.name}]  latent={latent}  skipping (already done — use --force to rerun)", flush=True)
@@ -1252,7 +1272,7 @@ def main():
                                     n_eval=s.get("n_eval", 0),
                                     n_pos=s.get("n_eval_positives", 0)))
             else:
-                issue = _check_run_data(rd, latent=latent)
+                issue = _check_run_data(seed_dir, latent=latent)
                 if issue is not None:
                     err_type, detail = issue
                     if err_type == "missing_enc_data":
@@ -1262,7 +1282,7 @@ def main():
                         failures.append(dict(name=rd.name, latent=latent, f=f_val, sw=sw_val,
                                              error=err_type, detail=detail))
                 else:
-                    worker_args.append((rd, args.epsilon, args.steps, suffix, csv_df, labels_all,
+                    worker_args.append((seed_dir, args.epsilon, args.steps, suffix, csv_df, labels_all,
                                         latent, args.pca, args.max_queries, args.timing_plot,
                                         args.pca_components, outputs_root, args.force,
                                         args.class_weight_mode, args.class_weight_strength,

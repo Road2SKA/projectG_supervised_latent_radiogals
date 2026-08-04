@@ -47,7 +47,7 @@ echo "Run: ${RUN_NAME}  ->  ${RUN_DIR}"
 # =============================================================================
 # 1. RUN LR / RF / KNN CLASSIFIERS
 # =============================================================================
-python scripts/run_hpsweep_classifiers.py \
+python scripts/hyperparameter_sweep/run_hpsweep_classifiers.py \
     --run-dir     "${RUN_DIR}" \
     --n-estimators 200 \
     --n-neighbors  15 \
@@ -57,7 +57,7 @@ python scripts/run_hpsweep_classifiers.py \
 # =============================================================================
 # 2. REFRESH ROW.JSON
 # =============================================================================
-python scripts/collate_hpsweep.py --mode row \
+python scripts/hyperparameter_sweep/collate_hpsweep.py --mode row \
     --run-dir "${RUN_DIR}"
 
 echo ""

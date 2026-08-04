@@ -14,60 +14,60 @@ echo "START: $(date)"
 cd /users/mbredber/p3_SUPLAT
 source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 
-BEST_RUN=outputs/byol_runs/enb0_mlp_pd128_clos_lrconst_wd1e-4_lfull_ema0.996_vicregvar2_cov0.1_gamma0.25_f1_sw0.05_augquart_ext_20260709_2203
-
+BYOL_SEED=2
 WD=3e-4
 N_RUNS=5
 NUM_WORKERS=4
-
-# ── Class weighting ───────────────────────────────────────────────────────────
-# MODE: which label set to balance. Empty string = no weighting (uniform).
-#   Options: initial | morphology | environment | classical | all | score
-# STRENGTH: 0.0 = uniform (no effect), 1.0 = each class contributes equally.
-CLASS_WEIGHT_MODE="all"
-CLASS_WEIGHT_STRENGTH=1.0
-# =============================================================================
-
 LR=1e-5
 EPOCHS=40
 
 # CONFIGS: "label_set  cw_mode  cw_strength"
 # cw_mode=none / cw_strength=0.0 → no weighting (cwNone)
 CONFIGS=(
+    "initial_pure    none          0.0"
     "full            none          0.0"
     "full            all           0.3"
     "full            all           1.0"
     "initial         none          0.0"
     "initial         initial       0.3"
     "initial         initial       1.0"
-    "initial_pure    none          0.0"
     "initial_pure    initial_pure  0.3"
     "initial_pure    initial_pure  1.0"
     "initial_binary  none          0.0"
 )
 
-for cfg in "${CONFIGS[@]}"; do
-    read -r LS CWM CWS <<< "$cfg"
+for RUN_DIR in outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.05_f1; do
+    MODEL_PATH="${RUN_DIR}/seed${BYOL_SEED}"
     echo ""
-    echo "=== label_set=${LS}  cw_mode=${CWM}  cw_strength=${CWS} ==="
+    echo "════════════════════════════════════════════════════════"
+    echo "Run: $(basename ${RUN_DIR})  model-path: ${MODEL_PATH}"
+    echo "════════════════════════════════════════════════════════"
 
-    CW_ARGS=()
-    if [ "${CWM}" != "none" ]; then
-        CW_ARGS+=(--class-weight-mode="${CWM}" --class-weight-strength="${CWS}")
-    fi
+    for MODE in 2 3; do
+        for cfg in "${CONFIGS[@]}"; do
+            read -r LS CWM CWS <<< "$cfg"
+            echo ""
+            echo "=== mode=${MODE}  label_set=${LS}  cw_mode=${CWM}  cw_strength=${CWS} ==="
 
-    python scripts/train_finetuning.py \
-        --model-path=${BEST_RUN} \
-        --training-mode=3 \
-        --label-set="${LS}" \
-        --epochs=${EPOCHS} \
-        --lr=${LR} \
-        --weight-decay=${WD} \
-        --n-runs=${N_RUNS} \
-        --num-workers=${NUM_WORKERS} \
-        --augmentation=quart_ext \
-        --run-name="mode3_lr${LR}_ep${EPOCHS}" \
-        "${CW_ARGS[@]}"
+            CW_ARGS=()
+            if [ "${CWM}" != "none" ]; then
+                CW_ARGS+=(--class-weight-mode="${CWM}" --class-weight-strength="${CWS}")
+            fi
+
+            python scripts/train_finetuning.py \
+                --model-path="${MODEL_PATH}" \
+                --training-mode="${MODE}" \
+                --label-set="${LS}" \
+                --epochs=${EPOCHS} \
+                --lr=${LR} \
+                --weight-decay=${WD} \
+                --n-runs=${N_RUNS} \
+                --num-workers=${NUM_WORKERS} \
+                --augmentation=quart_ext \
+                --run-name="mode${MODE}_lr${LR}_ep${EPOCHS}" \
+                "${CW_ARGS[@]}"
+        done
+    done
 done
 
 echo ""

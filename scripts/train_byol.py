@@ -200,6 +200,8 @@ def parse_args():
     ap.add_argument("--vicreg-gamma", type=float, default=1.0,
                     help="Target per-dimension std for the VICReg variance hinge (default 1.0).")
 
+    ap.add_argument("--no-timestamp", action="store_true", default=False,
+                    help="Omit timestamp from run dir; use seed subdir instead (for reproducible paths).")
 
     return ap.parse_args()
 
@@ -270,7 +272,8 @@ use_cuda = torch.cuda.is_available()
 OUTPUT_BASE = args.output_dir
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
-SPLITS_DIR = OUTPUT_BASE / 'data_splits' / str(DATA_SEED)
+_splits_subdir = str(DATA_SEED) if SUBSAMPLE_SIZE is None else f"{DATA_SEED}_ss{SUBSAMPLE_SIZE}"
+SPLITS_DIR = OUTPUT_BASE / 'data_splits' / _splits_subdir
 SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Create run directory — include projector type to avoid collisions with train_byol.py
@@ -279,12 +282,19 @@ BYOL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
-    RUN_ID = f"{args.run_name}_{_timestamp}"
-    # Skip if a run with this name already exists (any timestamp)
-    _existing = sorted(BYOL_RUNS_DIR.glob(f"{args.run_name}_*"))
-    if _existing:
-        print(f"[SKIP] Run '{args.run_name}' already exists: {_existing[0].name}")
-        import sys; sys.exit(0)
+    if args.no_timestamp:
+        OUTPUT_DIR = BYOL_RUNS_DIR / args.run_name / f"seed{SEED}"
+        if OUTPUT_DIR.exists():
+            print(f"[SKIP] Run dir already exists: {OUTPUT_DIR}")
+            import sys; sys.exit(0)
+        RUN_ID = f"{args.run_name}/seed{SEED}"
+    else:
+        RUN_ID = f"{args.run_name}_{_timestamp}"
+        _existing = sorted(BYOL_RUNS_DIR.glob(f"{args.run_name}_*"))
+        if _existing:
+            print(f"[SKIP] Run '{args.run_name}' already exists: {_existing[0].name}")
+            import sys; sys.exit(0)
+        OUTPUT_DIR = BYOL_RUNS_DIR / RUN_ID
 else:
     RUN_ID = _timestamp
     if DATASET_NAME != "LOTSS":
@@ -296,6 +306,7 @@ else:
     RUN_ID += f"_f{F_LABEL}_sw{args.supervision_weight}_swsch{args.supervision_weight_schedule}"
     if args.class_weight_mode is not None:
         RUN_ID += f"_cw{args.class_weight_mode}{args.class_weight_strength}"
+    OUTPUT_DIR = BYOL_RUNS_DIR / RUN_ID
 
 # Truncate labels based on label type
 LABEL_RANGES = {
@@ -308,7 +319,6 @@ LABEL_RANGES = {
     'derived':     (19, 24),
 }
 
-OUTPUT_DIR = BYOL_RUNS_DIR / RUN_ID
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Create subfolders

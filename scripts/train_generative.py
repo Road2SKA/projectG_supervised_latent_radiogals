@@ -26,6 +26,7 @@ import argparse
 import copy
 import json
 import math
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -262,17 +263,20 @@ def load_data(args):
         val_lbl   = _all_lbl[val_idx]
 
     # ── BYOL data/byol/ layout + catalogue sidecar ───────────────────────────
-    elif (base_dir / "data" / "byol" / "labelled_train_projections.npy").exists() \
+    elif (base_dir / f"seed{args.seed}" / "data" / "byol" / "labelled_train_projections.npy").exists() \
             and sidecar_path is not None:
-        _byol_dir       = base_dir / "data" / "byol"
+        _seed_dir       = base_dir / f"seed{args.seed}"
+        _byol_dir       = _seed_dir / "data" / "byol"
         _lab_train_proj = np.load(_byol_dir / "labelled_train_projections.npy").astype(np.float32)
         _run_test_proj  = np.load(_byol_dir / "test_projections.npy").astype(np.float32)
 
-        _ckpt_raw  = torch.load(base_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
+        _ckpt_raw  = torch.load(_seed_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
         _data_seed = int(_ckpt_raw["config"]["data_seed"])
         _splits_root = base_dir.parent.parent / "data_splits" / str(_data_seed)
 
-        _lab_train_idx = np.load(_splits_root / "labelled_train_idx.npy")
+        _f_m   = re.search(r'_f([\d.]+)', base_dir.name)
+        _f_tag = f"_f{_f_m.group(1)}" if _f_m else ""
+        _lab_train_idx = np.load(_splits_root / f"labelled_train_idx{_f_tag}.npy")
         _run_test_idx  = np.load(_splits_root / "test_idx.npy")
         if len(_lab_train_proj) != len(_lab_train_idx):
             _lab_train_idx = np.load(_splits_root / "train_idx.npy")
@@ -586,7 +590,7 @@ def main():
               f"({torch.cuda.get_device_properties(0).total_memory // 1024**3} GB)")
 
     label_suffix = args.label_subset if isinstance(args.label_subset, str) else "custom"
-    out_dir = Path(args.base_dir) / "data" / "generative"
+    out_dir = Path(args.base_dir) / f"seed{args.seed}" / "data" / "generative"
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output dir: {out_dir}")
 

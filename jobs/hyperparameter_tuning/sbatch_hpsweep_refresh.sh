@@ -22,12 +22,12 @@ for RUN_DIR in "${RUNS_ROOT}"/*/; do
     # Skip if no checkpoint (not a real run dir)
     [ -f "${RUN_DIR}/byol_model_best.pt" ] || continue
     echo "Refreshing: $(basename ${RUN_DIR})"
-    python scripts/collate_hpsweep.py --mode row --run-dir "${RUN_DIR}"
+    python scripts/hyperparameter_sweep/collate_hpsweep.py --mode row --run-dir "${RUN_DIR}"
 done
 
 echo ""
 echo "Aggregating..."
-python scripts/collate_hpsweep.py \
+python scripts/hyperparameter_sweep/collate_hpsweep.py \
     --mode aggregate \
     --sweep-root "${RUNS_ROOT}"
 

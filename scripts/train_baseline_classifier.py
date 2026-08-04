@@ -557,6 +557,10 @@ def main():
                         help="Apply torch.compile() to the model for faster GPU execution.")
     parser.add_argument('--early_stopping', action='store_true', default=False,
                         help='Use 10%% of test set as validation for early stopping.')
+    parser.add_argument('--gen_only', action='store_true', default=False,
+                        help="Train exclusively on generated images (no real training data), "
+                             "with n_gen = n_real (frac=1.0), then evaluate on the real test set. "
+                             "Requires --gen_dir. Outputs go to gen_only/ instead of with_generative/.")
     args = parser.parse_args()
     _ls_base = args.label_set[:-7] if args.label_set.endswith('_binary') else args.label_set
     if _ls_base not in LABEL_SETS:
@@ -580,7 +584,12 @@ def main():
         _dir_name = args.run_name
     else:
         _dir_name = f'{args.run_dir.name}_{args.model}_{_cw_tag}{_es_tag}'
-    _gen_subdir = 'with_generative' if args.gen_dir else 'without_generative'
+    if args.gen_dir and args.gen_only:
+        _gen_subdir = 'gen_only'
+    elif args.gen_dir:
+        _gen_subdir = 'with_generative'
+    else:
+        _gen_subdir = 'without_generative'
     out_dir = args.run_dir / _gen_subdir / _dir_name
     if out_dir.exists() and not args.force:
         print(f"Resuming existing run: {out_dir.name}  (use --force to retrain from scratch)")
@@ -630,7 +639,7 @@ def main():
 
     # ── Train/test split ──────────────────────────────────────────────────
     if args.data_seed is not None and not _byol_run_dir_explicit:
-        _splits_dir = args.run_dir.parent / "data_splits" / str(args.data_seed)
+        _splits_dir = args.run_dir.parent.parent / "data_splits" / str(args.data_seed)
         split_label = f"data_seed={args.data_seed}"
     elif args.data_seed is not None:
         _splits_dir = args.byol_run_dir.parent.parent / "data_splits" / str(args.data_seed)
@@ -992,7 +1001,7 @@ def main():
     # PATH B — Generative augmentation
     # ════════════════════════════════════════════════════════════════════
     if args.gen_dir is not None:
-        GEN_FRACS = [0.5, 1.0, 2.0]
+        GEN_FRACS = [1.0] if args.gen_only else [0.5, 1.0, 2.0]
 
         import zuko
         from suplat.models.generative_models import FlowMatchingUNet
@@ -1084,11 +1093,17 @@ def main():
                 _gen_imgs = np.concatenate(_gen_imgs_list, axis=0)   # (n_gen, 89, 89) uint8
                 _gen_lbs  = np.concatenate(_gen_lbs_list, axis=0)    # (n_gen, n_classes)
 
-                # Combine real + generated
-                _aug_imgs = np.concatenate([_tr_im, _gen_imgs], axis=0)
-                _aug_lbs  = np.concatenate([_tr_lb, _gen_lbs],  axis=0)
-                print(f"    Augmented training set: {len(_aug_imgs)} total "
-                      f"({n_real} real + {n_gen} gen)", flush=True)
+                # Combine real + generated (or use generated only)
+                if args.gen_only:
+                    _aug_imgs = _gen_imgs
+                    _aug_lbs  = _gen_lbs
+                    print(f"    Gen-only training set: {n_gen} generated images "
+                          f"(no real data, n_real={n_real})", flush=True)
+                else:
+                    _aug_imgs = np.concatenate([_tr_im, _gen_imgs], axis=0)
+                    _aug_lbs  = np.concatenate([_tr_lb, _gen_lbs],  axis=0)
+                    print(f"    Augmented training set: {len(_aug_imgs)} total "
+                          f"({n_real} real + {n_gen} gen)", flush=True)
 
                 # Uniform alpha for gen-aug (on CPU)
                 _alpha_g = torch.ones(n_classes, dtype=torch.float32)

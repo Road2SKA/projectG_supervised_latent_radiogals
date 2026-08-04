@@ -98,8 +98,8 @@ fi
 
 echo "Run dir: ${RUN_DIR}"
 
-python scripts/run_hpsweep_classifiers.py --run-dir "${RUN_DIR}"
-python scripts/collate_hpsweep.py --mode row --run-dir "${RUN_DIR}"
+python scripts/hyperparameter_sweep/run_hpsweep_classifiers.py --run-dir "${RUN_DIR}"
+python scripts/hyperparameter_sweep/collate_hpsweep.py --mode row --run-dir "${RUN_DIR}"
 
 echo ""
 echo "END: $(date)"

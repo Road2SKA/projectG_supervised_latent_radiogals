@@ -48,7 +48,7 @@ echo "Run: ${RUN_NAME}  ->  ${RUN_DIR}"
 # PROTEGE GP + LR CLASSIFIER + STATUS.JSON + ROW.JSON
 # (all handled by run_hpsweep_postprocess.py)
 # =============================================================================
-python scripts/run_hpsweep_postprocess.py \
+python scripts/hyperparameter_sweep/run_hpsweep_postprocess.py \
     --run-dir "${RUN_DIR}" \
     --epsilon 2.0 \
     --steps   100

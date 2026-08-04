@@ -25,6 +25,7 @@ Outputs
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -45,16 +46,10 @@ sys.path.insert(0, str(ROOT / "src"))
 from suplat.models.byol_models import BYOLEfficientNetB0
 from suplat.utils.class_weights import LABEL_COLS, TIERS
 
-# ── Hardcoded config ───────────────────────────────────────────────────────────
-FIXED_RUN = (
-    "enb0_mlp_pd128_clos_lrconst_wd1e-4_lfull_ema0.996_vicregvar2_cov0.1_gamma0.25"
-    "_f1_sw0.05_augquart_ext_20260709_2203"
-)
-
 IMAGES_PATH    = ROOT / "data/preprocessed/lotss/images_filtered.npy"
 LABELS_PATH    = ROOT / "data/preprocessed/lotss/labels_filtered.npy"
 BYOL_RUNS_ROOT = ROOT / "outputs/byol_runs"
-OUT_DIR        = ROOT / "outputs/anomaly_baselines/noise_robustness"
+OUT_ROOT       = ROOT / "outputs/anomaly_baselines/noise_robustness"
 
 NOISE_SIGMAS = [0.0, 0.25, 0.5, 1.0, 2.0]
 
@@ -146,24 +141,34 @@ def predict_ell_gp(te_ell_df, gpr, scaler, tr_medians):
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Merged noise robustness sweep")
+    parser.add_argument("--byol-run",  type=str, required=True,
+                        help="Name of the BYOL run directory under outputs/byol_runs/.")
     parser.add_argument("--data_seed", type=int, default=42)
     parser.add_argument("--seed",      type=int, default=42)
     parser.add_argument("--force",     action="store_true",
                         help="Overwrite existing outputs.")
     args = parser.parse_args()
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_json = OUT_DIR / "noise_robustness.json"
+    # Extract f-label suffix from run name (e.g. _f1 or _f0.1)
+    _fm = re.search(r'_f([\d.]+)', args.byol_run)
+    f_tag = f"_f{_fm.group(1)}" if _fm else ""
+
+    rd             = BYOL_RUNS_ROOT / args.byol_run
+    seed_dir       = rd / f"seed{args.seed}"
+    BYOL_OUT_DIR   = seed_dir / "data" / "anomaly"
+    BASELINE_OUT_DIR = ROOT / "outputs/anomaly_baselines"
+    BYOL_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    BASELINE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_json = BYOL_OUT_DIR / "noise_robustness.json"
     if out_json.exists() and not args.force:
         print(f"Output exists: {out_json}\nUse --force to overwrite.")
         return
 
-    rd         = BYOL_RUNS_ROOT / FIXED_RUN
     splits_dir = ROOT / "outputs/data_splits" / str(args.data_seed)
 
     # ── Load split ────────────────────────────────────────────────────────────
-    lab_idx  = np.load(splits_dir / "labelled_train_idx.npy")
-    unl_idx  = np.load(splits_dir / "unlabelled_train_idx.npy")
+    lab_idx  = np.load(splits_dir / f"labelled_train_idx{f_tag}.npy")
+    unl_idx  = np.load(splits_dir / f"unlabelled_train_idx{f_tag}.npy")
     test_idx = np.load(splits_dir / "test_idx.npy")
 
     labels_all = np.load(LABELS_PATH)
@@ -192,7 +197,7 @@ def main():
     # the correct 532-row matrix regardless of file convention.
     print("\n── Loading BYOL model ──")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt   = torch.load(rd / "byol_model_best.pt", map_location="cpu",
+    ckpt   = torch.load(seed_dir / "byol_model_best.pt", map_location="cpu",
                         weights_only=False)
     model  = BYOLEfficientNetB0(
         projection_dim=ckpt["config"].get("projection_dim", 256),
@@ -216,9 +221,9 @@ def main():
 
     # ── PCA fitted on all pre-saved encodings ─────────────────────────────────
     print("\n── BYOL setup ──")
-    tr_e  = np.load(rd / "data/byol/labelled_train_encodings.npy")
-    te_e  = np.load(rd / "data/byol/test_encodings.npy")
-    unl_p = rd / "data/byol/unlabelled_train_encodings.npy"
+    tr_e  = np.load(seed_dir / "data/byol/labelled_train_encodings.npy")
+    te_e  = np.load(seed_dir / "data/byol/test_encodings.npy")
+    unl_p = seed_dir / "data/byol/unlabelled_train_encodings.npy"
     if unl_p.exists():
         tr_e = np.concatenate([tr_e, np.load(unl_p)], 0)
     all_e = np.concatenate([tr_e, te_e], 0)
@@ -253,7 +258,7 @@ def main():
     # as σ>0 re-encoding; proj_nopca would mix feature spaces on the same curve).
     _byol_sigma0_auc = None
     for _sfx in ["enc_pca", "proj_nopca"]:
-        _psum_path = rd / "data/protege" / f"protege_summary_{_sfx}.json"
+        _psum_path = seed_dir / "data/protege" / f"protege_summary_{_sfx}.json"
         if _psum_path.exists():
             with open(_psum_path) as _fh:
                 _byol_sigma0_auc = json.load(_fh)["test_auc"]
@@ -324,7 +329,7 @@ def main():
                       flush=True)
             ell_scores = predict_ell_gp(te_ell_clean, gpr_ell, ell_sc, ell_med)
         else:
-            noisy_ell_dir = OUT_DIR / f"ell_sigma{sigma}"
+            noisy_ell_dir = BASELINE_OUT_DIR / f"_ell_sigma{sigma}_cache_{args.data_seed}"
             te_ell_noisy  = extract_ell_features(noisy / 255.0, noisy_ell_dir,
                                                   force_rerun=False)
             n_nan = int(te_ell_noisy.isna().any(axis=1).sum())
@@ -337,7 +342,7 @@ def main():
         print(f"  Ellipses GP      AUC={e_auc:.4f}", flush=True)
 
     # ── Save outputs ──────────────────────────────────────────────────────────
-    npz_path = OUT_DIR / "comp_noise_counts.npz"
+    npz_path = BASELINE_OUT_DIR / "comp_noise_counts.npz"
     np.savez(npz_path, **comp_scores_npz)
     print(f"\nSaved NPZ  → {npz_path}")
 
@@ -348,7 +353,7 @@ def main():
         "complexity_auc": comp_auc_list,
         "byol_auc":       byol_auc_list,
         "ell_auc":        ell_auc_list,
-        "byol_run":            FIXED_RUN,
+        "byol_run":            args.byol_run,
         "data_seed":           args.data_seed,
         "rng_seed":            args.seed,
         "test_idx_sha256":     test_idx_sha256,
@@ -361,7 +366,7 @@ def main():
     print(f"Saved JSON → {out_json}")
 
     # Backwards-compatible: comp_noise_robustness.json (read by notebook cell 40)
-    with open(OUT_DIR / "comp_noise_robustness.json", "w") as fh:
+    with open(BASELINE_OUT_DIR / "comp_noise_robustness.json", "w") as fh:
         json.dump({
             "version":         4,
             "noise_sigmas":    NOISE_SIGMAS,
@@ -373,9 +378,9 @@ def main():
         }, fh, indent=2)
 
     # Backwards-compatible: byol_noise_robustness.json (read by notebook cell 40)
-    with open(OUT_DIR / "byol_noise_robustness.json", "w") as fh:
+    with open(BYOL_OUT_DIR / "byol_noise_robustness.json", "w") as fh:
         json.dump({
-            "run":            FIXED_RUN,
+            "run":            args.byol_run,
             "data_seed":      args.data_seed,
             "rng_seed":       args.seed,
             "noise_sigmas":   NOISE_SIGMAS,

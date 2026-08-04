@@ -36,7 +36,8 @@ echo "Class weighting: ${CLASS_WEIGHT_MODE:-score (default)}  strength=${CLASS_W
 
 python scripts/train_byol_proteges.py \
     --outputs-root outputs \
-    --run-glob "byol_runs/enb0_mlp_pd128_clos_lrconst_wd1e-4_lfull_ema*_*_f*_sw*_*" \
+    --run-glob "byol_runs/pd128_*" \
+    --byol-seed 2 \
     --workers 8 \
     --steps 100 \
     --force \

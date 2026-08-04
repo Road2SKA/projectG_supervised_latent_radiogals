@@ -212,7 +212,6 @@ def mode_aggregate(sweep_root: Path):
         'run_name', 'projection_dim', 'weight_decay', 'lr_schedule', 'augmentation', 'vicreg', 'status',
         'train_loss_final', 'train_loss_best', 'train_loss_best_epoch',
         'train_friend_loss_final', 'train_friend_loss_best', 'train_friend_loss_best_epoch',
-        'val_friend_loss_final', 'val_friend_loss_best', 'val_friend_loss_best_epoch',
         'protege_proj_recall_auc',
         'lr_f1_macro', 'lr_auc_macro', 'lr_accuracy', 'lr_recall_macro',
         'run_dir',

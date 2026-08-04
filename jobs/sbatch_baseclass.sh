@@ -16,32 +16,37 @@ source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 cd /users/mbredber/p3_SUPLAT
 export PYTHONUNBUFFERED=1
 
-RUN_DIR="outputs/supervised_baseline_classifiers"
+RUN_DIR="outputs/supervised_baseline_classifiers/seed2"
 DATA_DIR="data/preprocessed/lotss"
 MODEL="enb0"
 EPOCHS=50
 BATCH_SIZE=256
 LR=3e-5
-SEED=42
-DATA_SEED=42
+SEED=2
+DATA_SEED=2
+
+GEN_DIR="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.05_f1/seed2/data/generative"
+GEN_VARIANT="initial"
 
 # Format: "LABEL_SET CLASS_WEIGHT_MODE CLASS_WEIGHT_STRENGTH"
 # CW_MODE "none" → uniform weights (--class_weight_mode omitted).
 # _binary label sets score element-wise accuracy (each label column independently).
 CONFIGS=(
-    "initial_pure   initial_pure  1.0"
-    "initial_binary none          0.0"
-    "initial_binary initial       0.3"
-    "initial_binary initial       1.0"
-    "full_binary    none          0.0"
-    "full_binary    all           0.3"
-    "full_binary    all           1.0"
+    "initial_pure   none          0.0"
+    #"initial_pure   initial_pure  1.0"
+    #"initial_binary none          0.0"
+    #"initial_binary initial       0.3"
+    #"initial_binary initial       1.0"
+    #"full_binary    none          0.0"
+    #"full_binary    all           0.3"
+    #"full_binary    all           1.0"
 )
 
 run_config() {
     local LABEL_SET="$1"
     local CW_MODE="$2"
     local CW_STR="$3"
+    local USE_GEN="${4:-}"   # optional: "gen" to enable generative augmentation
 
     local CW_TAG
     if [ "${CW_MODE}" = "none" ] || [ "${CW_MODE}" = "None" ]; then
@@ -50,12 +55,25 @@ run_config() {
         CW_TAG="cw${CW_MODE}$([ "${CW_STR}" != "1.0" ] && echo "${CW_STR}")"
     fi
     local RUN_NAME="${MODEL}_${LABEL_SET}_${CW_TAG}"
-    local OUT="${RUN_DIR}/without_generative/${RUN_NAME}"
+
+    local GEN_ARGS=()
+    local SUBDIR
+    if [ "${USE_GEN}" = "gen" ]; then
+        SUBDIR="with_generative"
+        GEN_ARGS=(--gen_dir "${GEN_DIR}" --gen_variant "${GEN_VARIANT}")
+    elif [ "${USE_GEN}" = "gen_only" ]; then
+        SUBDIR="gen_only"
+        GEN_ARGS=(--gen_dir "${GEN_DIR}" --gen_variant "${GEN_VARIANT}" --gen_only)
+    else
+        SUBDIR="without_generative"
+    fi
+    local OUT="${RUN_DIR}/${SUBDIR}/${RUN_NAME}"
 
     echo "════════════════════════════════════════════════════════"
-    echo "Run name    : ${RUN_NAME}"
+    echo "Run name    : ${RUN_NAME}  (${SUBDIR})"
     echo "Label set   : ${LABEL_SET}  Model: ${MODEL}"
     echo "Class wt    : ${CW_MODE}  strength=${CW_STR}"
+    [ "${USE_GEN}" = "gen" ] || [ "${USE_GEN}" = "gen_only" ] && echo "Gen dir     : ${GEN_DIR}  variant=${GEN_VARIANT}"
     echo "════════════════════════════════════════════════════════"
 
     # Delete stale fraction caches so the sweep reruns with corrected class weights.
@@ -85,14 +103,28 @@ run_config() {
         --data_seed            "$DATA_SEED" \
         --n_runs               3 \
         --num_workers          4 \
-        "${CW_ARGS[@]}"
+        "${CW_ARGS[@]}" \
+        "${GEN_ARGS[@]}"
 
     echo "  Done: $(date)"
 }
 
+#echo "── Without generative ───────────────────────────────────"
+#for cfg in "${CONFIGS[@]}"; do
+#    read -r LS CWM CWS <<< "$cfg"
+#    run_config "$LS" "$CWM" "$CWS"
+#done
+
+echo "── With generative ──────────────────────────────────────"
 for cfg in "${CONFIGS[@]}"; do
     read -r LS CWM CWS <<< "$cfg"
-    run_config "$LS" "$CWM" "$CWS"
+    run_config "$LS" "$CWM" "$CWS" "gen"
+done
+
+echo "── Gen only (train on generated, eval on real) ──────────"
+for cfg in "${CONFIGS[@]}"; do
+    read -r LS CWM CWS <<< "$cfg"
+    run_config "$LS" "$CWM" "$CWS" "gen_only"
 done
 
 echo "END: $(date)"

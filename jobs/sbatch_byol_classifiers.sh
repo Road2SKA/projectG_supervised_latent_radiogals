@@ -40,7 +40,7 @@ CLASS_WEIGHT_STRENGTH=1.0
 if [ -n "$BYOL_RUN_DIR" ]; then
     RUN_GLOB="$(basename "$BYOL_RUN_DIR")"
 else
-    RUN_GLOB="enb0_*"
+    RUN_GLOB="pd128_*"
 fi
 
 echo "Starting BYOL classifiers sweep — $(date)"
@@ -55,6 +55,7 @@ python scripts/train_byol_classifiers.py \
     --label-set    initial_pure \
     --n-estimators 200 \
     --workers      8 \
+    --seed         2 \
     ${CLASS_WEIGHT_MODE:+--class-weight-mode=${CLASS_WEIGHT_MODE}} \
     ${CLASS_WEIGHT_MODE:+--class-weight-strength=${CLASS_WEIGHT_STRENGTH}}
 

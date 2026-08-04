@@ -13,7 +13,7 @@ echo "START: $(date)"
 cd /users/mbredber/p3_SUPLAT
 source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 
-python scripts/collate_hpsweep.py \
+python scripts/hyperparameter_sweep/collate_hpsweep.py \
     --mode aggregate \
     --sweep-root outputs/hyperparameter_tuning/byol_runs
 
