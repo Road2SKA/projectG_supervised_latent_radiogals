@@ -1,7 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=rbyol_classifiers
-#SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
-#SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
+#SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.out
+#SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.err
+#SBATCH --array=0-3
 #SBATCH --partition=normal
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -21,41 +22,32 @@ cd "${PROJECT}"
 
 mkdir -p outputs/logs
 
-# =============================================================================
-# CONFIGURATION — keep BYOL_RUN_DIR in sync with run_classifiers.sh so both
-# scripts evaluate on the same train/test split.
-# Set to "" to sweep ALL matching run directories instead.
-# =============================================================================
-BYOL_RUN_DIR=""
+# Seeds 3-6, f_label=1, sw in {0.0, 0.05, 0.1, 0.5}
+SEEDS=(3 4 5 6)
+SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 # ── Class weighting ───────────────────────────────────────────────────────────
-# MODE: which label set to balance. Empty string = no weighting (uniform).
-#   Options: initial | morphology | environment | classical | all | score
-#   Label-set modes require --label-set to be a *_pure variant (e.g. initial_pure).
-# STRENGTH: 0.0 = uniform (no effect), 1.0 = each class contributes equally.
 CLASS_WEIGHT_MODE=""
 CLASS_WEIGHT_STRENGTH=1.0
 # =============================================================================
 
-if [ -n "$BYOL_RUN_DIR" ]; then
-    RUN_GLOB="$(basename "$BYOL_RUN_DIR")"
-else
-    RUN_GLOB="pd128_*"
-fi
-
 echo "Starting BYOL classifiers sweep — $(date)"
 echo "Node: ${SLURMD_NODENAME:-local}  CPUs: ${SLURM_CPUS_PER_TASK:-8}"
-echo "Run glob: ${RUN_GLOB}"
+echo "Seed: ${SEED}"
 echo "Class weighting: ${CLASS_WEIGHT_MODE:-none}  strength=${CLASS_WEIGHT_STRENGTH}"
 
 python scripts/train_byol_classifiers.py \
     --outputs-root outputs/byol_runs \
-    --run-glob     "${RUN_GLOB}" \
+    --run-glob     "pd128_*_f1" \
     --feature-type projections \
     --label-set    initial_pure \
     --n-estimators 200 \
     --workers      8 \
-    --seed         2 \
+    --seed         "${SEED}" \
+    --data-seed    2 \
     ${CLASS_WEIGHT_MODE:+--class-weight-mode=${CLASS_WEIGHT_MODE}} \
     ${CLASS_WEIGHT_MODE:+--class-weight-strength=${CLASS_WEIGHT_STRENGTH}}
 

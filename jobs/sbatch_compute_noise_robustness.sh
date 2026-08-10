@@ -22,21 +22,23 @@ export PYTHONUNBUFFERED=1
 # CONFIGURATION
 # =============================================================================
 DATA_SEED=2
-SEED=2
 # Add --force to overwrite existing outputs
 # =============================================================================
 
 for RUN_DIR in outputs/byol_runs/pd128_*_f1; do
     RUN_NAME="$(basename "${RUN_DIR}")"
-    echo "════════════════════════════════════════════════════════"
-    echo "Run: ${RUN_NAME}"
-    echo "════════════════════════════════════════════════════════"
-    python scripts/compute_noise_robustness.py \
-        --byol-run  "${RUN_NAME}" \
-        --data_seed "${DATA_SEED}" \
-        --seed      "${SEED}" \
-        --force
-    echo "  Done: $(date)"
+    for SEED_DIR in "${RUN_DIR}"/seed*; do
+        SEED="$(basename "${SEED_DIR}" | sed 's/seed//')"
+        echo "════════════════════════════════════════════════════════"
+        echo "Run: ${RUN_NAME}  seed: ${SEED}"
+        echo "════════════════════════════════════════════════════════"
+        python scripts/compute_noise_robustness.py \
+            --byol-run  "${RUN_NAME}" \
+            --data_seed "${DATA_SEED}" \
+            --seed      "${SEED}" \
+            --force
+        echo "  Done: $(date)"
+    done
 done
 
 echo "END: $(date)"

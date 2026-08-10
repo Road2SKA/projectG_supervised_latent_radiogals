@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=suplat_sw_sweep
-#SBATCH --array=0-9
+#SBATCH --array=0-15
 #SBATCH --output=outputs/logs/sw_sweep_%A_%a.out
 #SBATCH --error=outputs/logs/sw_sweep_%A_%a.err
 #SBATCH --gres=gpu:1
@@ -10,17 +10,23 @@
 
 source .venv/bin/activate
 
-SW_VALUES=("0.0" "0.05" "0.1" "0.5" "1.0")
-SW_TAGS=("sw0.0" "sw0.05" "sw0.1" "sw0.5" "sw1.0")
-FL_VALUES=("0.1" "1.0")
-FL_TAGS=("f0.1" "f1")
+# data-seed fixed at 2, model seeds 3-6, f_label=1, sw in {0.0, 0.05, 0.1, 0.5}
+# Array index: i = seed_i * 4 + sw_i
+#   seed_i in 0..3  -> seed in {3,4,5,6}
+#   sw_i   in 0..3  -> sw  in {0.0, 0.05, 0.1, 0.5}
+
+SW_VALUES=("0.0" "0.05" "0.1" "0.5")
+SW_TAGS=("sw0.0" "sw0.05" "sw0.1" "sw0.5")
+SEEDS=(3 4 5 6)
+DATA_SEED=2
 
 i=$SLURM_ARRAY_TASK_ID
-sw_i=$(( i / 2 ))
-fl_i=$(( i % 2 ))
+seed_i=$(( i / 4 ))
+sw_i=$(( i % 4 ))
 
+SEED=${SEEDS[$seed_i]}
 BASE="pd128_qext_v1_wd1e-3_lrconst"
-RUN_NAME="${BASE}_${SW_TAGS[$sw_i]}_${FL_TAGS[$fl_i]}"
+RUN_NAME="${BASE}_${SW_TAGS[$sw_i]}_f1"
 
 python scripts/train_byol.py \
     --run-name "$RUN_NAME" \
@@ -39,9 +45,9 @@ python scripts/train_byol.py \
     --epochs 300 \
     --lr 3e-4 \
     --num-workers 4 \
-    --seed 2 \
-    --data-seed 2 \
+    --seed "$SEED" \
+    --data-seed "$DATA_SEED" \
     --supervision-weight "${SW_VALUES[$sw_i]}" \
-    --f-label "${FL_VALUES[$fl_i]}" \
+    --f-label 1.0 \
     --output-dir outputs/ \
     --no-timestamp

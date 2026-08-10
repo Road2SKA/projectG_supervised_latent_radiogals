@@ -1,12 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=byol_finetune
 #SBATCH --account=sk036
+#SBATCH --array=0-3
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
 #SBATCH --time=12:00:00
-#SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.out
-#SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%j.err
+#SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.out
+#SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.err
 #SBATCH --mail-type=END
 #SBATCH --mail-user=markus.bredberg@epfl.ch
 
@@ -14,11 +15,14 @@ echo "START: $(date)"
 cd /users/mbredber/p3_SUPLAT
 source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 
-BYOL_SEED=2
-WD=3e-4
+# Seeds 3-6 (data-seed fixed at 2, read from checkpoint automatically)
+SEEDS=(3 4 5 6)
+BYOL_SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
+WD=3e-1
 N_RUNS=5
 NUM_WORKERS=4
-LR=1e-5
+LR=1e-2
+DROPOUT=0.2
 EPOCHS=40
 
 # CONFIGS: "label_set  cw_mode  cw_strength"
@@ -36,7 +40,12 @@ CONFIGS=(
     "initial_binary  none          0.0"
 )
 
-for RUN_DIR in outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.05_f1; do
+for RUN_DIR in \
+    outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.0_f1 \
+    outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.05_f1 \
+    outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.1_f1 \
+    outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.5_f1 \
+    outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw1.0_f1; do
     MODEL_PATH="${RUN_DIR}/seed${BYOL_SEED}"
     echo ""
     echo "════════════════════════════════════════════════════════"
@@ -61,6 +70,7 @@ for RUN_DIR in outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.05_f1; do
                 --epochs=${EPOCHS} \
                 --lr=${LR} \
                 --weight-decay=${WD} \
+                --dropout=${DROPOUT} \
                 --n-runs=${N_RUNS} \
                 --num-workers=${NUM_WORKERS} \
                 --augmentation=quart_ext \

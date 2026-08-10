@@ -288,7 +288,9 @@ def _train_one_run(
     elif model_name == 'enb0':
         tf_train = get_augmentation('quart_ext')
         tf_val   = None
-        print(f"  Training at native 89×89 for {model_name} (train: quart_ext aug)")
+        if args.no_augmentation:
+            tf_train = None
+        print(f"  Training at native 89×89 for {model_name} (train: {'no aug' if args.no_augmentation else 'quart_ext aug'})")
     else:
         tf_train = None
         tf_val   = None
@@ -561,6 +563,11 @@ def main():
                         help="Train exclusively on generated images (no real training data), "
                              "with n_gen = n_real (frac=1.0), then evaluate on the real test set. "
                              "Requires --gen_dir. Outputs go to gen_only/ instead of with_generative/.")
+    parser.add_argument('--no_augmentation', action='store_true', default=False,
+                        help="Disable training augmentation (tf_train=None). Default: False.")
+    parser.add_argument('--gen_frac', type=float, default=None,
+                        help="Pin gen-aug to a single fraction of real data instead of sweeping "
+                             "[0.5, 1.0, 2.0]. Requires --gen_dir. E.g. --gen_frac 1.0.")
     args = parser.parse_args()
     _ls_base = args.label_set[:-7] if args.label_set.endswith('_binary') else args.label_set
     if _ls_base not in LABEL_SETS:
@@ -966,6 +973,8 @@ def main():
     elif args.model == 'enb0':
         _tf_sw       = None
         _tf_train_sw = get_augmentation('quart_ext')
+        if args.no_augmentation:
+            _tf_train_sw = None
     else:
         _tf_sw       = None
         _tf_train_sw = None
@@ -1001,7 +1010,9 @@ def main():
     # PATH B — Generative augmentation
     # ════════════════════════════════════════════════════════════════════
     if args.gen_dir is not None:
-        GEN_FRACS = [1.0] if args.gen_only else [0.5, 1.0, 2.0]
+        GEN_FRACS = ([args.gen_frac] if args.gen_frac is not None
+                     else [1.0] if args.gen_only
+                     else [0.5, 1.0, 2.0])
 
         import zuko
         from suplat.models.generative_models import FlowMatchingUNet

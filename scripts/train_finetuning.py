@@ -236,6 +236,12 @@ def parse_args():
         help="Early stopping patience (epochs with no improvement on test loss). Default: 15.",
     )
     ap.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Dropout rate applied between projector output and classifier head. Default: 0.0.",
+    )
+    ap.add_argument(
         "--early-stopping",
         action="store_true",
         default=False,
@@ -263,7 +269,7 @@ def parse_args():
 
 
 class BYOLFineTuner(nn.Module):
-    def __init__(self, byol_model, num_classes=21, training_mode=3):
+    def __init__(self, byol_model, num_classes=21, training_mode=3, dropout_rate=0.0):
         super().__init__()
 
         self.encoder = byol_model.online_encoder
@@ -271,6 +277,7 @@ class BYOLFineTuner(nn.Module):
         self.training_mode = training_mode
 
         # BYOL projection_dim = 128 in your case
+        self.dropout = nn.Dropout(p=dropout_rate)
         self.classifier = nn.Linear(128, num_classes)
 
         self.apply_training_mode(training_mode)
@@ -310,6 +317,7 @@ class BYOLFineTuner(nn.Module):
     def forward(self, x):
         z = self.encoder(x)
         z = self.projector(z)
+        z = self.dropout(z)
         logits = self.classifier(z)
         return logits
 
@@ -483,6 +491,7 @@ def build_finetune_model(model_idx):
         byol_model=model,
         num_classes=num_classes,
         training_mode=TRAINING_MODE,
+        dropout_rate=args.dropout,
     )
 
     return finetune_model.to(device), run_seed

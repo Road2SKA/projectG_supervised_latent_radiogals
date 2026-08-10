@@ -239,7 +239,8 @@ def _do_ip_eval(out: dict, clf_dir: Path, feature_type: str, run_name: str,
 def process_run(run_dir: Path, feature_type: str, label_set: str,
                 n_estimators: int, n_neighbors: int, lr_C: float,
                 seed: int, force: bool,
-                class_weight_mode: str = None, class_weight_strength: float = 0.0):
+                class_weight_mode: str = None, class_weight_strength: float = 0.0,
+                data_seed: int = None):
     """Train RF, KNN, and LR for one run directory.
 
     Returns a result dict with keys rf/knn/lr (each with f1_macro, auc_macro, accuracy),
@@ -284,7 +285,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         if (_search / "data_splits").is_dir():
             break
         _search = _search.parent
-    splits_dir = _search / "data_splits" / str(seed)
+    splits_dir = _search / "data_splits" / str(data_seed if data_seed is not None else seed)
     feat_dir   = run_dir / f"seed{seed}" / "data" / "byol"
     _f_m  = re.search(r'_f([\d.]+)', run_dir.name)
     _f_tag = f"_f{_f_m.group(1)}" if _f_m else ""
@@ -640,11 +641,12 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
 # ---------------------------------------------------------------------------
 
 def _worker(args):
-    run_dir, feature_type, label_set, n_estimators, n_neighbors, lr_C, seed, force, cw_mode, cw_strength = args
+    run_dir, feature_type, label_set, n_estimators, n_neighbors, lr_C, seed, force, cw_mode, cw_strength, data_seed = args
     try:
         return process_run(run_dir, feature_type, label_set,
                            n_estimators, n_neighbors, lr_C, seed, force,
-                           class_weight_mode=cw_mode, class_weight_strength=cw_strength)
+                           class_weight_mode=cw_mode, class_weight_strength=cw_strength,
+                           data_seed=data_seed)
     except Exception as exc:
         import traceback
         print(f"  ERROR in {run_dir.name}: {exc}", file=sys.stderr, flush=True)
@@ -677,7 +679,9 @@ def main():
     parser.add_argument("--lr-c",         type=float, default=1.0,
                         help="Logistic regression inverse regularisation strength (default: 1.0).")
     parser.add_argument("--seed",         type=int, default=42,
-                        help="Random seed (default: 42).")
+                        help="Random seed for classifiers and BYOL seed subdir (default: 42).")
+    parser.add_argument("--data-seed",    type=int, default=None,
+                        help="Seed used to locate data_splits/<seed>/ (defaults to --seed).")
     parser.add_argument("--force",        action="store_true",
                         help="Re-run even if result already saved.")
     parser.add_argument("--workers",      type=int, default=1,
@@ -724,7 +728,7 @@ def main():
     worker_args = [
         (rd, args.feature_type, args.label_set, args.n_estimators,
          args.n_neighbors, args.lr_c, args.seed, args.force,
-         args.class_weight_mode, args.class_weight_strength)
+         args.class_weight_mode, args.class_weight_strength, args.data_seed)
         for rd in run_dirs
     ]
 

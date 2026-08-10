@@ -35,7 +35,6 @@ import torch
 from astronomaly.base.base_dataset import Dataset as _AstroDataset
 from astronomaly.feature_extraction import shape_features as _sf
 from skimage.feature import blob_doh
-from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
@@ -51,7 +50,7 @@ LABELS_PATH    = ROOT / "data/preprocessed/lotss/labels_filtered.npy"
 BYOL_RUNS_ROOT = ROOT / "outputs/byol_runs"
 OUT_ROOT       = ROOT / "outputs/anomaly_baselines/noise_robustness"
 
-NOISE_SIGMAS = [0.0, 0.25, 0.5, 1.0, 2.0]
+NOISE_SIGMAS = [0.0, 1/10, 1/5, 1/3, 1/2, 1.0, 2.0]
 
 
 # ── Astronomaly dataset wrapper ────────────────────────────────────────────────
@@ -90,11 +89,35 @@ def recall_auc(scores, true_hl, pos_thresh=3):
 
 
 def add_noise(images, sigma_rel, rng):
+    """Add noise in the Fourier (uv) domain with Hermitian symmetry.
+
+    Noise is generated as complex Gaussian in the half-spectrum returned by
+    rfft2, then transformed back with irfft2.  Because rfft2/irfft2 enforce
+    the Hermitian symmetry condition F(-u,-v)=F(u,v)*, the result is always
+    a real-valued image — consistent with how radio interferometric images
+    are formed.
+
+    sigma_rel calibration:
+      sigma_rel = 1.0  →  added noise std = per-image peak pixel value (max |pixel|)
+      sigma_rel = 0.1  →  noise std = 10% of peak
+
+    Derivation of the Fourier scaling factor:
+      irfft2 normalises by N = h*w.  Adding i.i.d. complex Gaussian noise
+      with variance σ_f² per component to all M = h*(w//2+1) rfft2 coefficients
+      gives image-domain noise with per-pixel variance ≈ 2σ_f²/N (Parseval).
+      Setting σ_image = sigma_rel * per_max solves to:
+        σ_f = sigma_rel * per_max * sqrt(N/2) = sigma_rel * per_max * sqrt(h*w/2)
+    """
     if sigma_rel == 0.0:
         return images.astype(np.float32)
-    per_std = images.astype(np.float32).std(axis=(-2, -1), keepdims=True).clip(1e-6)
-    return (images.astype(np.float32)
-            + rng.normal(0, sigma_rel, images.shape).astype(np.float32) * per_std)
+    imgs     = images.astype(np.float32)
+    per_max  = np.abs(imgs).max(axis=(-2, -1), keepdims=True).clip(1e-6)  # (n,1,1)
+    n, h, w  = imgs.shape
+    sigma_f  = per_max * sigma_rel * np.sqrt(h * w / 2.0)           # Fourier-domain scale
+    spectrum = np.fft.rfft2(imgs)                                    # (n, h, w//2+1) complex
+    noise_r  = rng.standard_normal(spectrum.shape).astype(np.float32) * sigma_f
+    noise_i  = rng.standard_normal(spectrum.shape).astype(np.float32) * sigma_f
+    return np.fft.irfft2(spectrum + (noise_r + 1j * noise_i), s=(h, w)).astype(np.float32)
 
 
 def blob_doh_complexity(image_f32):
@@ -145,8 +168,11 @@ def main():
                         help="Name of the BYOL run directory under outputs/byol_runs/.")
     parser.add_argument("--data_seed", type=int, default=42)
     parser.add_argument("--seed",      type=int, default=42)
-    parser.add_argument("--force",     action="store_true",
+    parser.add_argument("--force",       action="store_true",
                         help="Overwrite existing outputs.")
+    parser.add_argument("--n-noise-seeds", type=int, default=5,
+                        help="Number of independent noise realisations per σ level "
+                             "used to estimate BYOL AUC std (default: 5).")
     args = parser.parse_args()
 
     # Extract f-label suffix from run name (e.g. _f1 or _f0.1)
@@ -202,6 +228,7 @@ def main():
     model  = BYOLEfficientNetB0(
         projection_dim=ckpt["config"].get("projection_dim", 256),
         hidden_dim=ckpt["config"].get("hidden_dim", 4096),
+        feature_compression_mode=ckpt["config"].get("projector", "pca"),
     )
     sd = ckpt["model_state_dict"]
     if any(k.startswith("_orig_mod.") for k in sd):
@@ -216,34 +243,31 @@ def main():
             for i in range(0, len(imgs_01), batch):
                 x = (torch.from_numpy(imgs_01[i:i+batch])
                      .unsqueeze(1).float().to(device))
-                out.append(model.online_encoder(x).float().cpu().numpy())
+                enc = model.online_encoder(x)
+                out.append(model.online_projector(enc).float().cpu().numpy())
         return np.vstack(out)
 
-    # ── PCA fitted on all pre-saved encodings ─────────────────────────────────
+    # ── StandardScaler fitted on all pre-saved projections ────────────────────
     print("\n── BYOL setup ──")
-    tr_e  = np.load(seed_dir / "data/byol/labelled_train_encodings.npy")
-    te_e  = np.load(seed_dir / "data/byol/test_encodings.npy")
-    unl_p = seed_dir / "data/byol/unlabelled_train_encodings.npy"
-    if unl_p.exists():
-        tr_e = np.concatenate([tr_e, np.load(unl_p)], 0)
-    all_e = np.concatenate([tr_e, te_e], 0)
+    tr_p  = np.load(seed_dir / "data/byol/labelled_train_projections.npy")
+    te_p  = np.load(seed_dir / "data/byol/test_projections.npy")
+    all_p = np.concatenate([tr_p, te_p], 0)
 
-    pca = PCA(n_components=0.95, svd_solver="full").fit(all_e)
-    sc  = StandardScaler().fit(pca.transform(all_e))
-    print(f"PCA: {pca.n_components_} components  |  pre-saved test encodings: {len(te_e)}")
+    sc  = StandardScaler().fit(all_p)
+    print(f"StandardScaler fitted on {len(all_p)} sources  |  proj dim: {all_p.shape[1]}")
 
     # Re-encode both labeled train and clean test images through the model so
     # that Xtr_lab and Xte are always from the same encoder (online_encoder).
     # The pre-saved encodings above are used only for fitting the PCA/scaler.
     images_mmap = np.load(IMAGES_PATH, mmap_mode="r")
     lab_images  = np.array(images_mmap[lab_idx])
-    lab_enc     = encode(lab_images.astype(np.float32) / 255.0)
-    Xtr_lab     = sc.transform(pca.transform(lab_enc))
+    lab_proj    = encode(lab_images.astype(np.float32) / 255.0)
+    Xtr_lab     = sc.transform(lab_proj)
     print(f"Re-encoded {len(Xtr_lab)} labeled train sources → Xtr_lab {Xtr_lab.shape}")
 
     test_images_clean = np.array(images_mmap[test_idx])
-    clean_enc = encode(test_images_clean.astype(np.float32) / 255.0)
-    Xte       = sc.transform(pca.transform(clean_enc))
+    clean_proj = encode(test_images_clean.astype(np.float32) / 255.0)
+    Xte        = sc.transform(clean_proj)
     print(f"Re-encoded {len(Xte)} clean test sources → Xte {Xte.shape}")
 
     gpr_byol = GaussianProcessRegressor(
@@ -254,10 +278,10 @@ def main():
     gpr_byol.fit(Xtr_lab, y_lab)
     print(f"BYOL GP fitted on {len(Xtr_lab)} labeled sources")
 
-    # σ=0 BYOL GP AUC: read from protege enc_pca summary (same enc→PCA feature space
-    # as σ>0 re-encoding; proj_nopca would mix feature spaces on the same curve).
+    # σ=0 BYOL GP AUC: read from proj_nopca protege summary (same proj feature space
+    # as σ>0 re-encoding).
     _byol_sigma0_auc = None
-    for _sfx in ["enc_pca", "proj_nopca"]:
+    for _sfx in ["proj_nopca", "enc_pca"]:
         _psum_path = seed_dir / "data/protege" / f"protege_summary_{_sfx}.json"
         if _psum_path.exists():
             with open(_psum_path) as _fh:
@@ -281,11 +305,14 @@ def main():
     test_images = test_images_clean   # already loaded above
     del images_mmap
 
+    # One RNG for complexity/ellipses (single realisation per sigma) and N
+    # independent RNGs for BYOL so we can estimate AUC std across noise seeds.
     rng = np.random.default_rng(args.seed)
 
-    comp_auc_list   = []
-    byol_auc_list   = []
-    ell_auc_list    = []
+    comp_auc_list      = []
+    byol_auc_list      = []   # mean across noise seeds
+    byol_auc_std_list  = []   # std  across noise seeds
+    ell_auc_list       = []
     comp_scores_npz    = {}   # str(sigma) → float32 array, for npz
 
     # ── Sigma sweep ───────────────────────────────────────────────────────────
@@ -294,7 +321,7 @@ def main():
         print(f"── σ={sigma} ──", flush=True)
         noisy = add_noise(test_images, sigma, rng)   # (n_test, H, W) float32
 
-        # Complexity
+        # Complexity (single realisation)
         blob_scores = np.array(
             [blob_doh_complexity(noisy[i]) for i in range(len(noisy))],
             dtype=np.float32,
@@ -305,23 +332,33 @@ def main():
         print(f"  Complexity       AUC={c_auc:.4f}  (mean blobs={blob_scores.mean():.2f})",
               flush=True)
 
-        # BYOL GP
+        # BYOL GP — average over N independent noise realisations to get mean ± std
         if sigma == 0.0:
-            Xte_cur = Xte
+            # No noise: std is 0 by definition
             if _byol_sigma0_auc is not None:
                 b_auc = _byol_sigma0_auc
-                print(f"  BYOL GP          AUC={b_auc:.4f}  (protege summary)", flush=True)
+                print(f"  BYOL GP          AUC={b_auc:.4f}  (protege summary, σ=0)", flush=True)
             else:
-                b_auc = recall_auc(gpr_byol.predict(Xte_cur), test_hl)
+                b_auc = recall_auc(gpr_byol.predict(Xte), test_hl)
                 print(f"  BYOL GP          AUC={b_auc:.4f}", flush=True)
+            byol_auc_list.append(b_auc)
+            byol_auc_std_list.append(0.0)
         else:
-            enc     = encode(noisy / 255.0)
-            Xte_cur = sc.transform(pca.transform(enc))
-            b_auc   = recall_auc(gpr_byol.predict(Xte_cur), test_hl)
-            print(f"  BYOL GP          AUC={b_auc:.4f}", flush=True)
-        byol_auc_list.append(b_auc)
+            _byol_seed_aucs = []
+            for _ns in range(args.n_noise_seeds):
+                _rng_ns  = np.random.default_rng(args.seed * 1000 + _ns)
+                _noisy_s = add_noise(test_images, sigma, _rng_ns)
+                _enc_s   = encode(_noisy_s / 255.0)
+                _Xte_s   = sc.transform(_enc_s)
+                _byol_seed_aucs.append(recall_auc(gpr_byol.predict(_Xte_s), test_hl))
+            b_auc     = float(np.mean(_byol_seed_aucs))
+            b_auc_std = float(np.std(_byol_seed_aucs, ddof=1) if len(_byol_seed_aucs) > 1 else 0.0)
+            byol_auc_list.append(b_auc)
+            byol_auc_std_list.append(b_auc_std)
+            print(f"  BYOL GP          AUC={b_auc:.4f} ± {b_auc_std:.4f}  "
+                  f"(n={args.n_noise_seeds} seeds)", flush=True)
 
-        # Ellipses GP
+        # Ellipses GP (single realisation — uses same noisy images as complexity)
         if sigma == 0.0:
             n_nan_0 = int(te_ell_clean.isna().any(axis=1).sum())
             if n_nan_0:
@@ -348,16 +385,18 @@ def main():
 
     # Unified JSON
     result = {
-        "version":             1,
+        "version":             2,
         "noise_sigmas":        NOISE_SIGMAS,
-        "complexity_auc": comp_auc_list,
-        "byol_auc":       byol_auc_list,
-        "ell_auc":        ell_auc_list,
+        "complexity_auc":      comp_auc_list,
+        "byol_auc":            byol_auc_list,
+        "byol_auc_std":        byol_auc_std_list,
+        "n_noise_seeds":       args.n_noise_seeds,
+        "ell_auc":             ell_auc_list,
         "byol_run":            args.byol_run,
         "data_seed":           args.data_seed,
         "rng_seed":            args.seed,
         "test_idx_sha256":     test_idx_sha256,
-        "pca_components":      int(pca.n_components_),
+        "proj_dim":            int(all_p.shape[1]),
         "n_labeled":           int(len(lab_idx)),
         "n_test":              int(len(test_idx)),
     }
@@ -385,9 +424,11 @@ def main():
             "rng_seed":       args.seed,
             "noise_sigmas":   NOISE_SIGMAS,
             "byol_auc":       byol_auc_list,
+            "byol_auc_std":   byol_auc_std_list,
+            "n_noise_seeds":  args.n_noise_seeds,
             "n_labeled":      int(len(lab_idx)),
             "n_test":         int(len(test_idx)),
-            "pca_components": int(pca.n_components_),
+            "proj_dim":       int(all_p.shape[1]),
         }, fh, indent=2)
 
     print("Saved backwards-compatible JSONs.")
