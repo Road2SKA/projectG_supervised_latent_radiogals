@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ft_reg_sweep4
+#SBATCH --job-name=ft_reg_sweep5
 #SBATCH --account=sk036
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
@@ -10,9 +10,8 @@
 #SBATCH --mail-type=END
 #SBATCH --mail-user=markus.bredberg@epfl.ch
 
-# Sweep 4: broader LR range (1e-1 to 1e-3), mode 2 only.
-# Uses sw=0 BYOL run to decouple HP selection from the models being evaluated.
-# Note: only data_seed=2 exists, so test-set overfitting cannot be fully avoided.
+# Sweep 5: same as sweep 4 but with explicit --data-seed=2 --force so results
+# are on the correct test split (2004 samples) and old wrong-split results are overwritten.
 
 MODE=2
 BYOL_SEED=3
@@ -40,6 +39,8 @@ for LR in "${LRS[@]}"; do
         --n-runs=3 \
         --num-workers=4 \
         --augmentation=quart_ext \
+        --data-seed=2 \
+        --force \
         --run-name="${RUN_NAME}"
     done
   done

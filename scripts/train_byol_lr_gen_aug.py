@@ -93,7 +93,7 @@ def load_byol_model(checkpoint_path: Path, device: torch.device):
     proj_dim    = cfg.get("projection_dim", 256)
     hidden_dim  = cfg.get("hidden_dim", 4096)
     encoder_dim = cfg.get("encoder_dim", 512)
-    fcm         = cfg.get("feature_compression_mode", "pca")
+    fcm         = cfg.get("feature_compression_mode") or cfg.get("projector", "pca")
 
     if model_type == "efficientnet-b0":
         model = BYOLEfficientNetB0(

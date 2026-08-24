@@ -831,7 +831,7 @@ for _frac in _FRACS_SUB:
     _frac_dir = OUTPUT_DIR / f"frac_{_frac:.2f}"
 
     # Check whether every run for this fraction is already complete
-    _all_done = all(
+    _all_done = not args.force and all(
         (_frac_dir / f"run{_ri}" / "test_probs.npy").exists()
         for _ri in range(1, N_RUNS + 1)
     )
@@ -844,7 +844,7 @@ for _frac in _FRACS_SUB:
 
     for _ri in range(1, N_RUNS + 1):
         _run_dir = _frac_dir / f"run{_ri}"
-        if (_run_dir / "test_probs.npy").exists():
+        if (_run_dir / "test_probs.npy").exists() and not args.force:
             print(f"  run{_ri}: already exists, skipping.")
             continue
         _run_dir.mkdir(exist_ok=True)
