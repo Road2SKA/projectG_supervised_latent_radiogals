@@ -64,10 +64,10 @@ def parse_args():
     ap = argparse.ArgumentParser(description="BYOL training with configurable projector modes")
 
     # Random seed
-    ap.add_argument("--seed", type=int, default=42,
-                    help="Random seed for reproducibility (default: 42)")
+    ap.add_argument("--training-seed", type=int, default=42,
+                    help="Random seed for model training and reproducibility (default: 42)")
     ap.add_argument("--data-seed", type=int, default=None,
-                    help="Random seed for data split (if default (None), uses --seed)")
+                    help="Random seed for data split (if default (None), uses --training-seed)")
 
     # Data configuration
     ap.add_argument("--data-dir", type=Path,
@@ -243,11 +243,11 @@ CLASS_WEIGHT_STRENGTH = args.class_weight_strength
 SUBSAMPLE_SIZE = args.subsample
 
 # Random seed
-SEED = args.seed
-DATA_SEED = args.data_seed if args.data_seed is not None else SEED
-torch.manual_seed(SEED)
+TRAINING_SEED = args.training_seed
+DATA_SEED = args.data_seed if args.data_seed is not None else TRAINING_SEED
+torch.manual_seed(TRAINING_SEED)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed(TRAINING_SEED)
     torch.backends.cudnn.deterministic = True
 
 # Force CUDA if available
@@ -283,11 +283,11 @@ BYOL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
 _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     if args.no_timestamp:
-        OUTPUT_DIR = BYOL_RUNS_DIR / args.run_name / f"seed{SEED}"
+        OUTPUT_DIR = BYOL_RUNS_DIR / args.run_name / f"data_seed_{DATA_SEED}" / f"training_seed_{TRAINING_SEED}"
         if OUTPUT_DIR.exists():
             print(f"[SKIP] Run dir already exists: {OUTPUT_DIR}")
             import sys; sys.exit(0)
-        RUN_ID = f"{args.run_name}/seed{SEED}"
+        RUN_ID = f"{args.run_name}/data_seed_{DATA_SEED}/training_seed_{TRAINING_SEED}"
     else:
         RUN_ID = f"{args.run_name}_{_timestamp}"
         _existing = sorted(BYOL_RUNS_DIR.glob(f"{args.run_name}_*"))
@@ -547,9 +547,9 @@ def train_fold(train_loader, test_loader, extract_loader=None):
     extract_loader: DataLoader used to fit/re-fit PCA when PROJECTOR='pca'.
     Returns: (model, history, best_val_loss, best_epoch)
     """
-    torch.manual_seed(SEED)
+    torch.manual_seed(TRAINING_SEED)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(SEED)
+        torch.cuda.manual_seed(TRAINING_SEED)
 
     # -------------------------------------------------------------------------
     # MODEL INITIALIZATION
@@ -1224,7 +1224,7 @@ for _item in _items:
         [p for p in [unlab_projections, train_projections, test_projections] if p is not None]
     )
     _n_pca_components = min(128, _pca_all.shape[1])
-    _pca_diag = PCA(n_components=_n_pca_components, random_state=SEED)
+    _pca_diag = PCA(n_components=_n_pca_components, random_state=TRAINING_SEED)
     _pca_diag.fit(_pca_all)
 
     _cumvar   = np.cumsum(_pca_diag.explained_variance_ratio_)
@@ -1324,11 +1324,11 @@ for _item in _items:
             _mask_tr = np.zeros(_n_all, dtype=bool); _mask_tr[_n_ul:_n_ul+_n_tr] = True
             _mask_te = np.zeros(_n_all, dtype=bool); _mask_te[_n_ul+_n_tr:] = True
 
-            _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, SEED)
+            _, _all_2d = fit_umap(_all_proj, args.umap_n_neighbors, args.umap_min_dist, TRAINING_SEED)
 
             _proj_parts = ([unlab_projections] if unlab_encodings is not None else []) + [train_projections, test_projections]
             _all_projections = np.concatenate(_proj_parts)
-            _, _proj_2d = fit_umap(_all_projections, args.umap_n_neighbors, args.umap_min_dist, SEED)
+            _, _proj_2d = fit_umap(_all_projections, args.umap_n_neighbors, args.umap_min_dist, TRAINING_SEED)
 
             _img_parts = []
             if unlab_encodings is not None:

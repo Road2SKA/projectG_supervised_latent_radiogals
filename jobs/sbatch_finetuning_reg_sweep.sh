@@ -15,7 +15,7 @@
 
 MODE=2
 BYOL_SEED=3
-MODEL_PATH="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.0_f1/seed${BYOL_SEED}"
+MODEL_PATH="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.0_f1/data_seed_2/training_seed_${BYOL_SEED}"
 
 LRS=(1e-1 1e-2 1e-3)
 WDS=(3e-1 1e-1 3e-2)

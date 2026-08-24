@@ -250,7 +250,8 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     _cw_tag          = ("cwNone" if not class_weight_mode
                         else _cw_base if class_weight_strength == 1.0
                         else f"{_cw_base}{class_weight_strength}")
-    clf_dir          = run_dir / f"seed{seed}" / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
+    _eff_data_seed   = data_seed if data_seed is not None else seed
+    clf_dir          = run_dir / f"data_seed_{_eff_data_seed}" / f"training_seed_{seed}" / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
     rf_path          = clf_dir / f"rf_{feature_type}.json"
     knn_path         = clf_dir / f"knn_{feature_type}.json"
     lr_path          = clf_dir / f"lr_{feature_type}.json"
@@ -286,7 +287,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
             break
         _search = _search.parent
     splits_dir = _search / "data_splits" / str(data_seed if data_seed is not None else seed)
-    feat_dir   = run_dir / f"seed{seed}" / "data" / "byol"
+    feat_dir   = run_dir / f"data_seed_{_eff_data_seed}" / f"training_seed_{seed}" / "data" / "byol"
     _f_m  = re.search(r'_f([\d.]+)', run_dir.name)
     _f_tag = f"_f{_f_m.group(1)}" if _f_m else ""
 

@@ -17,7 +17,7 @@ source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 cd /users/mbredber/p3_SUPLAT
 export PYTHONUNBUFFERED=1
 
-SEED=${SLURM_ARRAY_TASK_ID}   # BYOL seed (matches the seed subdir and data split)
+TRAINING_SEED=${SLURM_ARRAY_TASK_ID}   # BYOL training seed
 DATA_SEED=2
 
 BYOL_RUNS_ROOT="outputs/byol_runs"
@@ -31,12 +31,12 @@ CONFIGS=(
 )
 
 for SW in "${SW_VALS[@]}"; do
-    BYOL_RUN_DIR="${BYOL_RUNS_ROOT}/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/seed${SEED}"
+    BYOL_RUN_DIR="${BYOL_RUNS_ROOT}/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/data_seed_${DATA_SEED}/training_seed_${TRAINING_SEED}"
     GEN_DIR="${BYOL_RUN_DIR}/data/generative"
-    NAME_SUFFIX="_sw${SW}_s${SEED}"
+    NAME_SUFFIX="_sw${SW}_s${TRAINING_SEED}"
 
     echo "════════════════════════════════════════════════════════"
-    echo "SW=${SW}  SEED=${SEED}"
+    echo "SW=${SW}  TRAINING_SEED=${TRAINING_SEED}"
     echo "BYOL run dir : ${BYOL_RUN_DIR}"
     echo "Gen dir      : ${GEN_DIR}"
     echo "════════════════════════════════════════════════════════"

@@ -115,7 +115,7 @@ run_config() {
 }
 
 for SW in "${SW_VALS[@]}"; do
-    GEN_DIR="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/seed${SEED}/data/generative"
+    GEN_DIR="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/data_seed_${DATA_SEED}/training_seed_${SEED}/data/generative"
     NAME_SUFFIX="_sw${SW}_s${SEED}"
     echo "════════════════════════════════════════════════════════"
     echo "SW=${SW}  SEED=${SEED}  GEN_DIR=${GEN_DIR}"
@@ -136,7 +136,7 @@ done
 
 # ── Extra pass: gen_frac=5 only (adds frac_5.00/ to existing run dirs) ────────
 for SW in "${SW_VALS[@]}"; do
-    GEN_DIR="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/seed${SEED}/data/generative"
+    GEN_DIR="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/data_seed_${DATA_SEED}/training_seed_${SEED}/data/generative"
     NAME_SUFFIX="_sw${SW}_s${SEED}"
     echo "════════════════════════════════════════════════════════"
     echo "gen_frac=5  SW=${SW}  SEED=${SEED}"

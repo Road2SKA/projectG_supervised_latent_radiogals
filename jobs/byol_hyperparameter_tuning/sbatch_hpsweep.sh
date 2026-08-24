@@ -78,7 +78,7 @@ python scripts/train_byol.py \
     --weighting           closest \
     --batch-size          512 \
     --epochs              300 \
-    --seed                1 \
+    --training-seed       1 \
     --data-seed           1 \
     --lr                  3e-4 \
     --lr-schedule         "${LR_SCHEDULES[$lr_i]}" \

@@ -43,7 +43,7 @@ python scripts/train_baseline_classifier.py $COMMON \
 # Each gen_frac adds a frac_X.XX/ subdir to the same run dir.
 GEN_FRACS=(1.0 5.0)
 for SW in "${SW_VALS[@]}"; do
-    GEN_DIR="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/seed${SEED}/data/generative"
+    GEN_DIR="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/data_seed_${DATA_SEED}/training_seed_${SEED}/data/generative"
     for GF in "${GEN_FRACS[@]}"; do
         python scripts/train_baseline_classifier.py $COMMON \
             --run_dir "$RUN_DIR" \

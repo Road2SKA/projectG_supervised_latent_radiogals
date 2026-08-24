@@ -180,7 +180,7 @@ def main():
     f_tag = f"_f{_fm.group(1)}" if _fm else ""
 
     rd             = BYOL_RUNS_ROOT / args.byol_run
-    seed_dir       = rd / f"seed{args.seed}"
+    seed_dir       = rd / f"data_seed_{args.data_seed}" / f"training_seed_{args.seed}"
     BYOL_OUT_DIR   = seed_dir / "data" / "anomaly"
     BASELINE_OUT_DIR = ROOT / "outputs/anomaly_baselines"
     BYOL_OUT_DIR.mkdir(parents=True, exist_ok=True)

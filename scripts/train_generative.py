@@ -161,6 +161,8 @@ def parse_args():
 
     # Misc
     p.add_argument("--seed",         type=int, default=42)
+    p.add_argument("--data-seed",    type=int, default=2,
+                   help="Data seed subdirectory under the base dir (default: 2).")
     p.add_argument("--run-name",     default="",
                    help="Override output directory suffix (default: <type>_<label>)")
     p.add_argument("--catalogue",    default=None,
@@ -263,9 +265,9 @@ def load_data(args):
         val_lbl   = _all_lbl[val_idx]
 
     # ── BYOL data/byol/ layout + catalogue sidecar ───────────────────────────
-    elif (base_dir / f"seed{args.seed}" / "data" / "byol" / "labelled_train_projections.npy").exists() \
+    elif (base_dir / f"data_seed_{args.data_seed}" / f"training_seed_{args.seed}" / "data" / "byol" / "labelled_train_projections.npy").exists() \
             and sidecar_path is not None:
-        _seed_dir       = base_dir / f"seed{args.seed}"
+        _seed_dir       = base_dir / f"data_seed_{args.data_seed}" / f"training_seed_{args.seed}"
         _byol_dir       = _seed_dir / "data" / "byol"
         _lab_train_proj = np.load(_byol_dir / "labelled_train_projections.npy").astype(np.float32)
         _run_test_proj  = np.load(_byol_dir / "test_projections.npy").astype(np.float32)
@@ -590,7 +592,7 @@ def main():
               f"({torch.cuda.get_device_properties(0).total_memory // 1024**3} GB)")
 
     label_suffix = args.label_subset if isinstance(args.label_subset, str) else "custom"
-    out_dir = Path(args.base_dir) / f"seed{args.seed}" / "data" / "generative"
+    out_dir = Path(args.base_dir) / f"data_seed_{args.data_seed}" / f"training_seed_{args.seed}" / "data" / "generative"
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output dir: {out_dir}")
 

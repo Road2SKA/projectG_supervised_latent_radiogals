@@ -36,7 +36,7 @@ for RUN_DIR in \
     outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.05_f1 \
     outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.1_f1 \
     outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.5_f1; do
-    MODEL_PATH="${RUN_DIR}/seed${BYOL_SEED}"
+    MODEL_PATH="${RUN_DIR}/data_seed_${DATA_SEED}/training_seed_${BYOL_SEED}"
     echo ""
     echo "════════════════════════════════════════════════════════"
     echo "Run: $(basename ${RUN_DIR})  model-path: ${MODEL_PATH}  data-seed: ${DATA_SEED}"

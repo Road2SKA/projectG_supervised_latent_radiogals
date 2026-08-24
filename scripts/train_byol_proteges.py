@@ -1191,8 +1191,10 @@ def main():
     parser.add_argument("--noise-rng-seed", type=int, default=42,
                         help="RNG seed for noise generation in --noise-sweep (default: 42).")
     parser.add_argument("--byol-seed",      type=int, default=None,
-                        help="Seed subdirectory under each run dir where BYOL artifacts live "
-                             "(e.g. 2 → <run>/seed2/). If omitted, artifacts are expected at the run root.")
+                        help="Training seed subdirectory under each run dir where BYOL artifacts live "
+                             "(e.g. 2 → <run>/data_seed_<D>/training_seed_2/). If omitted, artifacts are expected at the run root.")
+    parser.add_argument("--byol-data-seed", type=int, default=2,
+                        help="Data seed subdirectory under each run dir (default: 2).")
     args = parser.parse_args()
 
     outputs_root = Path(args.outputs_root)
@@ -1254,7 +1256,7 @@ def main():
         sw_val = float(m.group(1)) if m else float('nan')
         f_val  = float(m.group(2)) if m else float('nan')
 
-        seed_dir = rd / f"seed{args.byol_seed}" if args.byol_seed is not None else rd
+        seed_dir = rd / f"data_seed_{args.byol_data_seed}" / f"training_seed_{args.byol_seed}" if args.byol_seed is not None else rd
 
         for latent in ["proj", "enc"]:
             _ftag        = _pca_tag_for(latent)

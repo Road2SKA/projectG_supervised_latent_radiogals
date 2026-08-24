@@ -35,7 +35,7 @@ python scripts/train_byol.py \
     --epochs 300 \
     --lr 3e-4 \
     --num-workers 4 \
-    --seed "$SEED" \
+    --training-seed "$SEED" \
     --data-seed 2 \
     --supervision-weight 1.0 \
     --f-label 1.0 \
