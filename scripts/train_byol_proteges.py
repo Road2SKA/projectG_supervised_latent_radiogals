@@ -61,6 +61,13 @@ PROTEGE_INITIAL_STEPS = 200
 # ---------------------------------------------------------------------------
 # Shared helpers for the shared data_splits/ directory
 # ---------------------------------------------------------------------------
+def _get_run_name(rd: Path) -> str:
+    """Extract the run name (e.g. pd128_..._f1) from a seed subdir path."""
+    if re.match(r'^training_seed_\d+$', rd.name):
+        return rd.parent.parent.name   # <run>/data_seed_N/training_seed_N
+    if re.match(r'^seed\d+$', rd.name):
+        return rd.parent.name          # <run>/seedN  (legacy)
+    return rd.name
 def _get_splits_dir(run_dir: Path) -> Path:
     ckpt = torch.load(run_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
     seed = int(ckpt["config"]["data_seed"])
@@ -100,7 +107,7 @@ def _check_run_data(rd: Path, latent: str = "proj"):
     splits_dir = _get_splits_dir(rd)
 
     # Extract f-label tag from the run name (rd may be a seed subdir)
-    _run_name = rd.parent.name if re.match(r'^seed\d+$', rd.name) else rd.name
+    _run_name = _get_run_name(rd)
     _fm = re.search(r'_f([\d.]+)', _run_name)
     _f_str = str(float(_fm.group(1))).rstrip('0').rstrip('.') if _fm else None
 
@@ -1100,10 +1107,11 @@ def process_run(run_dir: Path, epsilon: float,
 # ---------------------------------------------------------------------------
 def _worker_process_run(args):
     rd, epsilon, steps, suffix, csv_df, labels_all, latent, use_pca, max_queries, timing_plot, pca_components, outputs_root, force, cw_mode, cw_strength, scale, l2norm, kernel_amplitude, refit_every = args
-    m      = re.search(r'_sw([\d.]+)_f([\d.]+)', rd.name)
+    _run_name = _get_run_name(rd)
+    m      = re.search(r'_sw([\d.]+)_f([\d.]+)', _run_name)
     f_val  = float(m.group(1)) if m else float('nan')
     sw_val = float(m.group(2)) if m else float('nan')
-    print(f"[{rd.name}]  latent={latent}  f={f_val}  sw={sw_val}", flush=True)
+    print(f"[{_run_name}]  latent={latent}  f={f_val}  sw={sw_val}", flush=True)
     try:
         auc, train_auc, n_eval, n_pos = process_run(rd, epsilon, steps, suffix, csv_df, labels_all,
                                                      latent=latent,
@@ -1115,21 +1123,21 @@ def _worker_process_run(args):
                                                      scale=scale, l2norm=l2norm,
                                                      kernel_amplitude=kernel_amplitude,
                                                      refit_every=refit_every)
-        return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, auc=auc, train_auc=train_auc,
+        return dict(name=_run_name, latent=latent, f=f_val, sw=sw_val, auc=auc, train_auc=train_auc,
                     n_eval=n_eval, n_pos=n_pos)
     except FileNotFoundError as exc:
-        print(f"  ERROR in {rd.name} ({latent}): {exc}", file=sys.stderr, flush=True)
-        return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, error="missing_checkpoint", detail=str(exc))
+        print(f"  ERROR in {_run_name} ({latent}): {exc}", file=sys.stderr, flush=True)
+        return dict(name=_run_name, latent=latent, f=f_val, sw=sw_val, error="missing_checkpoint", detail=str(exc))
     except ValueError as exc:
         import traceback
-        print(f"  ERROR in {rd.name} ({latent}): {exc}", file=sys.stderr, flush=True)
+        print(f"  ERROR in {_run_name} ({latent}): {exc}", file=sys.stderr, flush=True)
         traceback.print_exc()
-        return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, error="shape_mismatch", detail=str(exc))
+        return dict(name=_run_name, latent=latent, f=f_val, sw=sw_val, error="shape_mismatch", detail=str(exc))
     except Exception as exc:
         import traceback
-        print(f"  ERROR in {rd.name} ({latent}): {exc}", file=sys.stderr, flush=True)
+        print(f"  ERROR in {_run_name} ({latent}): {exc}", file=sys.stderr, flush=True)
         traceback.print_exc()
-        return dict(name=rd.name, latent=latent, f=f_val, sw=sw_val, error="other", detail=str(exc))
+        return dict(name=_run_name, latent=latent, f=f_val, sw=sw_val, error="other", detail=str(exc))
 
 
 # ---------------------------------------------------------------------------

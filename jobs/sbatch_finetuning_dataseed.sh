@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=byol_finetune
+#SBATCH --job-name=byol_ft_dataseed
 #SBATCH --account=sk036
 #SBATCH --array=0-4
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=2:00:00
+#SBATCH --time=4:00:00
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.err
 #SBATCH --mail-type=END
@@ -15,10 +15,13 @@ echo "START: $(date)"
 cd /users/mbredber/p3_SUPLAT
 source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 
-# BYOL model seeds 2-6, data split seed fixed at 2
-SEEDS=(2 3 4 5 6)
-BYOL_SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
-DATA_SEED=2
+# data_seed+1 pairing: training_seed = data_seed + 1
+DATA_SEEDS=(2 3 4 5 6)
+TRAINING_SEEDS=(3 4 5 6 7)
+
+DATA_SEED=${DATA_SEEDS[$SLURM_ARRAY_TASK_ID]}
+BYOL_SEED=${TRAINING_SEEDS[$SLURM_ARRAY_TASK_ID]}
+
 WD=3e-1
 N_RUNS=5
 NUM_WORKERS=4
@@ -31,12 +34,19 @@ CONFIGS=(
     "initial_pure    none          0.0"
 )
 
+echo "data_seed=${DATA_SEED}  training_seed=${BYOL_SEED}"
+
 for RUN_DIR in \
     outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.0_f1 \
     outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.05_f1 \
     outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.1_f1 \
-    outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.5_f1; do
+    outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.5_f1 \
+    outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw1.0_f1; do
     MODEL_PATH="${RUN_DIR}/data_seed_${DATA_SEED}/training_seed_${BYOL_SEED}"
+    if [ ! -f "${MODEL_PATH}/byol_model_best.pt" ]; then
+        echo "Skipping missing: ${MODEL_PATH}/byol_model_best.pt"
+        continue
+    fi
     echo ""
     echo "════════════════════════════════════════════════════════"
     echo "Run: $(basename ${RUN_DIR})  model-path: ${MODEL_PATH}  data-seed: ${DATA_SEED}"
@@ -47,6 +57,14 @@ for RUN_DIR in \
             read -r LS CWM CWS <<< "$cfg"
             echo ""
             echo "=== mode=${MODE}  label_set=${LS}  cw_mode=${CWM}  cw_strength=${CWS} ==="
+
+            if [ "${CWM}" = "none" ]; then CW_TAG="cwNone"; else CW_TAG="cw${CWM}"; fi
+            if [ "${CWS}" != "1.0" ]; then CW_TAG="${CW_TAG}${CWS}"; fi
+            METRICS_FILE="${MODEL_PATH}/data/classifiers/finetuning/${LS}_${CW_TAG}_mode${MODE}_lr${LR}_ep${EPOCHS}/finetuning_metrics.json"
+            if [ -f "${METRICS_FILE}" ]; then
+                echo "Skipping already complete: ${METRICS_FILE}"
+                continue
+            fi
 
             CW_ARGS=()
             if [ "${CWM}" != "none" ]; then
@@ -65,7 +83,6 @@ for RUN_DIR in \
                 --num-workers=${NUM_WORKERS} \
                 --augmentation=quart_ext \
                 --data-seed=${DATA_SEED} \
-                --force \
                 --run-name="mode${MODE}_lr${LR}_ep${EPOCHS}" \
                 "${CW_ARGS[@]}"
         done

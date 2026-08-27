@@ -17,14 +17,14 @@ source /users/mbredber/p3_SUPLAT/.venv/bin/activate
 cd /users/mbredber/p3_SUPLAT
 export PYTHONUNBUFFERED=1
 
-TRAINING_SEED=${SLURM_ARRAY_TASK_ID}   # BYOL training seed
-DATA_SEED=2
+DATA_SEED=${SLURM_ARRAY_TASK_ID}
+TRAINING_SEED=$((DATA_SEED + 1))   # data_seed+1 pairing
 
 BYOL_RUNS_ROOT="outputs/byol_runs"
 RUN_DIR="outputs/supervised_baseline_classifiers/gen_sweep"  # same root as ENB0
 GEN_VARIANT="initial"
 
-SW_VALS=(0.0 0.1 0.5)
+SW_VALS=(0.0 0.05 0.1 0.5)
 
 CONFIGS=(
     "initial_pure   none   0.0"
@@ -33,10 +33,15 @@ CONFIGS=(
 for SW in "${SW_VALS[@]}"; do
     BYOL_RUN_DIR="${BYOL_RUNS_ROOT}/pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1/data_seed_${DATA_SEED}/training_seed_${TRAINING_SEED}"
     GEN_DIR="${BYOL_RUN_DIR}/data/generative"
-    NAME_SUFFIX="_sw${SW}_s${TRAINING_SEED}"
+    NAME_SUFFIX="_sw${SW}_s${TRAINING_SEED}_ds${DATA_SEED}"
+
+    if [ ! -f "${BYOL_RUN_DIR}/byol_model_best.pt" ]; then
+        echo "Skipping missing model: ${BYOL_RUN_DIR}/byol_model_best.pt"
+        continue
+    fi
 
     echo "════════════════════════════════════════════════════════"
-    echo "SW=${SW}  TRAINING_SEED=${TRAINING_SEED}"
+    echo "SW=${SW}  DATA_SEED=${DATA_SEED}  TRAINING_SEED=${TRAINING_SEED}"
     echo "BYOL run dir : ${BYOL_RUN_DIR}"
     echo "Gen dir      : ${GEN_DIR}"
     echo "════════════════════════════════════════════════════════"
@@ -52,6 +57,11 @@ for SW in "${SW_VALS[@]}"; do
         fi
 
         OUT_DIR="${RUN_DIR}/with_generative/byollr_${LS}_${CW_TAG}${NAME_SUFFIX}"
+
+        if [ -f "${OUT_DIR}/gen_frac_0.0/results.json" ]; then
+            echo "  Skipping already complete: ${OUT_DIR}"
+            continue
+        fi
 
         echo "  label_set=${LS}  cw_tag=${CW_TAG}  → ${OUT_DIR}"
 

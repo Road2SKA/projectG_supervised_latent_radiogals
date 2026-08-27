@@ -20,23 +20,28 @@ export PYTHONUNBUFFERED=1
 
 # =============================================================================
 # CONFIGURATION
+# Diagonal condition: data_seed == training_seed (same seed for data split
+# and model training). Add --force to overwrite existing outputs.
 # =============================================================================
-DATA_SEED=2
-# Add --force to overwrite existing outputs
+SW_VALUES=(0.0 0.05 0.1 0.5)
+SEEDS=(2 3 4 5 6)
 # =============================================================================
 
-for RUN_DIR in outputs/byol_runs/pd128_*_f1; do
-    RUN_NAME="$(basename "${RUN_DIR}")"
-    for SEED_DIR in "${RUN_DIR}"/seed*; do
-        SEED="$(basename "${SEED_DIR}" | sed 's/seed//')"
+for SW in "${SW_VALUES[@]}"; do
+    RUN_NAME="pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f1"
+    for SEED in "${SEEDS[@]}"; do
+        SEED_DIR="outputs/byol_runs/${RUN_NAME}/data_seed_${SEED}/training_seed_${SEED}"
+        if [ ! -d "${SEED_DIR}" ]; then
+            echo "Skipping ${RUN_NAME} seed=${SEED}: directory not found"
+            continue
+        fi
         echo "════════════════════════════════════════════════════════"
-        echo "Run: ${RUN_NAME}  seed: ${SEED}"
+        echo "Run: ${RUN_NAME}  data_seed=${SEED}  training_seed=${SEED}"
         echo "════════════════════════════════════════════════════════"
         python scripts/compute_noise_robustness.py \
             --byol-run  "${RUN_NAME}" \
-            --data_seed "${DATA_SEED}" \
-            --seed      "${SEED}" \
-            --force
+            --data_seed "${SEED}" \
+            --seed      "${SEED}"
         echo "  Done: $(date)"
     done
 done

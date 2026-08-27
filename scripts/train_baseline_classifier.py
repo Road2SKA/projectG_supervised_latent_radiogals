@@ -49,9 +49,6 @@ from torchvision import transforms
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_class_weights
 from suplat.data.augmentations import get_augmentation
-from suplat.models.baseline_models import (
-    CNN, ScatterNet, SimpleScatterNet, DualScatterSqueezeNet
-)
 from suplat.models.byol_models import create_efficientnet_b0_backbone
 
 # ── Label sets (same as classifiers.ipynb) ───────────────────────────────────
@@ -180,18 +177,7 @@ def build_model(model_name, n_classes, img_shape, scat_shape=None):
     """Returns a model whose output is (B, n_classes) raw logits for BCE."""
     n_out = n_classes
 
-    if model_name == 'cnn':
-        base = CNN(img_shape, num_classes=n_out)
-    elif model_name == 'scatternet':
-        assert scat_shape is not None
-        base = ScatterNet(scat_shape, num_classes=n_out)
-    elif model_name == 'simplescatternet':
-        assert scat_shape is not None
-        base = SimpleScatterNet(scat_shape, num_classes=n_out)
-    elif model_name == 'dualssn':
-        assert scat_shape is not None
-        base = DualScatterSqueezeNet(img_shape, scat_shape, num_classes=n_out)
-    elif model_name == 'vit':
+    if model_name == 'vit':
         from torchvision.models import vit_b_16, ViT_B_16_Weights
         vit = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
         # Average first conv weights across 3 channels → 1 channel
@@ -646,7 +632,17 @@ def main():
 
     # ── Train/test split ──────────────────────────────────────────────────
     if args.data_seed is not None and not _byol_run_dir_explicit:
-        _splits_dir = args.run_dir.parent.parent / "data_splits" / str(args.data_seed)
+        _seed_str = str(args.data_seed)
+        _p = args.run_dir
+        _splits_dir = None
+        for _ in range(6):
+            _p = _p.parent
+            if (_p / "data_splits" / _seed_str).exists():
+                _splits_dir = _p / "data_splits" / _seed_str
+                break
+        if _splits_dir is None:
+            raise FileNotFoundError(
+                f"Could not find data_splits/{_seed_str}/ in any ancestor of {args.run_dir}")
         split_label = f"data_seed={args.data_seed}"
     elif args.data_seed is not None:
         _splits_dir = args.byol_run_dir.parent.parent / "data_splits" / str(args.data_seed)
