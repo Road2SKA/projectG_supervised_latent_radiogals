@@ -31,16 +31,16 @@ GEN_VARIANT="initial"
 
 # Format: "LABEL_SET CLASS_WEIGHT_MODE CLASS_WEIGHT_STRENGTH"
 # CW_MODE "none" → uniform weights (--class_weight_mode omitted).
-# _binary label sets score element-wise accuracy (each label column independently).
+# _individual label sets score element-wise accuracy (each label column independently).
 CONFIGS=(
-    "initial_pure   none          0.0"
-    #"initial_pure   initial_pure  1.0"
-    #"initial_binary none          0.0"
-    #"initial_binary initial       0.3"
-    #"initial_binary initial       1.0"
-    #"full_binary    none          0.0"
-    #"full_binary    all           0.3"
-    #"full_binary    all           1.0"
+    "initial_pure       none          0.0"
+    #"initial_pure       initial_pure  1.0"
+    #"initial_individual none          0.0"
+    #"initial_individual initial       0.3"
+    #"initial_individual initial       1.0"
+    #"full_individual    none          0.0"
+    #"full_individual    full          0.3"
+    #"full_individual    full          1.0"
 )
 
 run_config() {

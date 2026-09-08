@@ -173,14 +173,24 @@ def main():
     parser.add_argument("--n-noise-seeds", type=int, default=5,
                         help="Number of independent noise realisations per σ level "
                              "used to estimate BYOL AUC std (default: 5).")
+    parser.add_argument("--cv-fold", type=int, default=None,
+                        help="Cross-validation fold index (0-based). When set, appends cross_val_K "
+                             "to seed_dir and loads fold-specific splits.")
     args = parser.parse_args()
 
-    # Extract f-label suffix from run name (e.g. _f1 or _f0.1)
+    # Extract f-label suffix from run name (e.g. _f1 or _f0.1), normalise 1.0 → 1
     _fm = re.search(r'_f([\d.]+)', args.byol_run)
-    f_tag = f"_f{_fm.group(1)}" if _fm else ""
+    if _fm:
+        _f_val = float(_fm.group(1))
+        _f_str = str(int(_f_val)) if _f_val == int(_f_val) else str(_f_val)
+        f_tag  = f"_f{_f_str}"
+    else:
+        f_tag = ""
 
     rd             = BYOL_RUNS_ROOT / args.byol_run
     seed_dir       = rd / f"data_seed_{args.data_seed}" / f"training_seed_{args.seed}"
+    if args.cv_fold is not None:
+        seed_dir = seed_dir / f"cross_val_{args.cv_fold}"
     BYOL_OUT_DIR   = seed_dir / "data" / "anomaly"
     BASELINE_OUT_DIR = ROOT / "outputs/anomaly_baselines"
     BYOL_OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -191,6 +201,8 @@ def main():
         return
 
     splits_dir = ROOT / "outputs/data_splits" / str(args.data_seed)
+    if args.cv_fold is not None:
+        splits_dir = splits_dir / f"cross_val_{args.cv_fold}"
 
     # ── Load split ────────────────────────────────────────────────────────────
     lab_idx  = np.load(splits_dir / f"labelled_train_idx{f_tag}.npy")

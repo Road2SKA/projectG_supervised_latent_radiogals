@@ -63,6 +63,8 @@ PROTEGE_INITIAL_STEPS = 200
 # ---------------------------------------------------------------------------
 def _get_run_name(rd: Path) -> str:
     """Extract the run name (e.g. pd128_..._f1) from a seed subdir path."""
+    if re.match(r'^cross_val_\d+$', rd.name):
+        return rd.parent.parent.parent.name  # <run>/data_seed_N/training_seed_N/cross_val_K
     if re.match(r'^training_seed_\d+$', rd.name):
         return rd.parent.parent.name   # <run>/data_seed_N/training_seed_N
     if re.match(r'^seed\d+$', rd.name):
@@ -71,10 +73,12 @@ def _get_run_name(rd: Path) -> str:
 def _get_splits_dir(run_dir: Path) -> Path:
     ckpt = torch.load(run_dir / "byol_model_best.pt", map_location="cpu", weights_only=False)
     seed = int(ckpt["config"]["data_seed"])
+    _cv_subdir = run_dir.name if re.match(r'^cross_val_\d+$', run_dir.name) else ""
     _search = run_dir.parent
     for _ in range(6):
         if (_search / "data_splits").is_dir():
-            return _search / "data_splits" / str(seed)
+            base = _search / "data_splits" / str(seed)
+            return base / _cv_subdir if _cv_subdir else base
         _search = _search.parent
     return run_dir.parent.parent / "data_splits" / str(seed)  # fallback
 
@@ -1171,7 +1175,7 @@ def main():
     parser.add_argument("--pca-components",    type=int, default=None,
                         help="Fixed number of PCA components (overrides 95%% variance threshold).")
     parser.add_argument("--class-weight-mode", type=str, default="score",
-                        choices=["score", "initial", "morphology", "environment", "classical", "all"],
+                        choices=["score", "initial", "morphology", "environment", "classical", "full"],
                         help="How to score sources for GP seeding: 'score' (interest tier 1-4, default) "
                              "or a label-set name (inverse frequency within that set).")
     parser.add_argument("--class-weight-strength", type=float, default=1.0,
@@ -1203,6 +1207,9 @@ def main():
                              "(e.g. 2 → <run>/data_seed_<D>/training_seed_2/). If omitted, artifacts are expected at the run root.")
     parser.add_argument("--byol-data-seed", type=int, default=2,
                         help="Data seed subdirectory under each run dir (default: 2).")
+    parser.add_argument("--cv-fold",        type=int, default=None,
+                        help="Cross-validation fold index (0-based). When set, appends cross_val_K "
+                             "to the training_seed directory and loads fold-specific splits.")
     args = parser.parse_args()
 
     outputs_root = Path(args.outputs_root)
@@ -1265,6 +1272,8 @@ def main():
         f_val  = float(m.group(2)) if m else float('nan')
 
         seed_dir = rd / f"data_seed_{args.byol_data_seed}" / f"training_seed_{args.byol_seed}" if args.byol_seed is not None else rd
+        if args.cv_fold is not None:
+            seed_dir = seed_dir / f"cross_val_{args.cv_fold}"
 
         for latent in ["proj", "enc"]:
             _ftag        = _pca_tag_for(latent)

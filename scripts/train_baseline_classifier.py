@@ -50,27 +50,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_class_weights
 from suplat.data.augmentations import get_augmentation
 from suplat.models.byol_models import create_efficientnet_b0_backbone
+from suplat.label_sets import ALL_CLASS_NAMES, DERIVED_CLASS_NAMES, LABEL_SETS, make_derived as _make_derived
 
-# ── Label sets (same as classifiers.ipynb) ───────────────────────────────────
-ALL_CLASS_NAMES = [
-    'FRI', 'FRII', 'Hybrids', 'Spirals', 'Relaxed doubles',
-    'C-curv', 'S-curv', 'Misalign', 'Wings', 'X-shaped',
-    'Straight jets', 'Multi hotspots', 'Cont. jets', 'Banding',
-    'One-sided', 'Restarted', 'Cluster', 'Merger', 'Diffuse', 'Unknown',
-]
-
-LABEL_SETS = {
-    "classical":      [0, 1],
-    "classical_pure": [0, 1],
-    "initial":        list(range(0, 5)),
-    "initial_pure":   list(range(0, 5)),
-    "environment":    list(range(16, 20)),
-    "derived":        None,          # computed from label combinations
-    "morphology":     list(range(5, 16)),
-    "all":            list(range(0, 20)),
-    "pure":           list(range(0, 20)),
-    "full":           list(range(0, 20)),
-}
+# "pure" is a local alias used only by this script's train-set filtering logic
+LABEL_SETS = {**LABEL_SETS, "pure": list(range(0, 20))}
 
 VAL_FRAC = 0.15
 
@@ -427,7 +410,7 @@ def _train_one_run(
 
     # Metrics
     results = evaluate_metrics(test_labels_arr, test_preds, test_probs, class_names,
-                               is_binary=args.label_set.endswith('_binary'))
+                               is_binary=args.label_set.endswith('_individual'))
     results['label_set']          = args.label_set
     results['eval_fri_frii_pure'] = args.eval_fri_frii_pure
     if extra_results:
@@ -495,7 +478,7 @@ def main():
                         choices=['cnn', 'scatternet', 'simplescatternet',
                                  'vit', 'dualssn', 'enb0'])
     parser.add_argument('--label_set',  default='initial_pure',
-                        help="Label set. Append '_binary' for element-wise accuracy (e.g. initial_binary).")
+                        help="Label set. Append '_individual' for element-wise accuracy (e.g. initial_individual).")
     parser.add_argument('--eval_fri_frii_pure', action='store_true',
                         help='(with --label_set full) evaluate on FRI/FRII-pure sources only')
     parser.add_argument('--seed',       type=int, default=42)
@@ -516,7 +499,7 @@ def main():
                         help="Skip the label-fraction sweep entirely.")
     parser.add_argument('--class_weight_mode', type=str, default=None,
                         choices=["score", "initial", "initial_pure", "morphology", "morphology_pure",
-                                 "environment", "environment_pure", "classical", "classical_pure", "all", "all_pure"],
+                                 "environment", "environment_pure", "classical", "classical_pure", "full", "full_pure"],
                         help="Upweight rare samples: 'score' (interest tier 1-4) or label-set name "
                              "(inverse frequency). Default: None (uniform).")
     parser.add_argument('--class_weight_strength', type=float, default=0.0,
@@ -527,6 +510,9 @@ def main():
                              "define the train/test split (default: --run_dir itself).")
     parser.add_argument('--data_seed', type=int, default=42,
                         help="Data seed used to locate data_splits/<seed>/. Default: 42.")
+    parser.add_argument('--cv_fold', type=int, default=None,
+                        help="Cross-validation fold index (0-based). When set, loads indices "
+                             "from data_splits/<seed>/cross_val_K/ instead of data_splits/<seed>/.")
     parser.add_argument('--gen_dir', type=Path, default=None,
                         help="Path to generative model directory containing decoder_<variant>.pt "
                              "and nsf_<variant>.pt. When provided, skips the label-fraction sweep "
@@ -555,7 +541,7 @@ def main():
                         help="Pin gen-aug to a single fraction of real data instead of sweeping "
                              "[0.5, 1.0, 2.0]. Requires --gen_dir. E.g. --gen_frac 1.0.")
     args = parser.parse_args()
-    _ls_base = args.label_set[:-7] if args.label_set.endswith('_binary') else args.label_set
+    _ls_base = args.label_set[:-11] if args.label_set.endswith('_individual') else args.label_set
     if _ls_base not in LABEL_SETS:
         parser.error(f"Unknown label set: {args.label_set!r}")
     if args.gen_variant == 'full':
@@ -603,25 +589,7 @@ def main():
     print(f"Images: {images.shape}, Labels: {labels.shape}")
 
     # ── Label subset ──────────────────────────────────────────────────────
-    DERIVED_CLASS_NAMES = [
-        'Pure hybrid',       # col2 & ~col0 & ~col1
-        'FR hybrid',         # col2 & (col0 | col1)
-        'Curved FRI',        # col0 & (col5 | col6)
-        'Curved FRII',       # col1 & (col5 | col6)
-        'Straight+multi-HS', # col10 & col11
-    ]
-
-    def _make_derived(y):
-        c = lambda i: y[:, i].astype(bool)
-        return np.stack([
-            ( c(2) & ~c(0) & ~c(1)).astype(np.int64),
-            ( c(2) &  (c(0) | c(1))).astype(np.int64),
-            ( c(0) &  (c(5) | c(6))).astype(np.int64),
-            ( c(1) &  (c(5) | c(6))).astype(np.int64),
-            (c(10) &   c(11)).astype(np.int64),
-        ], axis=1)
-
-    _ls_base    = args.label_set[:-7] if args.label_set.endswith('_binary') else args.label_set
+    _ls_base    = args.label_set[:-11] if args.label_set.endswith('_individual') else args.label_set
     label_cols  = LABEL_SETS[_ls_base]
     if args.label_set == "derived":
         class_names = DERIVED_CLASS_NAMES
@@ -655,6 +623,8 @@ def main():
         _splits_dir = args.byol_run_dir.parent / "data_splits" / str(_data_seed)
         byol_data   = args.byol_run_dir / "data"
         split_label = args.byol_run_dir.name
+    if args.cv_fold is not None:
+        _splits_dir = _splits_dir / f"cross_val_{args.cv_fold}"
     def _load_idx(name):
         p = _splits_dir / name
         if args.data_seed is None:

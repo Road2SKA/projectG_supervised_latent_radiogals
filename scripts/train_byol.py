@@ -27,8 +27,8 @@ import torch
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
-from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, KFold
+from torch.utils.data import ConcatDataset, DataLoader
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from tqdm import tqdm
 
@@ -45,10 +45,10 @@ from suplat.models.byol_models import (
 from suplat.trainer.trainer import (byol_loss, get_warmup_lr, get_supervision_weight,
                                     extract_embeddings_from_loader,
                                     extract_raw_embeddings_from_loader,
-                                    vicreg_var_cov_loss, effective_rank,  # [VICReg]
-                                    byol_loss_weighted)                   # [TierW]
+                                    vicreg_var_cov_loss, effective_rank,
+                                    byol_loss_weighted)
 from suplat.utils.plotting import fit_umap, plot_umap_single, plot_umap_outliers, plot_training_curves, plot_umap_scalar
-from suplat.utils.class_weights import compute_sample_weights, compute_class_weights, LABEL_COLS, TIERS  # [CW]
+from suplat.utils.class_weights import compute_sample_weights, compute_class_weights, LABEL_COLS, TIERS
 
 # Check device availability
 if torch.cuda.is_available():
@@ -68,6 +68,8 @@ def parse_args():
                     help="Random seed for model training and reproducibility (default: 42)")
     ap.add_argument("--data-seed", type=int, default=None,
                     help="Random seed for data split (if default (None), uses --training-seed)")
+    ap.add_argument("--cross-val", action="store_true", default=False,
+                    help="Run 5-fold cross-validation instead of a single 70/30 train/test split")
 
     # Data configuration
     ap.add_argument("--data-dir", type=Path,
@@ -79,7 +81,7 @@ def parse_args():
 
     # Label configuration
     ap.add_argument("--label-type", type=str, default="full",
-                    choices=["full", "all", "classical", "initial", "morphology", "environment", "derived"],
+                    choices=["full", "classical", "initial", "morphology", "environment", "derived"],
                     help="Label subset to use: 'full'/'all' (all 20), 'classical' (0-1: FRI, FRII), "
                         "'initial' (0-4: FRI, FRII, Hybrids, Spirals, Relaxed doubles), "
                         "'morphology' (5-14: C-curve, S-curve, Misalignment, Wings, X-shaped, Straight jets, Multiple hotspots, "
@@ -91,7 +93,7 @@ def parse_args():
                     choices=["closest", "ponderate"],
                     help="Weight function for sampling pairs: 'closest' or 'ponderate' (default: closest)")
     ap.add_argument("--class-weight-mode", type=str, default=None,
-                    choices=["score", "initial", "morphology", "environment", "classical", "all"],
+                    choices=["score", "initial", "morphology", "environment", "classical", "full"],
                     help="Upweight rare classes in L_friend: 'score' (by interest tier 1-4) "
                          "or a label-set name (inverse frequency within that set). "
                          "Default: None (uniform).")
@@ -187,12 +189,8 @@ def parse_args():
     # METRICS
     ap.add_argument("--no-metrics", action="store_true",
                     help="Disable projection clustering metrics (enabled by default)")
-    ap.add_argument("--run-protege", action="store_true",
-                    help="Run Protege GP active learning after training (off by default)")
-    ap.add_argument("--no-protege-pca", action="store_false", dest="protege_pca",
-                    help="Disable PCA dimensionality reduction before Protege GP (on by default)")
 
-    # [VICReg] anti-collapse regularisation (default 0.0 = off; behaviour unchanged)
+    # anti-collapse regularisation (default 0.0 = off; behaviour unchanged)
     ap.add_argument("--vicreg-var-weight", type=float, default=0.0,
                     help="Weight on VICReg variance hinge (try ~25 for mlp/none projector).")
     ap.add_argument("--vicreg-cov-weight", type=float, default=0.0,
@@ -211,9 +209,8 @@ def parse_args():
 args = parse_args()
 
 if args.projector == 'mlp' and args.projection_dim is None:
-    import sys
-    print("ERROR: --projection-dim is required when --projector mlp", file=sys.stderr)
-    sys.exit(1)
+    print("ERROR: --projection-dim is required when --projector mlp", file=_sys.stderr)
+    _sys.exit(1)
 
 # Model hyperparameters
 BATCH_SIZE = args.batch_size
@@ -245,6 +242,8 @@ SUBSAMPLE_SIZE = args.subsample
 # Random seed
 TRAINING_SEED = args.training_seed
 DATA_SEED = args.data_seed if args.data_seed is not None else TRAINING_SEED
+CROSS_VAL = args.cross_val
+CV_N_FOLDS = 5
 torch.manual_seed(TRAINING_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(TRAINING_SEED)
@@ -273,7 +272,7 @@ OUTPUT_BASE = args.output_dir
 OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
 _splits_subdir = str(DATA_SEED) if SUBSAMPLE_SIZE is None else f"{DATA_SEED}_ss{SUBSAMPLE_SIZE}"
-SPLITS_DIR = OUTPUT_BASE / 'data_splits' / _splits_subdir
+SPLITS_DIR = OUTPUT_BASE.parent / 'data_splits' / _splits_subdir
 SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Create run directory — include projector type to avoid collisions with train_byol.py
@@ -284,16 +283,17 @@ _timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 if args.run_name:
     if args.no_timestamp:
         OUTPUT_DIR = BYOL_RUNS_DIR / args.run_name / f"data_seed_{DATA_SEED}" / f"training_seed_{TRAINING_SEED}"
-        if OUTPUT_DIR.exists():
-            print(f"[SKIP] Run dir already exists: {OUTPUT_DIR}")
-            import sys; sys.exit(0)
+        _complete_marker = 'cv_summary.json' if args.cross_val else 'status.json'
+        if (OUTPUT_DIR / _complete_marker).exists():
+            print(f"[SKIP] Run already complete ({_complete_marker} exists): {OUTPUT_DIR}")
+            _sys.exit(0)
         RUN_ID = f"{args.run_name}/data_seed_{DATA_SEED}/training_seed_{TRAINING_SEED}"
     else:
         RUN_ID = f"{args.run_name}_{_timestamp}"
         _existing = sorted(BYOL_RUNS_DIR.glob(f"{args.run_name}_*"))
         if _existing:
             print(f"[SKIP] Run '{args.run_name}' already exists: {_existing[0].name}")
-            import sys; sys.exit(0)
+            _sys.exit(0)
         OUTPUT_DIR = BYOL_RUNS_DIR / RUN_ID
 else:
     RUN_ID = _timestamp
@@ -447,7 +447,7 @@ SUPERVISION_WEIGHT_SCHEDULE = args.supervision_weight_schedule
 SUPERVISION_WEIGHT_START = args.supervision_weight_start
 SUPERVISION_WEIGHT_END = args.supervision_weight_end
 USE_CURRICULUM = SUPERVISION_WEIGHT_SCHEDULE != "constant"
-# [VICReg] anti-collapse weights
+# anti-collapse weights
 VICREG_VAR_WEIGHT = args.vicreg_var_weight
 VICREG_COV_WEIGHT = args.vicreg_cov_weight
 VICREG_GAMMA      = args.vicreg_gamma
@@ -470,7 +470,7 @@ def _make_dataset_loader(img_data, label_data, shuffle, drop_last=False):
     ds = BYOLSupDataset(
         tags_data=df, img_data=img_data,
         transform=byol_strong_aug, friend_transform=byol_strong_aug,
-        weightfunc=WEIGHTING_FUNC, p_pair_from_class=0.5
+        weightfunc=WEIGHTING_FUNC,
     )
     _nw = NUM_WORKERS if use_cuda else 0
     loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle,
@@ -541,12 +541,14 @@ def refit_pca(fold_model, extract_loader, device, hidden_dim, verbose=False):
     fold_model.train()
 
 
-def train_fold(train_loader, test_loader, extract_loader=None):
+def train_fold(train_loader, test_loader, extract_loader=None, byol_dir=None):
     """
     Train one model fold from scratch.
     extract_loader: DataLoader used to fit/re-fit PCA when PROJECTOR='pca'.
+    byol_dir: directory for partial history flush; defaults to the global BYOL_DIR.
     Returns: (model, history, best_val_loss, best_epoch)
     """
+    _byol_dir = byol_dir if byol_dir is not None else BYOL_DIR
     torch.manual_seed(TRAINING_SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(TRAINING_SEED)
@@ -704,9 +706,9 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         'train_loss': [],
         'train_aug_loss': [],
         'train_friend_loss': [],
-        'train_vic_var': [],          # [VICReg]
-        'train_vic_cov': [],          # [VICReg]
-        'effective_rank': [],         # [VICReg] RankMe diagnostic
+        'train_vic_var': [],
+        'train_vic_cov': [],
+        'effective_rank': [],         # RankMe diagnostic
         'monitor_val_loss': [],
         'lr': [],
         'supervision_schedule': [],
@@ -751,23 +753,23 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         train_aug_loss = 0.0
         train_friend_loss = 0.0
         train_friend_batches = 0
-        train_vic_var = 0.0           # [VICReg]
-        train_vic_cov = 0.0           # [VICReg]
-        _rank_buffer = []             # [VICReg] accumulate online projections for RankMe
+        train_vic_var = 0.0
+        train_vic_cov = 0.0
+        _rank_buffer = []             # accumulate online projections for RankMe
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
         for x1, x1_aug, x2_friend, is_labelled, sample_weights_batch in pbar:
             x1, x1_aug = x1.to(device), x1_aug.to(device)
 
             # L_aug: ALL samples
-            # [VICReg] also retrieve the online projections (oproj*) for regularisation
+            # also retrieve the online projections (oproj*) for regularisation
             pred1_t, pred2_t, proj1_t, proj2_t, oproj1_t, oproj2_t = fold_model(
                 x1, x1_aug, return_online_proj=True)
             loss_trans = byol_loss(pred1_t, pred2_t, proj1_t, proj2_t)
             loss = loss_trans
 
             # L_friend: labelled samples only
-            if x2_friend is not None and is_labelled.sum() >= 8:
+            if x2_friend is not None and is_labelled.sum() >= 8 and current_supervision_weight > 0:
                 x1_lab = x1[is_labelled.to(device)]
                 x2_lab = x2_friend[is_labelled].to(device)
                 pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1_lab, x2_lab)
@@ -781,7 +783,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
                 train_friend_loss += loss_friend.item()
                 train_friend_batches += 1
 
-            # [VICReg] anti-collapse term, added OUTSIDE the (1+sw) normalisation so
+            # anti-collapse term, added OUTSIDE the (1+sw) normalisation so
             # its strength does not shrink as the supervision weight grows.
             if VICREG_VAR_WEIGHT > 0 or VICREG_COV_WEIGHT > 0:
                 _v1, _c1 = vicreg_var_cov_loss(oproj1_t, gamma=VICREG_GAMMA)
@@ -792,7 +794,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
                 train_vic_var += _vic_var.item()
                 train_vic_cov += _vic_cov.item()
 
-            # [VICReg] accumulate projections for the per-epoch RankMe metric
+            # accumulate projections for the per-epoch RankMe metric
             if len(_rank_buffer) * x1.size(0) < 4096:
                 _rank_buffer.append(oproj1_t.detach().float().cpu())
 
@@ -811,7 +813,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         avg_train_loss = train_loss / len(train_loader)
         avg_train_aug_loss = train_aug_loss / len(train_loader)
         avg_train_friend_loss = train_friend_loss / train_friend_batches if train_friend_batches > 0 else 0.0
-        # [VICReg] epoch means + RankMe effective rank of the online projections
+        # epoch means + RankMe effective rank of the online projections
         avg_vic_var = train_vic_var / len(train_loader)
         avg_vic_cov = train_vic_cov / len(train_loader)
         epoch_rank = (effective_rank(torch.cat(_rank_buffer, dim=0))
@@ -832,7 +834,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
             monitor_loss = 0.0
 
             with torch.no_grad():
-                for x1, _x1_trans, x2_friend, is_labelled in test_loader:
+                for x1, _x1_trans, x2_friend, _ in test_loader:
                     x1 = x1.to(device)
                     x2_friend = x2_friend.to(device)
                     pred1_f, pred2_f, proj1_f, proj2_f = fold_model(x1, x2_friend)
@@ -862,9 +864,9 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         history['train_loss'].append(avg_train_loss)
         history['train_aug_loss'].append(avg_train_aug_loss)
         history['train_friend_loss'].append(avg_train_friend_loss)
-        history['train_vic_var'].append(avg_vic_var)              # [VICReg]
-        history['train_vic_cov'].append(avg_vic_cov)              # [VICReg]
-        history['effective_rank'].append(epoch_rank)             # [VICReg]
+        history['train_vic_var'].append(avg_vic_var)
+        history['train_vic_cov'].append(avg_vic_cov)
+        history['effective_rank'].append(epoch_rank)
         history['monitor_val_loss'].append(avg_monitor_loss)
         history['lr'].append(current_lr)
         history['supervision_schedule'].append(current_supervision_weight)
@@ -873,7 +875,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
 
         # Incremental flush — survives OOM / walltime kills
         if (epoch + 1) % 10 == 0 or (epoch + 1) == NUM_EPOCHS:
-            with open(BYOL_DIR / 'training_history_partial.json', 'w') as _fh:
+            with open(_byol_dir / 'training_history_partial.json', 'w') as _fh:
                 json.dump(
                     {k: [float(x) if x is not None else None for x in v]
                      for k, v in history.items()},
@@ -885,7 +887,7 @@ def train_fold(train_loader, test_loader, extract_loader=None):
         _loss_str = f"t_aug: {avg_train_aug_loss:.4f}"
         if avg_train_friend_loss > 0 and _compute_val:
             _loss_str += f"  t_fri: {avg_train_friend_loss:.4f}  v_fri: {avg_val_friend_loss:.4f}"
-        # [VICReg] append VICReg means + RankMe to the per-epoch log line
+        # append VICReg means + RankMe to the per-epoch log line
         _vic_str = (f" | vic_var: {avg_vic_var:.4f} vic_cov: {avg_vic_cov:.4f}"
                     if (VICREG_VAR_WEIGHT > 0 or VICREG_COV_WEIGHT > 0) else "")
         _rank_str = f" | rank: {epoch_rank:.1f}" if epoch_rank == epoch_rank else ""
@@ -936,163 +938,298 @@ TRAIN_RATIO, TEST_RATIO = 0.70, 0.30
 
 np.random.seed(DATA_SEED)
 
-all_idx = np.arange(len(images))
-print(f"\nSplitting data ({TRAIN_RATIO:.0%}/{TEST_RATIO:.0%})...")
-train_idx, test_idx = train_test_split(all_idx, test_size=TEST_RATIO, random_state=DATA_SEED)
-train_images, train_labels = images[train_idx], labels[train_idx]
-test_images  = images[test_idx]
-test_labels  = labels[test_idx]
+_f_str = str(F_LABEL).rstrip('0').rstrip('.') if '.' in str(F_LABEL) else str(int(F_LABEL))
 
-# Labelled subset via stratified sampling
-if F_LABEL == 0.0:
-    labelled_mask = np.zeros(len(train_idx), dtype=bool)
-elif F_LABEL >= 1.0:
-    labelled_mask = np.ones(len(train_idx), dtype=bool)
-else:
-    strat_key = np.argmax(train_labels[:, :min(5, train_labels.shape[1])], axis=1)
-    n_lab = max(2, int(round(F_LABEL * len(train_idx))))
-    try:
-        sss = StratifiedShuffleSplit(n_splits=1, train_size=n_lab, random_state=DATA_SEED)
-        lab_rel, _ = next(sss.split(train_images, strat_key))
-    except ValueError:
-        print("Stratification failed, falling back to random selection")
-        lab_rel = np.random.choice(len(train_idx), n_lab, replace=False)
-    labelled_mask = np.zeros(len(train_idx), dtype=bool)
-    labelled_mask[lab_rel] = True
+def _build_split_datasets_and_loaders(train_idx, test_idx, nw):
+    """
+    Given pre-determined train/test index arrays, build all datasets, data loaders,
+    apply the labelled/unlabelled mask and class-weight logic, and save split index files
+    to splits_dir.  Returns a dict with keys needed for training and downstream.
+    """
+    train_images_s = images[train_idx]
+    train_labels_s = labels[train_idx]
+    test_images_s  = images[test_idx]
+    test_labels_s  = labels[test_idx]
 
-labelled_images = train_images[labelled_mask]
-labelled_labels = train_labels[labelled_mask]
-unlabelled_images = train_images[~labelled_mask]
-labelled_train_idx = train_idx[labelled_mask]
+    # Labelled subset via stratified sampling
+    if F_LABEL == 0.0:
+        labelled_mask = np.zeros(len(train_idx), dtype=bool)
+    elif F_LABEL >= 1.0:
+        labelled_mask = np.ones(len(train_idx), dtype=bool)
+    else:
+        strat_key = np.argmax(train_labels_s[:, :min(5, train_labels_s.shape[1])], axis=1)
+        n_lab = max(2, int(round(F_LABEL * len(train_idx))))
+        try:
+            sss = StratifiedShuffleSplit(n_splits=1, train_size=n_lab, random_state=DATA_SEED)
+            lab_rel, _ = next(sss.split(train_images_s, strat_key))
+        except ValueError:
+            print("Stratification failed, falling back to random selection")
+            lab_rel = np.random.choice(len(train_idx), n_lab, replace=False)
+        labelled_mask = np.zeros(len(train_idx), dtype=bool)
+        labelled_mask[lab_rel] = True
 
-print(f"  Train BYOL total: {len(train_idx) + len(test_idx)} "
-      f"({len(labelled_images)} labelled, {len(unlabelled_images)} unlabelled train, "
-      f"{len(test_images)} test as unlabelled)")
-print(f"  Test:  {len(test_images)}")
+    lab_images_s   = train_images_s[labelled_mask]
+    lab_labels_s   = train_labels_s[labelled_mask]
+    unlab_images_s = train_images_s[~labelled_mask]
+    lab_train_idx  = train_idx[labelled_mask]
+    unlab_train_idx = train_idx[~labelled_mask]
 
-# Datasets
-print("\nCreating datasets...")
-print(f"  Augmentation: {args.augmentation}")
-train_unlab_ds = UnlabelledBYOLDataset(unlabelled_images, transform=byol_strong_aug)
+    print(f"  Train BYOL total: {len(train_idx) + len(test_idx)} "
+          f"({len(lab_images_s)} labelled, {len(unlab_images_s)} unlabelled train, "
+          f"{len(test_images_s)} test as unlabelled)")
+    print(f"  Test:  {len(test_images_s)}")
+
+    # Datasets
+    train_unlab_ds_s = UnlabelledBYOLDataset(unlab_images_s, transform=byol_strong_aug)
+
+    if len(lab_images_s) > 0:
+        lab_df_s = pd.DataFrame(lab_labels_s)
+        train_lab_ds_s = BYOLSupDataset(tags_data=lab_df_s, img_data=lab_images_s,
+                                        transform=byol_strong_aug, friend_transform=byol_strong_aug,
+                                        weightfunc=WEIGHTING_FUNC)
+        _train_combined_s = ConcatDataset([train_lab_ds_s, train_unlab_ds_s])
+        train_extract_loader_s = DataLoader(train_lab_ds_s, batch_size=BATCH_SIZE, shuffle=False,
+                                            num_workers=nw, pin_memory=use_cuda)
+    else:
+        train_lab_ds_s = None
+        _train_combined_s = train_unlab_ds_s
+        train_extract_loader_s = DataLoader(train_unlab_ds_s, batch_size=BATCH_SIZE, shuffle=False,
+                                            num_workers=nw, pin_memory=use_cuda)
+
+    # Test images always enter the BYOL training pool regardless of F_LABEL or supervision_weight.
+    test_unlab_ds_s = UnlabelledBYOLDataset(test_images_s, transform=byol_strong_aug)
+    _train_combined_s = ConcatDataset([_train_combined_s, test_unlab_ds_s])
+
+    # precompute per-sample weights and attach to the labelled dataset.
+    if CLASS_WEIGHT_MODE is not None and train_lab_ds_s is not None and F_LABEL > 0:
+        _lab_full_s = labels_full[train_idx][labelled_mask]
+        print(f'  Class-weight mode={CLASS_WEIGHT_MODE} strength={CLASS_WEIGHT_STRENGTH}')
+        if CLASS_WEIGHT_MODE == 'score':
+            _sw = compute_sample_weights(_lab_full_s, 'score', CLASS_WEIGHT_STRENGTH)
+            train_lab_ds_s.sample_weights = _sw
+            _raw = np.ones(len(_lab_full_s), dtype=np.float32)
+            for _sv, _cols in reversed(TIERS):
+                _ci = [LABEL_COLS.index(c) for c in _cols]
+                _raw[_lab_full_s[:, _ci].any(axis=1)] = float(_sv)
+            for _sv in [1, 2, 3, 4]:
+                _n = int((_raw == _sv).sum())
+                _w = float((1.0 + CLASS_WEIGHT_STRENGTH * (_sv / _raw.mean() - 1.0)))
+                print(f'    tier{_sv}: n={_n}  effective_weight={_w:.3f}')
+        else:
+            _alpha = compute_class_weights(_lab_full_s, CLASS_WEIGHT_MODE, CLASS_WEIGHT_STRENGTH)
+            _pos = _lab_full_s.astype(np.float32)
+            _set_mask = (_alpha > 0).astype(np.float32)
+            _in_set_pos = (_pos * _set_mask).sum(axis=1).clip(min=1)
+            _raw = (_pos * _alpha).sum(axis=1) / _in_set_pos
+            _sw = (_raw / np.clip(_raw.mean(), 1e-6, None)).astype(np.float32)
+            train_lab_ds_s.sample_weights = _sw
+            _nz = _alpha[_alpha > 0]
+            print(f'    alpha stats: min={_nz.min():.3f}  max={_nz.max():.3f}')
+            print(f'    sample_weight: min={_sw.min():.3f}  max={_sw.max():.3f}  mean={_sw.mean():.3f}')
+    elif CLASS_WEIGHT_MODE is not None and F_LABEL == 0.0:
+        print("WARNING: --class-weight-mode has no effect when F_LABEL=0 (no labelled samples).")
+
+    train_loader_s = DataLoader(_train_combined_s, batch_size=BATCH_SIZE, shuffle=True,
+                                drop_last=True, num_workers=nw, pin_memory=use_cuda,
+                                collate_fn=byol_collate_fn)
+    unlab_extract_loader_s = DataLoader(train_unlab_ds_s, batch_size=BATCH_SIZE, shuffle=False,
+                                        num_workers=nw, pin_memory=use_cuda)
+    pca_fit_loader_s = DataLoader(_train_combined_s, batch_size=BATCH_SIZE,
+                                  shuffle=False, num_workers=nw, pin_memory=use_cuda,
+                                  collate_fn=byol_collate_fn)
+    _, test_loader_s = _make_dataset_loader(test_images_s, test_labels_s,
+                                            shuffle=False, drop_last=USE_COMPILE)
+
+    # Downstream train data is labelled-only if any labelled samples exist
+    if len(lab_images_s) > 0:
+        dl_train_images = lab_images_s
+        dl_train_labels = lab_labels_s
+        dl_train_idx    = lab_train_idx
+    else:
+        dl_train_images = train_images_s
+        dl_train_labels = train_labels_s
+        dl_train_idx    = train_idx
+
+    return dict(
+        train_loader=train_loader_s,
+        test_loader=test_loader_s,
+        pca_fit_loader=pca_fit_loader_s,
+        train_extract_loader=train_extract_loader_s,
+        unlab_extract_loader=unlab_extract_loader_s,
+        train_images=dl_train_images,
+        train_labels=dl_train_labels,
+        train_idx=dl_train_idx,
+        test_images=test_images_s,
+        test_labels=test_labels_s,
+        test_idx=test_idx,
+        labelled_images=lab_images_s,
+        unlabelled_images=unlab_images_s,
+        labelled_train_idx=lab_train_idx,
+        unlabelled_train_idx=unlab_train_idx,
+    )
+
 
 _nw = NUM_WORKERS if use_cuda else 0
+print("\nCreating datasets...")
+print(f"  Augmentation: {args.augmentation}")
 
-if len(labelled_images) > 0:
-    lab_df = pd.DataFrame(labelled_labels)
-    train_lab_ds = BYOLSupDataset(tags_data=lab_df, img_data=labelled_images,
-                             transform=byol_strong_aug, friend_transform=byol_strong_aug,
-                             weightfunc=WEIGHTING_FUNC, p_pair_from_class=0.5)
-    _train_combined = ConcatDataset([train_lab_ds, train_unlab_ds])
-    train_extract_loader = DataLoader(train_lab_ds, batch_size=BATCH_SIZE, shuffle=False,
-                                       num_workers=_nw, pin_memory=use_cuda)
+if not CROSS_VAL:
+    # =========================================================================
+    # SINGLE 70/30 TRAIN/TEST SPLIT (default behaviour)
+    # =========================================================================
+    all_idx = np.arange(len(images))
+    print(f"\nSplitting data ({TRAIN_RATIO:.0%}/{TEST_RATIO:.0%})...")
+    train_idx, test_idx = train_test_split(all_idx, test_size=TEST_RATIO, random_state=DATA_SEED)
+
+    _split = _build_split_datasets_and_loaders(train_idx, test_idx, _nw)
+
+    np.save(SPLITS_DIR / 'train_idx.npy', train_idx)
+    np.save(SPLITS_DIR / 'test_idx.npy',  test_idx)
+    np.save(SPLITS_DIR / f'labelled_train_idx_f{_f_str}.npy',   _split['labelled_train_idx'])
+    np.save(SPLITS_DIR / f'unlabelled_train_idx_f{_f_str}.npy', _split['unlabelled_train_idx'])
+
+    # Expose globals expected by the downstream loop (non-CV path only)
+    train_images         = _split['train_images']
+    train_labels         = _split['train_labels']
+    train_idx            = _split['train_idx']
+    test_images          = _split['test_images']
+    test_labels          = _split['test_labels']
+    test_idx             = _split['test_idx']
+    labelled_images      = _split['labelled_images']
+    unlabelled_images    = _split['unlabelled_images']
+    unlabelled_train_idx = _split['unlabelled_train_idx']
+    train_extract_loader = _split['train_extract_loader']
+    unlab_extract_loader = _split['unlab_extract_loader']
+    train_loader         = _split['train_loader']
+    test_loader          = _split['test_loader']
+    pca_fit_loader       = _split['pca_fit_loader']
+
+    print(f"\n{'='*70}")
+    print("DATA LOADED")
+    print(f"{'='*70}")
+    print(f"Train: {len(train_loader)} batches x {BATCH_SIZE}")
+    print(f"Test:  {len(test_loader)} batches x {BATCH_SIZE}")
+    print(f"{'='*70}\n")
+
+    x1, x1_aug, x2_friend, is_labelled, _ = next(iter(train_loader))
+    print(f"Test batch: {x1.shape}, {x1_aug.shape}")
+    print(f"  Labelled fraction: {is_labelled.float().mean():.2f}")
+
+    model, history, best_val_loss, best_epoch = train_fold(
+        train_loader, test_loader, extract_loader=pca_fit_loader)
+
+    print("\nEvaluating on TEST set...")
+    avg_test_loss = evaluate_test(model, test_loader)
+    print(f"Test Loss: {avg_test_loss:.4f}  Best Val: {best_val_loss:.4f}")
+
+    # =============================================================================
+    # DOWNSTREAM: per-model loop
+    # =============================================================================
+
+    _items = [{'fold_idx': None, 'model': model, 'history': history,
+               'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
+               'avg_test_loss': avg_test_loss,
+               'train_extract_loader': train_extract_loader,
+               'train_labels': train_labels, 'train_idx': train_idx,
+               'train_images': train_images,
+               'test_images': test_images, 'test_labels': test_labels,
+               'test_idx': test_idx, 'labelled_images': labelled_images,
+               'unlabelled_images': unlabelled_images,
+               'unlabelled_train_idx': unlabelled_train_idx,
+               'unlab_extract_loader': unlab_extract_loader}]
+
 else:
-    train_lab_ds = None
-    _train_combined = train_unlab_ds
-    train_extract_loader = DataLoader(train_unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
-                                       num_workers=_nw, pin_memory=use_cuda)
+    # =========================================================================
+    # 5-FOLD CROSS-VALIDATION
+    # =========================================================================
+    all_idx = np.arange(len(images))
+    kf = KFold(n_splits=CV_N_FOLDS, shuffle=True, random_state=DATA_SEED)
+    _items = []
 
-# Test images always enter the BYOL training pool regardless of F_LABEL or supervision_weight.
-test_unlab_ds = UnlabelledBYOLDataset(test_images, transform=byol_strong_aug)
-_train_combined = ConcatDataset([_train_combined, test_unlab_ds])
+    for _fi, (_fold_train_idx, _fold_test_idx) in enumerate(kf.split(all_idx)):
+        print(f"\n{'='*70}")
+        print(f"CROSS-VALIDATION FOLD {_fi + 1}/{CV_N_FOLDS}")
+        print(f"{'='*70}")
 
-# =============================================================================
-# PROTEGE TIER CONSTANTS
-# LABEL_COLS and TIERS are imported from suplat.utils.class_weights above.
-# =============================================================================
-POSITIVE_THRESHOLD   = 3
-PROTEGE_INITIAL_STEPS = 10
+        _split = _build_split_datasets_and_loaders(_fold_train_idx, _fold_test_idx, _nw)
 
-# [TierW] precompute per-sample weights and attach to the labelled dataset.
-# L_friend is a BYOL similarity loss (no per-class terms), so per-class alpha must be
-# aggregated to a per-sample scalar before being passed to byol_loss_weighted.
-if CLASS_WEIGHT_MODE is not None and train_lab_ds is not None and F_LABEL > 0:
-    # Use full 20-col labels regardless of --label-type truncation
-    _lab_full = labels_full[train_idx][labelled_mask]
-    print(f'  Class-weight mode={CLASS_WEIGHT_MODE} strength={CLASS_WEIGHT_STRENGTH}')
-    if CLASS_WEIGHT_MODE == 'score':
-        _sw = compute_sample_weights(_lab_full, 'score', CLASS_WEIGHT_STRENGTH)
-        train_lab_ds.sample_weights = _sw
-        _raw = np.ones(len(_lab_full), dtype=np.float32)
-        for _sv, _cols in reversed(TIERS):
-            _ci = [LABEL_COLS.index(c) for c in _cols]
-            _raw[_lab_full[:, _ci].any(axis=1)] = float(_sv)
-        for _sv in [1, 2, 3, 4]:
-            _n = int((_raw == _sv).sum())
-            _w = float((1.0 + CLASS_WEIGHT_STRENGTH * (_sv / _raw.mean() - 1.0)))
-            print(f'    tier{_sv}: n={_n}  effective_weight={_w:.3f}')
-    else:
-        # label-set mode: get per-class alpha, aggregate to per-sample scalar for BYOL loss
-        _alpha = compute_class_weights(_lab_full, CLASS_WEIGHT_MODE, CLASS_WEIGHT_STRENGTH)
-        # _alpha is (20,); non-zero only for columns in the selected set
-        _pos = _lab_full.astype(np.float32)                        # (N_lab, 20)
-        _set_mask = (_alpha > 0).astype(np.float32)                # columns in selected set
-        _in_set_pos = (_pos * _set_mask).sum(axis=1).clip(min=1)   # positives in set per sample
-        _raw = (_pos * _alpha).sum(axis=1) / _in_set_pos           # mean alpha over set positives
-        _sw = (_raw / np.clip(_raw.mean(), 1e-6, None)).astype(np.float32)
-        train_lab_ds.sample_weights = _sw
-        _nz = _alpha[_alpha > 0]
-        print(f'    alpha stats: min={_nz.min():.3f}  max={_nz.max():.3f}')
-        print(f'    sample_weight: min={_sw.min():.3f}  max={_sw.max():.3f}  mean={_sw.mean():.3f}')
-elif CLASS_WEIGHT_MODE is not None and F_LABEL == 0.0:
-    print("WARNING: --class-weight-mode has no effect when F_LABEL=0 (no labelled samples).")
+        # Create per-fold output subdirectory tree
+        _fold_out_dir       = OUTPUT_DIR / f'cross_val_{_fi}'
+        _fold_figures_dir   = _fold_out_dir / 'figures'
+        _fold_umap_dir      = _fold_figures_dir / 'umap'
+        _fold_data_dir      = _fold_out_dir / 'data'
+        _fold_byol_dir      = _fold_data_dir / 'byol'
+        _fold_umap_data_dir = _fold_data_dir / 'umap'
+        for _d in [_fold_figures_dir, _fold_umap_dir, _fold_data_dir,
+                   _fold_byol_dir, _fold_umap_data_dir]:
+            _d.mkdir(parents=True, exist_ok=True)
 
-train_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE, shuffle=True,
-                          drop_last=True, num_workers=_nw, pin_memory=use_cuda,
-                          collate_fn=byol_collate_fn)
-unlab_extract_loader = DataLoader(train_unlab_ds, batch_size=BATCH_SIZE, shuffle=False,
-                                   num_workers=_nw, pin_memory=use_cuda)
-pca_fit_loader = DataLoader(_train_combined, batch_size=BATCH_SIZE,
-                             shuffle=False, num_workers=_nw, pin_memory=use_cuda,
-                             collate_fn=byol_collate_fn)
+        # Save fold-specific split indices
+        _fold_splits_dir = SPLITS_DIR / f'cross_val_{_fi}'
+        _fold_splits_dir.mkdir(exist_ok=True)
+        np.save(_fold_splits_dir / 'train_idx.npy', _fold_train_idx)
+        np.save(_fold_splits_dir / 'test_idx.npy',  _fold_test_idx)
+        np.save(_fold_splits_dir / f'labelled_train_idx_f{_f_str}.npy',
+                _split['labelled_train_idx'])
+        np.save(_fold_splits_dir / f'unlabelled_train_idx_f{_f_str}.npy',
+                _split['unlabelled_train_idx'])
 
-_, test_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=USE_COMPILE)
+        print(f"\n{'='*70}")
+        print(f"DATA LOADED — fold {_fi + 1}/{CV_N_FOLDS}")
+        print(f"{'='*70}")
+        print(f"Train: {len(_split['train_loader'])} batches x {BATCH_SIZE}")
+        print(f"Test:  {len(_split['test_loader'])} batches x {BATCH_SIZE}")
+        print(f"{'='*70}\n")
 
-np.save(SPLITS_DIR / 'train_idx.npy', train_idx)
-np.save(SPLITS_DIR / 'test_idx.npy',  test_idx)
-unlabelled_train_idx = train_idx[~labelled_mask]
-_f_str = str(F_LABEL).rstrip('0').rstrip('.') if '.' in str(F_LABEL) else str(int(F_LABEL))
-np.save(SPLITS_DIR / f'labelled_train_idx_f{_f_str}.npy',   labelled_train_idx)
-np.save(SPLITS_DIR / f'unlabelled_train_idx_f{_f_str}.npy', unlabelled_train_idx)
+        _x1, _, _, _is_lab, _ = next(iter(_split['train_loader']))
+        print(f"Test batch: {_x1.shape}")
+        print(f"  Labelled fraction: {_is_lab.float().mean():.2f}")
 
-# Set train_labels / train_images for downstream to labelled-only
-if len(labelled_images) > 0:
-    train_labels = labelled_labels
-    train_images = labelled_images
-    train_idx    = labelled_train_idx
+        _model_fold, _hist_fold, _bvl_fold, _bep_fold = train_fold(
+            _split['train_loader'], _split['test_loader'],
+            extract_loader=_split['pca_fit_loader'],
+            byol_dir=_fold_byol_dir,
+        )
 
-print(f"\n{'='*70}")
-print("DATA LOADED")
-print(f"{'='*70}")
-print(f"Train: {len(train_loader)} batches x {BATCH_SIZE}")
-print(f"Test:  {len(test_loader)} batches x {BATCH_SIZE}")
-print(f"{'='*70}\n")
+        print(f"\nEvaluating on TEST set (fold {_fi + 1})...")
+        _avg_test_loss_fold = evaluate_test(_model_fold, _split['test_loader'])
+        print(f"Test Loss: {_avg_test_loss_fold:.4f}  Best Val: {_bvl_fold:.4f}")
 
-x1, x1_aug, x2_friend, is_labelled, _ = next(iter(train_loader))  # [TierW]
-print(f"Test batch: {x1.shape}, {x1_aug.shape}")
-print(f"  Labelled fraction: {is_labelled.float().mean():.2f}")
+        _items.append({
+            'fold_idx':             _fi,
+            'model':                _model_fold,
+            'history':              _hist_fold,
+            'best_val_loss':        _bvl_fold,
+            'best_epoch':           _bep_fold,
+            'avg_test_loss':        _avg_test_loss_fold,
+            'train_extract_loader': _split['train_extract_loader'],
+            'train_labels':         _split['train_labels'],
+            'train_idx':            _split['train_idx'],
+            'train_images':         _split['train_images'],
+            # fold-specific output dirs (CV only):
+            'output_dir':           _fold_out_dir,
+            'figures_dir':          _fold_figures_dir,
+            'umap_dir':             _fold_umap_dir,
+            'byol_dir':             _fold_byol_dir,
+            'umap_data_dir':        _fold_umap_data_dir,
+            'splits_dir':           _fold_splits_dir,
+            # fold-specific data overrides consumed by the downstream loop:
+            'test_images':          _split['test_images'],
+            'test_labels':          _split['test_labels'],
+            'test_idx':             _split['test_idx'],
+            'labelled_images':      _split['labelled_images'],
+            'unlabelled_images':    _split['unlabelled_images'],
+            'unlabelled_train_idx': _split['unlabelled_train_idx'],
+            'unlab_extract_loader': _split['unlab_extract_loader'],
+        })
 
-model, history, best_val_loss, best_epoch = train_fold(
-    train_loader, test_loader, extract_loader=pca_fit_loader)
-
-print("\nEvaluating on TEST set...")
-avg_test_loss = evaluate_test(model, test_loader)
-print(f"Test Loss: {avg_test_loss:.4f}  Best Val: {best_val_loss:.4f}")
-
-# =============================================================================
-# DOWNSTREAM: per-model loop
-# =============================================================================
-
-_items = [{'fold_idx': None, 'model': model, 'history': history,
-           'best_val_loss': best_val_loss, 'best_epoch': best_epoch,
-           'avg_test_loss': avg_test_loss,
-           'train_extract_loader': train_extract_loader,
-           'train_labels': train_labels, 'train_idx': train_idx,
-           'train_images': train_images}]
+    # =============================================================================
+    # DOWNSTREAM: per-model loop
+    # =============================================================================
 
 for _item in _items:
     _fi      = _item['fold_idx']
-    _suffix  = "" if _fi is None else f"_fold{_fi + 1}"
-    _label   = ""
+    _label   = "" if _fi is None else f" (cross_val_{_fi})"
     model                = _item['model']
     history              = _item['history']
     best_val_loss        = _item['best_val_loss']
@@ -1103,12 +1240,29 @@ for _item in _items:
     train_idx            = _item['train_idx']
     train_images         = _item['train_images']
 
+    # Per-fold output dirs (CV) fall back to module-level globals (non-CV)
+    _out_dir        = _item.get('output_dir',    OUTPUT_DIR)
+    _fig_dir        = _item.get('figures_dir',   FIGURES_DIR)
+    _umap_dir_item  = _item.get('umap_dir',      UMAP_DIR)
+    _byol_dir_item  = _item.get('byol_dir',      BYOL_DIR)
+    _umap_data_dir_item = _item.get('umap_data_dir', UMAP_DATA_DIR)
+    _splits_dir_item = _item.get('splits_dir',   SPLITS_DIR)
+
+    # Per-fold data (always present in both CV and non-CV _items dicts)
+    _test_images_cur          = _item['test_images']
+    _test_labels_cur          = _item['test_labels']
+    _test_idx_cur             = _item['test_idx']
+    _labelled_images_cur      = _item['labelled_images']
+    _unlabelled_images_cur    = _item['unlabelled_images']
+    _unlabelled_train_idx_cur = _item['unlabelled_train_idx']
+    _unlab_extract_loader_cur = _item['unlab_extract_loader']
+
     history['test_loss'] = avg_test_loss
 
     # =========================================================================
     # SAVE MODEL AND HISTORY
     # =========================================================================
-    _chk_path = OUTPUT_DIR / f'byol_model_best{_suffix}.pt'
+    _chk_path = _out_dir / 'byol_model_best.pt'
 
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -1134,9 +1288,9 @@ for _item in _items:
             'supervision_weight': SUPERVISION_WEIGHT,
             'supervision_weight_schedule': SUPERVISION_WEIGHT_SCHEDULE,
             'projector': PROJECTOR,
-            'vicreg_var_weight': VICREG_VAR_WEIGHT,   # [VICReg]
-            'vicreg_cov_weight': VICREG_COV_WEIGHT,   # [VICReg]
-            'vicreg_gamma': VICREG_GAMMA,             # [VICReg]
+            'vicreg_var_weight': VICREG_VAR_WEIGHT,
+            'vicreg_cov_weight': VICREG_COV_WEIGHT,
+            'vicreg_gamma': VICREG_GAMMA,
             'class_weight_mode': CLASS_WEIGHT_MODE,
             'class_weight_strength': CLASS_WEIGHT_STRENGTH,
             'label_type': args.label_type,
@@ -1145,13 +1299,13 @@ for _item in _items:
 
     print(f"Model checkpoint saved to {_chk_path}")
 
-    np.save(BYOL_DIR / f'training_history{_suffix}.npy', history)
-    print(f"Training history saved to {BYOL_DIR / f'training_history{_suffix}.npy'}")
+    np.save(_byol_dir_item / 'training_history.npy', history)
+    print(f"Training history saved to {_byol_dir_item / 'training_history.npy'}")
 
     if not args.no_plot_history:
         print(f"\nGenerating training curve plots{_label}...")
-        plot_training_curves(history, best_val_loss, best_epoch, MODEL_TYPE, FIGURES_DIR,
-                             suffix=_suffix, loss_mode="both")
+        plot_training_curves(history, best_val_loss, best_epoch, MODEL_TYPE, _fig_dir,
+                             suffix="", loss_mode="both")
 
     # =========================================================================
     # EXTRACT PROJECTIONS
@@ -1162,28 +1316,29 @@ for _item in _items:
         model, train_extract_loader, MODEL_TYPE, device, max_batches=None
     )
     print(f"   Train set projections: {train_projections.shape}")
-    _test_extract_loader = _make_dataset_loader(test_images, test_labels, shuffle=False, drop_last=False)[1]
+    _test_extract_loader = _make_dataset_loader(_test_images_cur, _test_labels_cur, shuffle=False, drop_last=False)[1]
     test_projections = extract_embeddings_from_loader(
         model, _test_extract_loader, MODEL_TYPE, device, max_batches=None
     )
     print(f"   Test set projections: {test_projections.shape}")
 
-    np.save(BYOL_DIR / f'labelled_train_projections{_suffix}.npy', train_projections)
-    np.save(BYOL_DIR / f'test_projections{_suffix}.npy', test_projections)
-    np.save(SPLITS_DIR / f'labelled_train_labels_f{_f_str}{_suffix}.npy', train_labels[:len(train_projections)])
-    np.save(SPLITS_DIR / f'test_labels{_suffix}.npy', test_labels[:len(test_projections)])
+    np.save(_byol_dir_item / 'labelled_train_projections.npy', train_projections)
+    np.save(_byol_dir_item / 'test_projections.npy', test_projections)
+    np.save(_splits_dir_item / f'labelled_train_labels_f{_f_str}.npy', train_labels[:len(train_projections)])
+    np.save(_splits_dir_item / f'test_labels.npy', _test_labels_cur[:len(test_projections)])
 
-    if len(unlabelled_images) > 0:
+    if len(_unlabelled_images_cur) > 0:
         unlab_projections = extract_embeddings_from_loader(
-            model, unlab_extract_loader, MODEL_TYPE, device, max_batches=None
+            model, _unlab_extract_loader_cur, MODEL_TYPE, device, max_batches=None
         )
         print(f"   Unlabelled train set projections: {unlab_projections.shape}")
-        np.save(BYOL_DIR / f'unlabelled_train_projections{_suffix}.npy', unlab_projections)
-        np.save(SPLITS_DIR / f'unlabelled_train_labels_f{_f_str}{_suffix}.npy', labels[unlabelled_train_idx])
+        np.save(_byol_dir_item / 'unlabelled_train_projections.npy', unlab_projections)
+        np.save(_splits_dir_item / f'unlabelled_train_labels_f{_f_str}.npy',
+                labels[_unlabelled_train_idx_cur])
     else:
         unlab_projections = None
 
-    print(f"\nProjections saved to {BYOL_DIR}/")
+    print(f"\nProjections saved to {_byol_dir_item}/")
 
     # =========================================================================
     # EXTRACT ENCODINGS (encoder output, before projector)
@@ -1202,19 +1357,19 @@ for _item in _items:
         f"Encoding/projection count mismatch (train): {len(train_encodings)} vs {len(train_projections)}"
     assert len(test_encodings) == len(test_projections), \
         f"Encoding/projection count mismatch (test): {len(test_encodings)} vs {len(test_projections)}"
-    np.save(BYOL_DIR / f'labelled_train_encodings{_suffix}.npy', train_encodings)
-    np.save(BYOL_DIR / f'test_encodings{_suffix}.npy', test_encodings)
+    np.save(_byol_dir_item / 'labelled_train_encodings.npy', train_encodings)
+    np.save(_byol_dir_item / 'test_encodings.npy', test_encodings)
 
     if unlab_projections is not None:
         unlab_encodings = extract_raw_embeddings_from_loader(
-            model, unlab_extract_loader, device, max_batches=None
+            model, _unlab_extract_loader_cur, device, max_batches=None
         )
         print(f"   Unlabelled train set encodings: {unlab_encodings.shape}")
-        np.save(BYOL_DIR / f'unlabelled_train_encodings{_suffix}.npy', unlab_encodings)
+        np.save(_byol_dir_item / 'unlabelled_train_encodings.npy', unlab_encodings)
     else:
         unlab_encodings = None
 
-    print(f"Encodings saved to {BYOL_DIR}/")
+    print(f"Encodings saved to {_byol_dir_item}/")
 
     # =========================================================================
     # PCA VARIANCE ANALYSIS  (dimensionality collapse diagnostic)
@@ -1254,7 +1409,7 @@ for _item in _items:
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
     plt.tight_layout()
-    _pca_fig_path = FIGURES_DIR / f"pca_variance{_suffix}.png"
+    _pca_fig_path = _fig_dir / "pca_variance.png"
     fig.savefig(_pca_fig_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  PCA variance plot saved to {_pca_fig_path}")
@@ -1275,8 +1430,8 @@ for _item in _items:
                             'Curved FRIIs', 'Straight+multi hotspots'],
         }
 
-        _enc_parquet  = UMAP_DATA_DIR / f'umap_encodings{_suffix}.parquet'
-        _proj_parquet = UMAP_DATA_DIR / f'umap_projections{_suffix}.parquet'
+        _enc_parquet  = _umap_data_dir_item / 'umap_encodings.parquet'
+        _proj_parquet = _umap_data_dir_item / 'umap_projections.parquet'
 
         if _enc_parquet.exists() and _proj_parquet.exists():
             # ── Load coordinates and metadata from cached parquets ─────────────
@@ -1303,7 +1458,7 @@ for _item in _items:
             _n_te = len(test_projections)
 
             _lf_train = labels_full[train_idx][:_n_tr]
-            _lf_test  = labels_full[test_idx][:_n_te]
+            _lf_test  = labels_full[_test_idx_cur][:_n_te]
 
             if unlab_encodings is not None:
                 _n_ul = len(unlab_encodings)
@@ -1332,9 +1487,9 @@ for _item in _items:
 
             _img_parts = []
             if unlab_encodings is not None:
-                _img_parts.append(unlabelled_images[:_n_ul])
+                _img_parts.append(_unlabelled_images_cur[:_n_ul])
             _img_parts.append(train_images[:_n_tr])
-            _img_parts.append(test_images[:_n_te])
+            _img_parts.append(_test_images_cur[:_n_te])
             _all_images_arr = np.concatenate(_img_parts, axis=0)
             _all_pixel_sum = _all_images_arr.sum(axis=(1, 2))
 
@@ -1350,7 +1505,7 @@ for _item in _items:
                 ['test'] * _n_te
             )
             _lf_true = np.concatenate(
-                ([labels_full[unlabelled_train_idx][:_n_ul]] if _n_ul > 0 else []) +
+                ([labels_full[_unlabelled_train_idx_cur][:_n_ul]] if _n_ul > 0 else []) +
                 [_lf_train, _lf_test]
             )
             _umap_meta = pd.DataFrame({'split': _split_col})
@@ -1368,13 +1523,13 @@ for _item in _items:
             _proj_df['umap_x'] = _proj_2d[:, 0]
             _proj_df['umap_y'] = _proj_2d[:, 1]
             _proj_df.to_parquet(_proj_parquet, index=False)
-            print(f"  UMAP metadata saved to {UMAP_DATA_DIR}/")
+            print(f"  UMAP metadata saved to {_umap_data_dir_item}/")
 
         # ── Produce all figures from whichever source ──────────────────────────
         _split_masks_all = {}
         if _n_ul > 0:
             _split_masks_all['Unlabelled train'] = _mask_ul
-        _tr_key = 'Labelled train' if len(labelled_images) > 0 else 'Unlabelled train'
+        _tr_key = 'Labelled train' if len(_labelled_images_cur) > 0 else 'Unlabelled train'
         _split_masks_all[_tr_key] = _mask_tr
         _split_masks_all['Test'] = _mask_te
 
@@ -1383,7 +1538,7 @@ for _item in _items:
                 plot_umap_single(
                     _2d, _all_lf, _col, CLASS_NAMES, LABEL_RANGES,
                     title=f'{_space} — {_col}',
-                    save_path=UMAP_DIR / f'{_prefix}_all_{_col}{_suffix}.png',
+                    save_path=_umap_dir_item / f'{_prefix}_all_{_col}.png',
                     split_masks=_split_masks_all,
                 )
 
@@ -1391,7 +1546,7 @@ for _item in _items:
                 _2d, _all_pixel_sum,
                 title=f'{_space} — brightness',
                 cbar_label='Total pixel sum',
-                save_path=UMAP_DIR / f'{_prefix}_all_brightness{_suffix}.png',
+                save_path=_umap_dir_item / f'{_prefix}_all_brightness.png',
                 cmap='plasma',
             )
 
@@ -1399,7 +1554,7 @@ for _item in _items:
                 _2d, _interest,
                 title=f'{_space} — interest score',
                 cbar_label='Interest score',
-                save_path=UMAP_DIR / f'{_prefix}_all_interest{_suffix}.png',
+                save_path=_umap_dir_item / f'{_prefix}_all_interest.png',
                 cmap='plasma',
                 vmin=1, vmax=4,
                 cbar_ticks=[1, 2, 3, 4],
@@ -1408,12 +1563,12 @@ for _item in _items:
             plot_umap_outliers(
                 _2d[:_n_tr],
                 train_images[:_n_tr],
-                OUTPUT_DIR=UMAP_DIR,
+                OUTPUT_DIR=_umap_dir_item,
                 labels=train_labels[:_n_tr],
-                save_prefix=f"{_prefix}_outliers{_suffix}",
+                save_prefix=f"{_prefix}_outliers",
             )
 
-        print(f"\nUMAP plots saved to {UMAP_DIR}/")
+        print(f"\nUMAP plots saved to {_umap_dir_item}/")
 
     # =========================================================================
     # CLUSTERING METRICS
@@ -1421,7 +1576,7 @@ for _item in _items:
     if not args.no_metrics:
         metrics = {}
         _metric_splits = [('train', train_projections, train_labels[:len(train_projections)]),
-                          ('test', test_projections, test_labels[:len(test_projections)])]
+                          ('test', test_projections, _test_labels_cur[:len(test_projections)])]
         _all_m_projs  = []
         _all_m_labels = []
         if unlab_projections is not None:
@@ -1431,7 +1586,7 @@ for _item in _items:
         _all_m_projs.append(train_projections)
         _all_m_labels.append(train_labels[:len(train_projections)])
         _all_m_projs.append(test_projections)
-        _all_m_labels.append(test_labels[:len(test_projections)])
+        _all_m_labels.append(_test_labels_cur[:len(test_projections)])
         _metric_splits.append(('all', np.concatenate(_all_m_projs), np.concatenate(_all_m_labels)))
         for split, projections, split_labels in _metric_splits:
             metrics[split] = {'fri_vs_frii': {}, 'base_classes': {}}
@@ -1459,9 +1614,24 @@ for _item in _items:
                 'calinski_harabasz': float(calinski_harabasz_score(projections[combined], labels_hot))
             }
 
-        with open(OUTPUT_DIR / f'projection_metrics{_suffix}.json', 'w') as f:
+        with open(_out_dir / 'projection_metrics.json', 'w') as f:
             json.dump(metrics, f, indent=4)
-        print(f"Projection clustering metrics saved to {OUTPUT_DIR / f'projection_metrics{_suffix}.json'}")
+        print(f"Projection clustering metrics saved to {_out_dir / 'projection_metrics.json'}")
+
+if CROSS_VAL:
+    _cv_losses = [_it['avg_test_loss'] for _it in _items]
+    _cv_summary = {
+        'n_folds': CV_N_FOLDS,
+        'fold_test_losses': _cv_losses,
+        'mean_test_loss': float(np.mean(_cv_losses)),
+        'std_test_loss':  float(np.std(_cv_losses)),
+    }
+    with open(OUTPUT_DIR / 'cv_summary.json', 'w') as _fh:
+        json.dump(_cv_summary, _fh, indent=4)
+    print(f"\nCV summary ({CV_N_FOLDS} folds): "
+          f"mean_test_loss={_cv_summary['mean_test_loss']:.4f} "
+          f"± {_cv_summary['std_test_loss']:.4f}")
+    print(f"  Per-fold: {[f'{v:.4f}' for v in _cv_losses]}")
 
 print(f"\n{'='*70}")
 print("SCRIPT COMPLETE")

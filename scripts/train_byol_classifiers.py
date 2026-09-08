@@ -28,90 +28,10 @@ from sklearn.preprocessing import StandardScaler, label_binarize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_class_weights, compute_sample_weights
-
-
-# ---------------------------------------------------------------------------
-# Label-set definitions (copied from train_sklearn_classifiers.py)
-# ---------------------------------------------------------------------------
-
-ALL_CLASS_NAMES = [
-    'FRI', 'FRII', 'Hybrids', 'Spirals', 'Relaxed doubles',
-    'C-curv', 'S-curv', 'Misalign', 'Wings', 'X-shaped',
-    'Straight jets', 'Multi hotspots', 'Cont. jets', 'Banding',
-    'One-sided', 'Restarted', 'Cluster', 'Merger', 'Diffuse', 'Unknown',
-]
-
-DERIVED_CLASS_NAMES = [
-    'Pure hybrid',        # col2 & ~col0 & ~col1
-    'FR hybrid',          # col2 & (col0 | col1)
-    'Curved FRI',         # col0 & (col5 | col6)
-    'Curved FRII',        # col1 & (col5 | col6)
-    'Straight+multi-HS',  # col10 & col11
-]
-
-LABEL_SETS = {
-    "classical":       [0, 1],
-    "classical_pure":  [0, 1],
-    "initial":         list(range(0, 5)),
-    "initial_pure":    list(range(0, 5)),
-    "morphology":      list(range(5, 16)),
-    "morphology_pure": list(range(5, 16)),
-    "environment":     list(range(16, 20)),
-    "derived":         None,
-    "full":            list(range(0, 20)),
-    "full_pure":       list(range(0, 20)),
-    # _binary variants: same columns as base set; evaluated element-wise (not exact-match)
-    "classical_binary":   [0, 1],
-    "initial_binary":     list(range(0, 5)),
-    "morphology_binary":  list(range(5, 16)),
-    "environment_binary": list(range(16, 20)),
-    "full_binary":        list(range(0, 20)),
-}
-
-
-# ---------------------------------------------------------------------------
-# Helpers (copied from train_sklearn_classifiers.py)
-# ---------------------------------------------------------------------------
-
-def _make_derived(y: np.ndarray) -> np.ndarray:
-    c = lambda i: y[:, i].astype(bool)
-    return np.stack([
-        ( c(2) & ~c(0) & ~c(1)).astype(np.int64),
-        ( c(2) &  (c(0) | c(1))).astype(np.int64),
-        ( c(0) &  (c(5) | c(6))).astype(np.int64),
-        ( c(1) &  (c(5) | c(6))).astype(np.int64),
-        (c(10) &   c(11)).astype(np.int64),
-    ], axis=1)
-
-
-def apply_label_set(labels_20: np.ndarray, label_set: str):
-    """Apply column selection and pure-source row filtering.
-
-    Returns (labels_sub, row_mask). For non-pure label sets row_mask is all-True.
-    """
-    n        = len(labels_20)
-    row_mask = np.ones(n, dtype=bool)
-
-    if label_set == "derived":
-        return _make_derived(labels_20), row_mask
-
-    if label_set == "classical_pure":
-        fri_frii = labels_20[:, 0:2]
-        rest     = labels_20[:, 2:5]
-        row_mask = (fri_frii.sum(axis=1) == 1) & (rest.sum(axis=1) == 0)
-
-    elif label_set == "initial_pure":
-        initial  = labels_20[:, 0:5]
-        row_mask = initial.sum(axis=1) == 1
-
-    elif label_set == "morphology_pure":
-        morph    = labels_20[:, 5:16]
-        row_mask = morph.sum(axis=1) == 1
-
-    _base      = label_set[:-7] if label_set.endswith('_binary') else label_set
-    cols       = LABEL_SETS[_base]
-    labels_sub = labels_20[row_mask][:, cols]
-    return labels_sub.astype(np.int64), row_mask
+from suplat.label_sets import (
+    ALL_CLASS_NAMES, DERIVED_CLASS_NAMES, LABEL_SETS,
+    make_derived as _make_derived, apply_label_set,
+)
 
 
 def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
@@ -134,9 +54,13 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
             "auc_macro":     auc_macro,
             "accuracy":      float(accuracy_score(y_true, y_pred)),
             "recall_macro":  float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-            "f1_per_class":  f1_score(y_true, y_pred, average=None, zero_division=0).tolist(),
-            "auc_per_class": aucs,
-            "class_names":   class_names,
+            "f1_per_class":       f1_score(y_true, y_pred, average=None, zero_division=0).tolist(),
+            "recall_per_class":   recall_score(y_true, y_pred, average=None, zero_division=0).tolist(),
+            "accuracy_per_class": [float(accuracy_score((y_true == c).astype(int),
+                                                        (y_pred == c).astype(int)))
+                                   for c in range(n)],
+            "auc_per_class":      aucs,
+            "class_names":        class_names,
         }
     else:
         # Multi-label: y_true and y_pred are 2-D multi-hot arrays.
@@ -148,13 +72,15 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
                 aucs.append(float(roc_auc_score(y_true[:, i], y_prob[:, i])))
         _acc = float((y_true == y_pred).mean()) if is_binary else float(accuracy_score(y_true, y_pred))
         return {
-            "f1_macro":      float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-            "auc_macro":     float(np.nanmean([a for a in aucs if a is not None])),
-            "accuracy":      _acc,
-            "recall_macro":  float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-            "f1_per_class":  f1_score(y_true, y_pred, average=None, zero_division=0).tolist(),
-            "auc_per_class": aucs,
-            "class_names":   class_names,
+            "f1_macro":           float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+            "auc_macro":          float(np.nanmean([a for a in aucs if a is not None])),
+            "accuracy":           _acc,
+            "recall_macro":       float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+            "f1_per_class":       f1_score(y_true, y_pred, average=None, zero_division=0).tolist(),
+            "recall_per_class":   recall_score(y_true, y_pred, average=None, zero_division=0).tolist(),
+            "accuracy_per_class": (y_true == y_pred).mean(axis=0).tolist(),
+            "auc_per_class":      aucs,
+            "class_names":        class_names,
         }
 
 
@@ -178,7 +104,7 @@ def _fit_and_eval(clf, X_train, y_train, X_test, y_test, class_names,
         y_pred = clf.predict(X_test)
         y_prob = clf.predict_proba(X_test)
     return evaluate_metrics(y_test, y_pred, y_prob, class_names,
-                            is_binary=label_set.endswith('_binary')), y_pred, y_prob
+                            is_binary=label_set.endswith('_individual')), y_pred, y_prob
 
 
 
@@ -240,7 +166,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                 n_estimators: int, n_neighbors: int, lr_C: float,
                 seed: int, force: bool,
                 class_weight_mode: str = None, class_weight_strength: float = 0.0,
-                data_seed: int = None):
+                data_seed: int = None, cv_fold: int = None):
     """Train RF, KNN, and LR for one run directory.
 
     Returns a result dict with keys rf/knn/lr (each with f1_macro, auc_macro, accuracy),
@@ -251,7 +177,9 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                         else _cw_base if class_weight_strength == 1.0
                         else f"{_cw_base}{class_weight_strength}")
     _eff_data_seed   = data_seed if data_seed is not None else seed
-    clf_dir          = run_dir / f"data_seed_{_eff_data_seed}" / f"training_seed_{seed}" / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
+    _seed_dir        = run_dir / f"data_seed_{_eff_data_seed}" / f"training_seed_{seed}"
+    _fold_dir        = _seed_dir / f"cross_val_{cv_fold}" if cv_fold is not None else _seed_dir
+    clf_dir          = _fold_dir / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
     rf_path          = clf_dir / f"rf_{feature_type}.json"
     knn_path         = clf_dir / f"knn_{feature_type}.json"
     lr_path          = clf_dir / f"lr_{feature_type}.json"
@@ -286,10 +214,16 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         if (_search / "data_splits").is_dir():
             break
         _search = _search.parent
-    splits_dir = _search / "data_splits" / str(data_seed if data_seed is not None else seed)
-    feat_dir   = run_dir / f"data_seed_{_eff_data_seed}" / f"training_seed_{seed}" / "data" / "byol"
+    _splits_base = _search / "data_splits" / str(data_seed if data_seed is not None else seed)
+    splits_dir = _splits_base / f"cross_val_{cv_fold}" if cv_fold is not None else _splits_base
+    feat_dir   = _fold_dir / "data" / "byol"
     _f_m  = re.search(r'_f([\d.]+)', run_dir.name)
-    _f_tag = f"_f{_f_m.group(1)}" if _f_m else ""
+    if _f_m:
+        _f_val = float(_f_m.group(1))
+        _f_str = str(int(_f_val)) if _f_val == int(_f_val) else str(_f_val)
+        _f_tag = f"_f{_f_str}"
+    else:
+        _f_tag = ""
 
     # ── Load features ────────────────────────────────────────────────────────
     train_feat_path = feat_dir / f"labelled_train_{feature_type}.npy"
@@ -370,7 +304,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     if label_set == "derived":
         class_names = DERIVED_CLASS_NAMES
     else:
-        _base_ls    = label_set[:-7] if label_set.endswith('_binary') else label_set
+        _base_ls    = label_set[:-11] if label_set.endswith('_individual') else label_set
         class_names = [ALL_CLASS_NAMES[i] for i in LABEL_SETS[_base_ls]]
 
     print(f"    train={len(X_train)}  test={len(X_test)}  "
@@ -414,7 +348,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                 class_weight_mode,
                 class_weight_strength,
             )                                           # (20,)
-            _label_cols = LABEL_SETS[label_set[:-7] if label_set.endswith('_binary') else label_set]  # list of int indices
+            _label_cols = LABEL_SETS[label_set[:-11] if label_set.endswith('_individual') else label_set]  # list of int indices
             _alpha_arr  = _alpha_full[_label_cols]      # (n_classes,)
             # y_train_raw: (N_train, n_classes), already filtered to label_set columns
             _row_sums = y_train_raw.sum(axis=1)         # positives per sample
@@ -599,7 +533,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                     "f1":       float(f1_score(_yt_fit, _yp, average="macro",
                                                zero_division=0)),
                     "auc":      _auc,
-                    "accuracy": (float((_yt_fit == _yp).mean()) if label_set.endswith('_binary')
+                    "accuracy": (float((_yt_fit == _yp).mean()) if label_set.endswith('_individual')
                                  else float(accuracy_score(_yt_fit, _yp))),
                     "recall":   float(recall_score(_yt_fit, _yp, average="macro",
                                                    zero_division=0)),
@@ -642,12 +576,12 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
 # ---------------------------------------------------------------------------
 
 def _worker(args):
-    run_dir, feature_type, label_set, n_estimators, n_neighbors, lr_C, seed, force, cw_mode, cw_strength, data_seed = args
+    run_dir, feature_type, label_set, n_estimators, n_neighbors, lr_C, seed, force, cw_mode, cw_strength, data_seed, cv_fold = args
     try:
         return process_run(run_dir, feature_type, label_set,
                            n_estimators, n_neighbors, lr_C, seed, force,
                            class_weight_mode=cw_mode, class_weight_strength=cw_strength,
-                           data_seed=data_seed)
+                           data_seed=data_seed, cv_fold=cv_fold)
     except Exception as exc:
         import traceback
         print(f"  ERROR in {run_dir.name}: {exc}", file=sys.stderr, flush=True)
@@ -672,7 +606,7 @@ def main():
                         help="Feature vectors to use (default: projections).")
     parser.add_argument("--label-set",    default="classical_pure",
                         help="Classification scheme (default: classical_pure). "
-                             "Append '_binary' for element-wise accuracy (e.g. initial_binary).")
+                             "Append '_individual' for element-wise accuracy (e.g. initial_individual).")
     parser.add_argument("--n-estimators", type=int, default=200,
                         help="Number of RF trees (default: 200).")
     parser.add_argument("--n-neighbors",  type=int, default=15,
@@ -690,9 +624,9 @@ def main():
     parser.add_argument("--class-weight-mode", type=str, default=None,
                         choices=["score", "initial", "initial_pure", "morphology", "morphology_pure",
                                  "environment", "environment_pure", "classical", "classical_pure",
-                                 "all", "all_pure", "full", "None"],
+                                 "full", "full_pure", "None"],
                         help="Upweight rare samples: 'score' (interest tier 1-4) or a label-set name. "
-                             "'full' is a synonym for 'all'. Pass 'None' or omit to use uniform weights. "
+                             "Pass 'None' or omit to use uniform weights. "
                              "Label-set modes (e.g. initial, morphology) require a pure label set — "
                              "each training sample must have exactly one positive in the selected columns. "
                              "Pass a *_pure label_set (e.g. initial_pure). "
@@ -701,18 +635,19 @@ def main():
     parser.add_argument("--class-weight-strength", type=float, default=0.0,
                         help="Magnitude of class upweighting (0=uniform, default). "
                              "w = clip(1 + strength*(raw_norm - 1), min=0).")
+    parser.add_argument("--cv-fold", type=int, default=None,
+                        help="Cross-validation fold index (0-based). When set, looks for features "
+                             "and results in training_seed_N/cross_val_K/ instead of training_seed_N/.")
     args = parser.parse_args()
 
-    # Validate label_set (allow _binary suffix on any known base label set)
-    _ls_base = args.label_set[:-7] if args.label_set.endswith('_binary') else args.label_set
+    # Validate label_set (allow _individual suffix on any known base label set)
+    _ls_base = args.label_set[:-11] if args.label_set.endswith('_individual') else args.label_set
     if _ls_base not in LABEL_SETS:
         parser.error(f"Unknown label set: {args.label_set!r}")
 
-    # Normalise synonyms: "None" → None, "full" → "all"
+    # Normalise synonyms: "None" → None
     if args.class_weight_mode in ("None", "none"):
         args.class_weight_mode = None
-    elif args.class_weight_mode == "full":
-        args.class_weight_mode = "all"
 
     outputs_root = Path(args.outputs_root)
 
@@ -729,7 +664,7 @@ def main():
     worker_args = [
         (rd, args.feature_type, args.label_set, args.n_estimators,
          args.n_neighbors, args.lr_c, args.seed, args.force,
-         args.class_weight_mode, args.class_weight_strength, args.data_seed)
+         args.class_weight_mode, args.class_weight_strength, args.data_seed, args.cv_fold)
         for rd in run_dirs
     ]
 

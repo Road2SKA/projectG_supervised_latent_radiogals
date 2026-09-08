@@ -1,32 +1,12 @@
 import numpy as np
 
-LABEL_COLS = [
-    "fri", "frii", "hybrid", "spiral", "relaxed",
-    "cshaped", "sshaped", "misaligned", "wings", "xshaped",
-    "straight", "multihotspots", "continuous", "banding", "onesided",
-    "restarted", "cluster", "merger", "diffuse", "unknown",
-]
+from suplat.label_sets import LABEL_COLS, LABEL_SETS
 
 SCORE_4 = ["xshaped", "unknown", "cluster", "merger"]
 SCORE_3 = ["diffuse", "sshaped", "spiral"]
 SCORE_2 = ["restarted", "onesided", "banding", "cshaped", "wings", "misaligned", "multihotspots", "relaxed"]
 SCORE_1 = ["fri", "frii", "hybrid", "straight", "continuous"]
 TIERS   = [(4, SCORE_4), (3, SCORE_3), (2, SCORE_2), (1, SCORE_1)]
-
-LABEL_SETS = {
-    "classical":        ["fri", "frii"],
-    "classical_pure":   ["fri", "frii"],
-    "initial":          ["fri", "frii", "hybrid", "spiral", "relaxed"],
-    "initial_pure":     ["fri", "frii", "hybrid", "spiral", "relaxed"],
-    "morphology":       ["cshaped", "sshaped", "misaligned", "wings", "xshaped",
-                         "straight", "multihotspots", "continuous", "banding", "onesided", "restarted"],
-    "morphology_pure":  ["cshaped", "sshaped", "misaligned", "wings", "xshaped",
-                         "straight", "multihotspots", "continuous", "banding", "onesided", "restarted"],
-    "environment":      ["cluster", "merger", "diffuse", "unknown"],
-    "environment_pure": ["cluster", "merger", "diffuse", "unknown"],
-    "all":              LABEL_COLS,
-    "all_pure":         LABEL_COLS,
-}
 
 _LABEL_COL_IDX = {c: i for i, c in enumerate(LABEL_COLS)}
 
@@ -65,7 +45,7 @@ def compute_class_weights(labels, mode, strength):
             f"Valid: {sorted(_VALID_MODES - {'score'})}"
         )
 
-    ci = [_LABEL_COL_IDX[c] for c in LABEL_SETS[mode]]
+    ci = LABEL_SETS[mode]
     n_c = labels[:, ci].sum(axis=0).astype(np.float32)   # positive counts per class
     mean_n = n_c.mean()
     alpha = np.zeros(20, dtype=np.float32)
@@ -111,8 +91,7 @@ def compute_sample_weights(labels, mode, strength):
         return w
 
     # Label-set mode: requires a pure label set (exactly one positive per row in the set)
-    cols = LABEL_SETS[mode]
-    ci = [_LABEL_COL_IDX[c] for c in cols]
+    ci = LABEL_SETS[mode]
     Y_sub = labels[:, ci]
     row_sums = Y_sub.sum(axis=1)
     if not np.all(row_sums == 1):

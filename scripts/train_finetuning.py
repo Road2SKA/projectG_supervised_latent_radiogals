@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from suplat.utils.class_weights import compute_class_weights
 from suplat.data.augmentations import get_augmentation
 from suplat.data.data_samplers import ImagesAndLabelsDataset
+from suplat.label_sets import LABEL_SETS, make_derived as _make_derived, apply_label_set
 from suplat.models.byol_models import (
     BYOLEfficientNetB0,
     BYOLPretrainedBackbone,
@@ -39,53 +40,6 @@ from suplat.models.byol_models import (
     create_resnet18_backbone,
     create_resnet50_backbone,
 )
-
-LABEL_SETS = {
-    "classical":       [0, 1],
-    "classical_pure":  [0, 1],
-    "initial":         list(range(0, 5)),
-    "initial_pure":    list(range(0, 5)),
-    "morphology":      list(range(5, 16)),
-    "morphology_pure": list(range(5, 16)),
-    "environment":     list(range(16, 20)),
-    "derived":         None,
-    "full":            list(range(0, 20)),
-}
-
-
-def _make_derived(y: np.ndarray) -> np.ndarray:
-    c = lambda i: y[:, i].astype(bool)
-    return np.stack([
-        ( c(2) & ~c(0) & ~c(1)).astype(np.int64),
-        ( c(2) &  (c(0) | c(1))).astype(np.int64),
-        ( c(0) &  (c(5) | c(6))).astype(np.int64),
-        ( c(1) &  (c(5) | c(6))).astype(np.int64),
-        (c(10) &   c(11)).astype(np.int64),
-    ], axis=1)
-
-
-def apply_label_set(labels_20: np.ndarray, label_set: str):
-    n        = len(labels_20)
-    row_mask = np.ones(n, dtype=bool)
-
-    if label_set == "derived":
-        return _make_derived(labels_20), row_mask
-
-    if label_set == "classical_pure":
-        fri_frii = labels_20[:, 0:2]
-        rest     = labels_20[:, 2:5]
-        row_mask = (fri_frii.sum(axis=1) == 1) & (rest.sum(axis=1) == 0)
-    elif label_set == "initial_pure":
-        initial  = labels_20[:, 0:5]
-        row_mask = initial.sum(axis=1) == 1
-    elif label_set == "morphology_pure":
-        morph    = labels_20[:, 5:16]
-        row_mask = morph.sum(axis=1) == 1
-
-    _base      = label_set[:-7] if label_set.endswith('_binary') else label_set
-    cols       = LABEL_SETS[_base]
-    labels_sub = labels_20[row_mask][:, cols]
-    return labels_sub.astype(np.int64), row_mask
 
 
 TRAINING_MODE_DESCRIPTIONS = {
@@ -156,10 +110,10 @@ def parse_args():
     ap.add_argument(
         "--n-runs", "--n-models",
         type=positive_int,
-        default=10,
+        default=1,
         dest="n_runs",
         help="Number of training runs with different initialisations. "
-             "Run i uses seed DATA_SEED + (i-1). Default: 10.",
+             "Run i uses seed DATA_SEED + (i-1). Default: 1.",
     )
     # Data and run configuration
     ap.add_argument(
@@ -206,7 +160,7 @@ def parse_args():
         type=str,
         default=None,
         choices=["score", "initial", "initial_pure", "morphology", "morphology_pure",
-                 "environment", "environment_pure", "classical", "classical_pure", "all", "all_pure"],
+                 "environment", "environment_pure", "classical", "classical_pure", "full", "full_pure"],
         help="Upweight rare samples in training loss: 'score' (interest tier 1-4) or "
              "a label-set name (inverse frequency). Default: None (uniform).",
     )
@@ -252,7 +206,7 @@ def parse_args():
         type=str,
         default="full",
         help="Classification scheme / label subset to train on (default: full). "
-             "Append '_binary' for element-wise accuracy (e.g. full_binary).",
+             "Append '_individual' for element-wise accuracy (e.g. full_individual).",
     )
     ap.add_argument(
         "--force",
@@ -260,9 +214,16 @@ def parse_args():
         default=False,
         help="Re-run even if results already exist.",
     )
+    ap.add_argument(
+        "--cv-fold",
+        type=int,
+        default=None,
+        help="Cross-validation fold index (0-based). When set, appends cross_val_K to "
+             "--model-path and loads the fold's train/test indices from data_splits/.",
+    )
 
     _args = ap.parse_args()
-    _ls_base = _args.label_set[:-7] if _args.label_set.endswith('_binary') else _args.label_set
+    _ls_base = _args.label_set[:-11] if _args.label_set.endswith('_individual') else _args.label_set
     if _ls_base not in LABEL_SETS:
         ap.error(f"Unknown label set: {_args.label_set!r}")
     return _args
@@ -323,6 +284,10 @@ class BYOLFineTuner(nn.Module):
 
 args = parse_args()
 
+CV_FOLD = args.cv_fold
+if CV_FOLD is not None:
+    args.model_path = args.model_path / f"cross_val_{CV_FOLD}"
+
 BYOL_PATH = args.model_path / "byol_model_best.pt"
 LABEL_SET = args.label_set
 _cw_base = f'cw{args.class_weight_mode}' if args.class_weight_mode else 'cwNone'
@@ -356,7 +321,19 @@ N_RUNS = args.n_runs
 TRAIN_RATIO, TEST_RATIO = 0.70, 0.30
 
 all_idx = np.arange(len(images))
-train_idx, test_idx = train_test_split(all_idx, test_size=TEST_RATIO, random_state=DATA_SEED)
+if CV_FOLD is not None:
+    # Load fold-specific indices saved by train_byol.py --cross-val
+    _search = args.model_path.parent
+    for _ in range(6):
+        if (_search / "data_splits").is_dir():
+            break
+        _search = _search.parent
+    _cv_splits_dir = _search / "data_splits" / str(DATA_SEED) / f"cross_val_{CV_FOLD}"
+    train_idx = np.load(_cv_splits_dir / "train_idx.npy")
+    test_idx  = np.load(_cv_splits_dir / "test_idx.npy")
+    print(f"CV fold {CV_FOLD}: loaded indices from {_cv_splits_dir}")
+else:
+    train_idx, test_idx = train_test_split(all_idx, test_size=TEST_RATIO, random_state=DATA_SEED)
 train_images, train_labels = images[train_idx], labels[train_idx]
 test_images  = images[test_idx]
 test_labels  = labels[test_idx]
@@ -423,7 +400,7 @@ def _make_labeled_loader(f_label, seed):
     _lab_labs = train_labels[_mask]
     _alpha = compute_class_weights(
         _train_labels_full_20[_mask], args.class_weight_mode, args.class_weight_strength)
-    _cols = LABEL_SETS[LABEL_SET[:-7] if LABEL_SET.endswith('_binary') else LABEL_SET]
+    _cols = LABEL_SETS[LABEL_SET[:-11] if LABEL_SET.endswith('_individual') else LABEL_SET]
     _alpha = _alpha[_cols] if _cols is not None else np.ones(train_labels.shape[1], dtype=np.float32)
     _alpha_t   = torch.tensor(_alpha, dtype=torch.float32)
     _alpha_sum = float(_alpha_t.sum().clamp(min=1e-6))
@@ -714,8 +691,8 @@ for model_idx in range(N_RUNS):
     run_number = model_idx + 1
     print(f"Starting run {run_number}/{N_RUNS}")
 
-    run_dir = OUTPUT_DIR / f'run{run_number}' if N_RUNS > 1 else OUTPUT_DIR
-    run_dir.mkdir(exist_ok=True)
+    run_dir = OUTPUT_DIR / "frac_1.00" / f'run{run_number}' if N_RUNS > 1 else OUTPUT_DIR / "frac_1.00"
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     if (run_dir / 'test_probs.npy').exists() and not args.force:
         print(f"Run {run_number}/{N_RUNS}: cached — skipping (use --force to rerun).")

@@ -28,13 +28,12 @@ class BYOLSupDataset(Dataset):
                  transform=None,
                  friend_transform=None,
                  weightfunc=weights_closest,
-                 p_pair_from_class=0.5):
+):
         self.all_labels = tags_data
         self.img_data = img_data
         self.transform = transform
         self.friend_transform = friend_transform
         self.weightfunc = weightfunc
-        self.p_pair_from_class = p_pair_from_class
         self.sample_weights = None  # set externally after construction to enable per-sample loss weighting
         # build the distance matrix once for efficiency
         self.label_distances = cdist(self.all_labels.values, self.all_labels.values, metric="cityblock")
@@ -83,7 +82,7 @@ class UnlabelledBYOLDataset(Dataset):
         img = self.img_data[idx]
         img = torch.from_numpy(img).unsqueeze(0).float()
         img_aug = self.transform(img) if self.transform else img.clone()
-        return img, img_aug, torch.zeros_like(img), 0.0
+        return img, img_aug, None, 0.0
 
 
 class ImagesAndLabelsDataset(Dataset):
