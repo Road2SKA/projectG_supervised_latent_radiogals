@@ -1,6 +1,6 @@
 import numpy as np
 
-from suplat.label_sets import LABEL_COLS, LABEL_SETS
+from suplat.data.label_sets import LABEL_COLS, LABEL_SETS
 
 SCORE_4 = ["xshaped", "unknown", "cluster", "merger"]
 SCORE_3 = ["diffuse", "sshaped", "spiral"]

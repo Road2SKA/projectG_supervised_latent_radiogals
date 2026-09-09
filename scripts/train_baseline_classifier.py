@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_class_weights
 from suplat.data.augmentations import get_augmentation
 from suplat.models.byol_models import create_efficientnet_b0_backbone
-from suplat.label_sets import ALL_CLASS_NAMES, DERIVED_CLASS_NAMES, LABEL_SETS, make_derived as _make_derived
+from suplat.data.label_sets import ALL_CLASS_NAMES, DERIVED_CLASS_NAMES, LABEL_SETS, make_derived as _make_derived
 
 # "pure" is a local alias used only by this script's train-set filtering logic
 LABEL_SETS = {**LABEL_SETS, "pure": list(range(0, 20))}

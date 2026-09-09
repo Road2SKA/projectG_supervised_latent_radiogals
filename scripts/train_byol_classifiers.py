@@ -20,15 +20,19 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.gaussian_process.kernels import RBF
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
 from sklearn.multioutput import MultiOutputClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler, label_binarize
 
+_MAX_GP_TRAIN = 3000   # skip GP when n_train exceeds this (cubic cost)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_class_weights, compute_sample_weights
-from suplat.label_sets import (
+from suplat.data.label_sets import (
     ALL_CLASS_NAMES, DERIVED_CLASS_NAMES, LABEL_SETS,
     make_derived as _make_derived, apply_label_set,
 )
@@ -167,9 +171,9 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                 seed: int, force: bool,
                 class_weight_mode: str = None, class_weight_strength: float = 0.0,
                 data_seed: int = None, cv_fold: int = None):
-    """Train RF, KNN, and LR for one run directory.
+    """Train RF, KNN, LR, and GP for one run directory.
 
-    Returns a result dict with keys rf/knn/lr (each with f1_macro, auc_macro, accuracy),
+    Returns a result dict with keys rf/knn/lr/gp (each with f1_macro, auc_macro, accuracy),
     or a failure dict (with key 'error' and 'detail').
     """
     _cw_base         = f"cw{class_weight_mode}" if class_weight_mode else "cwNone"
@@ -183,17 +187,19 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     rf_path          = clf_dir / f"rf_{feature_type}.json"
     knn_path         = clf_dir / f"knn_{feature_type}.json"
     lr_path          = clf_dir / f"lr_{feature_type}.json"
+    gp_path          = clf_dir / f"gp_{feature_type}.json"
     _frac_cache_path    = clf_dir / "label_fraction_metrics.json"
     _need_ip_frac       = not label_set.endswith("_pure")
     _frac_ip_cache_path = clf_dir / "label_fraction_metrics_initial_pure_eval.json"
 
     all_cached = (rf_path.exists() and knn_path.exists() and lr_path.exists()
+                  and gp_path.exists()
                   and _frac_cache_path.exists()
                   and (not _need_ip_frac or _frac_ip_cache_path.exists()))
     if all_cached and not force:
         print(f"  [{run_dir.name}] skipping (all cached — use --force to rerun)", flush=True)
         out = dict(name=run_dir.name)
-        for key, path in [("rf", rf_path), ("knn", knn_path), ("lr", lr_path)]:
+        for key, path in [("rf", rf_path), ("knn", knn_path), ("lr", lr_path), ("gp", gp_path)]:
             with open(path) as fh:
                 saved = json.load(fh)
             out[key] = {
@@ -399,6 +405,10 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
          if is_multiclass else
          MultiOutputClassifier(LogisticRegression(max_iter=1000, C=lr_C,
                                                   random_state=seed))),
+        ("gp",  gp_path,
+         GaussianProcessClassifier(kernel=RBF(1.0), multi_class="one_vs_rest", random_state=seed)
+         if is_multiclass else
+         MultiOutputClassifier(GaussianProcessClassifier(kernel=RBF(1.0), random_state=seed))),
     ]
 
     for clf_name, path, clf in _specs:
@@ -415,8 +425,11 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
             continue
 
         is_mo = not is_multiclass
-        # KNN does not support sample_weight; RF and LR do
-        sw = None if clf_name == "knn" else sample_weights
+        # KNN and GP do not support sample_weight; RF and LR do
+        sw = None if clf_name in ("knn", "gp") else sample_weights
+        if clf_name == "gp" and len(X_train) > _MAX_GP_TRAIN:
+            print(f"    GP: skipping (n_train={len(X_train)} > {_MAX_GP_TRAIN})", flush=True)
+            continue
         metrics, y_pred_test, y_prob_test = _fit_and_eval(
             clf, X_train, y_train, X_test, y_test,
             class_names, label_set, is_multi_output=is_mo, sample_weight=sw)
@@ -456,10 +469,18 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     # ── Label-fraction sweep (all label sets except "derived") ───────────────
     _do_frac_sweep = label_set != "derived"
     _do_ip_frac    = _need_ip_frac and (not _frac_ip_cache_path.exists() or force)
-    if _do_frac_sweep and (not _frac_cache_path.exists() or _do_ip_frac or force):
+    # Re-run sweep if GP is absent from the existing cache (e.g. newly added classifier)
+    _frac_gp_missing = False
+    if _frac_cache_path.exists() and not force:
+        with open(_frac_cache_path) as _fh_gp:
+            _existing_frac = json.load(_fh_gp)
+        _frac_gp_missing = not any("GP" in v for v in _existing_frac.values())
+    if _do_frac_sweep and (not _frac_cache_path.exists() or _do_ip_frac or force or _frac_gp_missing):
         _FRACS = [0.01, 0.05, 0.10, 0.25, 0.50, 1.0]
         _rng   = np.random.default_rng(seed)
-        _frac_out: dict    = {}
+        # Seed from existing cache when only adding missing classifiers (e.g. GP)
+        _frac_out: dict = ({str(_f): dict(v) for _f, v in _existing_frac.items()}
+                           if _frac_gp_missing and not force else {})
         # Pre-initialise all fraction keys so the notebook's exact-key check always passes
         _frac_ip_out: dict = {str(_frac): {} for _frac in _FRACS}
         for _frac in _FRACS:
@@ -485,12 +506,20 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
                                                 metric="euclidean", n_jobs=-1)),
                 ("RF",     RandomForestClassifier(n_estimators=50,
                                                   random_state=seed, n_jobs=-1)),
+                ("GP",     GaussianProcessClassifier(kernel=RBF(1.0),
+                                                     multi_class="one_vs_rest",
+                                                     random_state=seed)),
             ]:
                 if len(_Xf_fit) == 0:
                     continue
+                if _cname == "GP" and len(_Xf_fit) > _MAX_GP_TRAIN:
+                    continue
+                # Skip classifiers already present in the seeded cache
+                if _cname in _frac_out.get(str(_frac), {}):
+                    continue
                 _clf_frac = (MultiOutputClassifier(_clf_base) if not is_multiclass
                              else _clf_base)
-                _fit_sw = None if _cname == "KNN" else _sw_frac
+                _fit_sw = None if _cname in ("KNN", "GP") else _sw_frac
                 try:
                     if _fit_sw is not None:
                         _clf_frac.fit(_Xf_fit, _yf_fit, sample_weight=_fit_sw)
@@ -686,6 +715,7 @@ def main():
                 r.get("rf",  {}).get("f1_macro", -1.0),
                 r.get("knn", {}).get("f1_macro", -1.0),
                 r.get("lr",  {}).get("f1_macro", -1.0),
+                r.get("gp",  {}).get("f1_macro", -1.0),
             ),
             reverse=True,
         )
@@ -695,15 +725,19 @@ def main():
             ("RF",  "rf",  "f1_macro"),
             ("KNN", "knn", "f1_macro"),
             ("LR",  "lr",  "f1_macro"),
+            ("GP",  "gp",  "f1_macro"),
             ("RF",  "rf",  "auc_macro"),
             ("KNN", "knn", "auc_macro"),
             ("LR",  "lr",  "auc_macro"),
+            ("GP",  "gp",  "auc_macro"),
             ("RF",  "rf",  "accuracy"),
             ("KNN", "knn", "accuracy"),
             ("LR",  "lr",  "accuracy"),
+            ("GP",  "gp",  "accuracy"),
             ("RF",  "rf",  "recall_macro"),
             ("KNN", "knn", "recall_macro"),
             ("LR",  "lr",  "recall_macro"),
+            ("GP",  "gp",  "recall_macro"),
         ]
         _short = {"f1_macro": "F1", "auc_macro": "AUC",
                   "accuracy": "Acc", "recall_macro": "Rec"}
@@ -730,7 +764,7 @@ def main():
         ) + f"  {'Run':<{w}}"
         sep = "=" * len(hdr)
         print(f"\n{sep}")
-        print(f"RF / KNN / LR ({args.label_set} / {args.feature_type}) — ranked by best F1-macro")
+        print(f"RF / KNN / LR / GP ({args.label_set} / {args.feature_type}) — ranked by best F1-macro")
         print(sep)
         print(hdr)
         print("-" * len(hdr))
@@ -744,7 +778,8 @@ def main():
     if results:
         print_statistical_summary(
             results,
-            title=f"RF / KNN / LR ({args.label_set} / {args.feature_type})",
+            clfs=("rf", "knn", "lr", "gp"),
+            title=f"RF / KNN / LR / GP ({args.label_set} / {args.feature_type})",
         )
 
     # ── initial_pure summary (when not training on a pure label set) ──────────

@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from suplat.utils.class_weights import compute_class_weights
 from suplat.data.augmentations import get_augmentation
 from suplat.data.data_samplers import ImagesAndLabelsDataset
-from suplat.label_sets import LABEL_SETS, make_derived as _make_derived, apply_label_set
+from suplat.data.label_sets import LABEL_SETS, make_derived as _make_derived, apply_label_set
 from suplat.models.byol_models import (
     BYOLEfficientNetB0,
     BYOLPretrainedBackbone,
