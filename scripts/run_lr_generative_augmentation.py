@@ -1,5 +1,5 @@
 """
-train_byol_lr_gen_aug.py
+run_lr_generative_augmentation.py
 
 Train a logistic regression on top of frozen BYOL projections augmented with
 generated images, sweeping over gen_frac values.
@@ -21,7 +21,7 @@ Output layout (compatible with the gen-aug notebook cell):
     frac_2.00/run{i}/...
 
 Usage:
-  python scripts/train_byol_lr_gen_aug.py \\
+  python scripts/run_lr_generative_augmentation.py \\
     --byol_run_dir outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.05_f1/seed2 \\
     --gen_dir      outputs/generative/run_xxx \\
     --data_dir     outputs/data \\
@@ -55,7 +55,7 @@ from suplat.models.byol_models import (
 from suplat.models.generative_models import FlowMatchingUNet
 
 
-# ── Label-set definitions (shared with train_byol_classifiers.py) ────────────
+# ── Label-set definitions (shared with run_downstream_classifiers.py) ────────────
 
 ALL_CLASS_NAMES = [
     'FRI', 'FRII', 'Hybrids', 'Spirals', 'Relaxed doubles',

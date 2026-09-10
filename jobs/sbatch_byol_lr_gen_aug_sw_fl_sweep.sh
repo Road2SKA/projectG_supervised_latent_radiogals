@@ -72,7 +72,7 @@ for SW in "${SW_VALS[@]}"; do
 
             echo "  label_set=${LS}  cw_tag=${CW_TAG}  → ${OUT_DIR}"
 
-            python scripts/train_byol_lr_gen_aug.py \
+            python scripts/run_lr_generative_augmentation.py \
                 --byol_run_dir  "${BYOL_RUN_DIR}" \
                 --gen_dir       "${GEN_DIR}" \
                 --gen_variant   "${GEN_VARIANT}" \

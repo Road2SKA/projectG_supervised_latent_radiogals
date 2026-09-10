@@ -38,7 +38,7 @@ echo "run=${RUN_NAME}  data_seed=2  training_seed=2"
 
 for FOLD in 0 1 2 3 4; do
     echo "--- fold ${FOLD} ---"
-    python scripts/train_byol_classifiers.py \
+    python scripts/run_downstream_classifiers.py \
         --outputs-root outputs/byol_runs/byol_runs \
         --run-glob     "${RUN_NAME}" \
         --feature-type projections \

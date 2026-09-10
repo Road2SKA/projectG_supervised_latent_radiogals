@@ -131,7 +131,7 @@ def build_row(run_dir: Path) -> dict:
             row[col] = None
 
     # ── protege summary ───────────────────────────────────────────────────
-    # train_byol_proteges.py saves to data/protege/protege_summary_proj_nopca.json (key: test_auc)
+    # run_protege_scoring.py saves to data/protege/protege_summary_proj_nopca.json (key: test_auc)
     # Legacy path: protege/protege_summary.json (key: auc)
     protege_path = run_dir / 'data' / 'protege' / 'protege_summary_proj_nopca.json'
     if not protege_path.exists():

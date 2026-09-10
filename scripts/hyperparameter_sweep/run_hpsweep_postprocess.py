@@ -2,7 +2,7 @@
 run_hpsweep_postprocess.py — Post-processing for a single hyperparameter sweep run.
 
 For an already-trained run directory:
-  1. Runs Protege GP on projections (calls process_run from train_byol_proteges.py).
+  1. Runs Protege GP on projections (calls process_run from run_protege_scoring.py).
   2. Writes status.json to signal completion.
   3. Updates data/row.json via collate_hpsweep.py --mode row.
 
@@ -27,8 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Import process_run functions from existing scripts (bypasses their regex glob filters)
-from train_byol_proteges import process_run as protege_run, CSV_PATH, LABELS_PATH
-from train_byol_classifiers import process_run as clf_run
+from run_protege_scoring import process_run as protege_run, CSV_PATH, LABELS_PATH
+from run_downstream_classifiers import process_run as clf_run
 
 
 def main():

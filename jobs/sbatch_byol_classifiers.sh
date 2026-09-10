@@ -39,7 +39,7 @@ echo "Node: ${SLURMD_NODENAME:-local}  CPUs: ${SLURM_CPUS_PER_TASK:-8}"
 echo "Seed: ${SEED}"
 echo "Class weighting: ${CLASS_WEIGHT_MODE:-none}  strength=${CLASS_WEIGHT_STRENGTH}"
 
-python scripts/train_byol_classifiers.py \
+python scripts/run_downstream_classifiers.py \
     --outputs-root outputs/byol_runs \
     --run-glob     "pd128_*_f1" \
     --feature-type projections \

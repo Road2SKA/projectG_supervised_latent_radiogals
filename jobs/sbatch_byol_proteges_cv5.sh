@@ -45,7 +45,7 @@ for FOLD in 0 1 2 3 4; do
         continue
     fi
 
-    python scripts/train_byol_proteges.py \
+    python scripts/run_protege_scoring.py \
         --outputs-root outputs \
         --run-glob     "byol_runs/byol_runs/${RUN_NAME}" \
         --byol-seed    2 \

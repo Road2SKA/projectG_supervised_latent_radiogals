@@ -20,7 +20,7 @@ RUN_NAME="pd128_qext_v1_wd1e-3_lrconst_sw0.0_f0.1"
 echo "Starting BYOL classifiers (non-CV, initial_individual) — sw=0 f=0.1 — $(date)"
 echo "Node: ${SLURMD_NODENAME:-local}  CPUs: ${SLURM_CPUS_PER_TASK:-8}"
 
-python scripts/train_byol_classifiers.py \
+python scripts/run_downstream_classifiers.py \
     --outputs-root outputs/byol_runs/byol_runs \
     --run-glob     "${RUN_NAME}" \
     --feature-type projections \

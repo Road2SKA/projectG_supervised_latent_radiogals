@@ -42,7 +42,7 @@ echo "data_seed=${DATA_SEED}  training_seed=${SEED}"
 echo "Class weighting: ${CLASS_WEIGHT_MODE:-none}  strength=${CLASS_WEIGHT_STRENGTH}"
 
 for SW_GLOB in "pd128_*_sw0.05_f1" "pd128_*_sw0.1_f1"; do
-    python scripts/train_byol_classifiers.py \
+    python scripts/run_downstream_classifiers.py \
         --outputs-root outputs/byol_runs \
         --run-glob     "${SW_GLOB}" \
         --feature-type projections \

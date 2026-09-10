@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_class_weights, compute_sample_weights
 from suplat.data.label_sets import (
     ALL_CLASS_NAMES, DERIVED_CLASS_NAMES, LABEL_SETS,
+    INTEREST_TIER_CLASS_NAMES, INTEREST_BINARY_CLASS_NAMES,
     make_derived as _make_derived, apply_label_set,
 )
 
@@ -46,6 +47,9 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     if y_true.ndim == 1:
         # Multiclass (pure label sets): y_true and y_pred are 1-D argmax labels.
         y_true_bin = label_binarize(y_true, classes=list(range(n)))
+        # label_binarize returns (N, 1) for the binary case (n=2); expand to (N, 2).
+        if n == 2 and y_true_bin.shape[1] == 1:
+            y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
         aucs = []
         for i in range(n):
             if len(np.unique(y_true_bin[:, i])) < 2:
@@ -95,15 +99,33 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
 def _fit_and_eval(clf, X_train, y_train, X_test, y_test, class_names,
                   label_set, is_multi_output=False, sample_weight=None):
     """Fit clf and return evaluate_metrics result dict."""
-    if sample_weight is not None:
-        clf.fit(X_train, y_train, sample_weight=sample_weight)
+    _X_fit, _y_fit, _sw_fit = X_train, y_train, sample_weight
+    if is_multi_output and y_train.ndim == 2:
+        # In small CV folds some columns may be all-zero; LR raises "only one class".
+        # Add one synthetic positive row per constant column so the estimator can fit.
+        _const = [i for i in range(y_train.shape[1])
+                  if len(np.unique(y_train[:, i])) < 2]
+        if _const:
+            _x_aug = np.zeros((1, X_train.shape[1]), dtype=X_train.dtype)
+            _y_aug = np.zeros((1, y_train.shape[1]), dtype=y_train.dtype)
+            for _ci in _const:
+                _y_aug[0, _ci] = 1
+            _X_fit = np.vstack([X_train, _x_aug])
+            _y_fit = np.vstack([y_train, _y_aug])
+            if sample_weight is not None:
+                _sw_fit = np.append(sample_weight, float(np.mean(sample_weight)))
+    if _sw_fit is not None:
+        clf.fit(_X_fit, _y_fit, sample_weight=_sw_fit)
     else:
-        clf.fit(X_train, y_train)
+        clf.fit(_X_fit, _y_fit)
     if is_multi_output:
         y_pred = clf.predict(X_test)
-        y_prob = np.stack(
-            [est.predict_proba(X_test)[:, 1] for est in clf.estimators_], axis=1
-        )
+        _proba_cols = []
+        for _est in clf.estimators_:
+            _p = _est.predict_proba(X_test)
+            # predict_proba returns (N,1) when the estimator only saw one class in training
+            _proba_cols.append(_p[:, 1] if _p.shape[1] > 1 else np.zeros(len(X_test), dtype=_p.dtype))
+        y_prob = np.stack(_proba_cols, axis=1)
     else:
         y_pred = clf.predict(X_test)
         y_prob = clf.predict_proba(X_test)
@@ -130,6 +152,8 @@ def _do_ip_eval(out: dict, clf_dir: Path, feature_type: str, run_name: str,
         if not _prob_path.exists():
             continue
         _probs = np.load(_prob_path)   # (N_test, 20) for full label set
+        if _probs.shape[1] < 5:
+            continue   # binary/small label set — probs don't cover initial_pure classes
 
         # Determine initial_pure mask
         if y_test_full is not None and test_mask is not None:
@@ -309,6 +333,10 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
 
     if label_set == "derived":
         class_names = DERIVED_CLASS_NAMES
+    elif label_set == "interest_tier":
+        class_names = INTEREST_TIER_CLASS_NAMES
+    elif label_set == "interest_binary":
+        class_names = INTEREST_BINARY_CLASS_NAMES
     else:
         _base_ls    = label_set[:-11] if label_set.endswith('_individual') else label_set
         class_names = [ALL_CLASS_NAMES[i] for i in LABEL_SETS[_base_ls]]
@@ -348,7 +376,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         # → per-sample weight = mean alpha over each sample's positive classes.
         if (class_weight_mode is not None and class_weight_mode != "score"
                 and class_weight_strength > 0.0
-                and label_set != "derived"):
+                and label_set not in ("derived", "interest_tier", "interest_binary")):
             _alpha_full = compute_class_weights(
                 y_train_full[train_mask, :20],
                 class_weight_mode,
