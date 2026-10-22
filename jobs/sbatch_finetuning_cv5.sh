@@ -11,6 +11,9 @@
 #SBATCH --mail-type=END
 #SBATCH --mail-user=markus.bredberg@epfl.ch
 
+# === PIPELINE STEP 3/4: Finetuning classifiers (full backbone) on BYOL init ===
+# After this: open classification.ipynb (step 4)
+
 set -euo pipefail
 
 cd /users/mbredber/p3_SUPLAT
@@ -27,7 +30,7 @@ SW=${SW_VALUES[$i]}
 F=${F_VALUES[$i]}
 F_STR="${F%.0}"   # strip trailing .0 so f=1.0 → f1 (matches dir names)
 RUN_NAME="pd128_qext_v1_wd1e-3_lrconst_sw${SW}_f${F_STR}"
-MODEL_PATH="outputs/byol_runs/byol_runs/${RUN_NAME}/data_seed_2/training_seed_2"
+MODEL_PATH="outputs/byol_runs/${RUN_NAME}/data_seed_2/training_seed_2"
 
 WD=3e-1
 N_RUNS=1

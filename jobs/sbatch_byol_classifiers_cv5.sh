@@ -12,6 +12,9 @@
 #SBATCH --mail-type=END
 #SBATCH --mail-user=markus.bredberg@epfl.ch
 
+# === PIPELINE STEP 3/4: Downstream classifiers (KNN/LR/RF) on BYOL projections ===
+# After this: open classification.ipynb (step 4)
+
 set -euo pipefail
 
 VENV=/users/mbredber/p3_SUPLAT/.venv
@@ -39,7 +42,7 @@ echo "run=${RUN_NAME}  data_seed=2  training_seed=2"
 for FOLD in 0 1 2 3 4; do
     echo "--- fold ${FOLD} ---"
     python scripts/run_downstream_classifiers.py \
-        --outputs-root outputs/byol_runs/byol_runs \
+        --outputs-root outputs/byol_runs \
         --run-glob     "${RUN_NAME}" \
         --feature-type projections \
         --label-set    initial_pure \

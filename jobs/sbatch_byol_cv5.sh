@@ -10,6 +10,9 @@
 #SBATCH --mail-type=END
 #SBATCH --mail-user=markus.bredberg@epfl.ch
 
+# === PIPELINE STEP 1/4: Train BYOL models (cross-val) ===
+# After this: run sbatch_extract_cv_projections.sh (step 2)
+
 source .venv/bin/activate
 
 # sw=0 is run once (f irrelevant when supervision weight=0): index 0
@@ -46,6 +49,6 @@ python scripts/train_byol.py \
     --data-seed 2 \
     --supervision-weight "$SW" \
     --f-label "$F" \
-    --output-dir outputs/byol_runs/ \
+    --output-dir outputs/ \
     --no-timestamp \
     --cross-val

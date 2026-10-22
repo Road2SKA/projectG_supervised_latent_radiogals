@@ -7,7 +7,7 @@ For each run directory matching --run-glob under --outputs-root:
   3. Fit a StandardScaler on train features, then train an sklearn MLP.
   4. Evaluate on the test set (F1-macro, AUC-macro, Accuracy, Recall-macro).
   5. Save JSON + prediction .npy files to:
-       data/classifiers/simple_downstream/{label_set}_{cw_tag}/mlp_{feature_type}.json
+       data/downstream_classifiers/{label_set}_{cw_tag}/mlp_{feature_type}.json
 
 Results are saved in exactly the same format as run_downstream_classifiers.py so the
 notebook can pick them up alongside LR/RF/KNN/GP without any extra changes.
@@ -26,6 +26,7 @@ from sklearn.preprocessing import StandardScaler, label_binarize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from suplat.data.label_sets import ALL_CLASS_NAMES, LABEL_SETS, apply_label_set
+from suplat.utils.class_weights import compute_sample_weights
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -61,12 +62,16 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
 def process_run(run_dir: Path, feature_type: str, label_set: str,
                 hidden_layer_sizes: tuple, max_iter: int, learning_rate_init: float,
                 seed: int, force: bool,
-                data_seed: int = None, cv_fold: int = None) -> dict:
+                data_seed: int = None, cv_fold: int = None,
+                class_weight_mode: str = None, class_weight_strength: float = 1.0) -> dict:
 
     _eff_data_seed = data_seed if data_seed is not None else seed
     _seed_dir      = run_dir / f"data_seed_{_eff_data_seed}" / f"training_seed_{seed}"
     _fold_dir      = _seed_dir / f"cross_val_{cv_fold}" if cv_fold is not None else _seed_dir
-    clf_dir        = _fold_dir / "data" / "classifiers" / "simple_downstream" / f"{label_set}_cwNone"
+    _cw_tag        = ("cwNone" if not class_weight_mode
+                      else f"cw{class_weight_mode}" if class_weight_strength == 1.0
+                      else f"cw{class_weight_mode}{class_weight_strength}")
+    clf_dir        = _fold_dir / "data" / "downstream_classifiers" / f"{label_set}_{_cw_tag}"
     out_path       = clf_dir / f"mlp_{feature_type}.json"
 
     if out_path.exists() and not force:
@@ -156,14 +161,30 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     y_train = y_train_raw.argmax(axis=1)
     y_test  = y_test_raw.argmax(axis=1)
 
+    # ── Oversample rare classes (MLPClassifier has no sample_weight support) ──
+    if class_weight_mode is not None and class_weight_strength > 0.0:
+        _w = compute_sample_weights(y_train_full[train_mask], class_weight_mode,
+                                    class_weight_strength)
+        _repeats = np.maximum(1, np.round(_w / _w.min()).astype(int))
+        X_train  = np.repeat(X_train, _repeats, axis=0)
+        y_train  = np.repeat(y_train, _repeats)
+        print(f"    Oversampled: {len(X_train)} samples "
+              f"(repeats min={_repeats.min()} max={_repeats.max()})", flush=True)
+
     # ── Train MLP ─────────────────────────────────────────────────────────────
+    # When oversampling is active, early stopping is disabled: duplicated rows
+    # can land in both train and validation halves, making the stopping signal
+    # leaky. Use a fixed 40 iterations instead (unweighted runs converge at
+    # 18-39, so this is equivalent).
+    _oversampling = class_weight_mode is not None and class_weight_strength > 0.0
+    _eff_max_iter = 40 if _oversampling else max_iter
     mlp = MLPClassifier(
         hidden_layer_sizes=hidden_layer_sizes,
         activation="relu",
         solver="adam",
         learning_rate_init=learning_rate_init,
-        max_iter=max_iter,
-        early_stopping=True,
+        max_iter=_eff_max_iter,
+        early_stopping=not _oversampling,
         validation_fraction=0.1,
         n_iter_no_change=15,
         random_state=seed,
@@ -171,7 +192,8 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     )
     mlp.fit(X_train, y_train)
     _loss_str = f"{mlp.best_loss_:.4f}" if mlp.best_loss_ is not None else "N/A"
-    print(f"    MLP: converged in {mlp.n_iter_} iter(s)  "
+    print(f"    MLP: {mlp.n_iter_} iter(s)  "
+          f"{'fixed' if _oversampling else 'early-stop'}  "
           f"best val loss={_loss_str}", flush=True)
 
     y_pred = mlp.predict(X_test)
@@ -184,15 +206,17 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     # ── Save ──────────────────────────────────────────────────────────────────
     clf_dir.mkdir(parents=True, exist_ok=True)
     payload = {
-        "run_dir":              str(run_dir),
-        "feature_type":         feature_type,
-        "label_set":            label_set,
-        "hidden_layer_sizes":   list(hidden_layer_sizes),
-        "max_iter":             max_iter,
-        "learning_rate_init":   learning_rate_init,
-        "n_iter":               int(mlp.n_iter_),
-        "n_train":              int(len(X_train)),
-        "n_test":               int(len(X_test)),
+        "run_dir":               str(run_dir),
+        "feature_type":          feature_type,
+        "label_set":             label_set,
+        "class_weight_mode":     class_weight_mode,
+        "class_weight_strength": class_weight_strength,
+        "hidden_layer_sizes":    list(hidden_layer_sizes),
+        "max_iter":              max_iter,
+        "learning_rate_init":    learning_rate_init,
+        "n_iter":                int(mlp.n_iter_),
+        "n_train":               int(len(X_train)),
+        "n_test":                int(len(X_test)),
         **metrics,
     }
     with open(out_path, "w") as fh:
@@ -237,12 +261,24 @@ def main():
                         help="Seed for data_splits/<seed>/ (defaults to --seed).")
     parser.add_argument("--cv-fold",         type=int, default=None,
                         help="Cross-val fold index (0-based).")
+    parser.add_argument("--class-weight-mode", type=str, default=None,
+                        choices=["score", "initial", "initial_pure", "morphology", "morphology_pure",
+                                 "environment", "environment_pure", "classical", "classical_pure",
+                                 "full", "full_pure", "None"],
+                        help="Upweight rare classes via oversampling. Pass a *_pure label set "
+                             "matching --label-set (e.g. initial_pure). MLPClassifier has no "
+                             "native sample_weight so minority samples are duplicated.")
+    parser.add_argument("--class-weight-strength", type=float, default=1.0,
+                        help="Weight strength (default: 1.0 = full inverse-frequency).")
     parser.add_argument("--force",           action="store_true",
                         help="Re-run even if output JSON already exists.")
     args = parser.parse_args()
 
     if not args.label_set.endswith("_pure"):
         parser.error("--label-set must be a *_pure label set (e.g. initial_pure).")
+
+    if args.class_weight_mode in ("None", "none"):
+        args.class_weight_mode = None
 
     hidden_layer_sizes = tuple(int(x) for x in args.hidden_layers.split(","))
 
@@ -263,6 +299,8 @@ def main():
             hidden_layer_sizes, args.max_iter, args.lr,
             args.seed, args.force,
             data_seed=args.data_seed, cv_fold=args.cv_fold,
+            class_weight_mode=args.class_weight_mode,
+            class_weight_strength=args.class_weight_strength,
         )
         if "error" in r:
             errors.append(r)

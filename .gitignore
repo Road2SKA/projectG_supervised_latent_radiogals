@@ -5,6 +5,7 @@ __pycache__
 core_*
 data/raw
 data/processed
+data_splits/
 logs
 outputs
 *.sbatch

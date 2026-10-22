@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_class_weights, compute_sample_weights
 from suplat.data.label_sets import (
     ALL_CLASS_NAMES, DERIVED_CLASS_NAMES, LABEL_SETS,
-    INTEREST_TIER_CLASS_NAMES, INTEREST_BINARY_CLASS_NAMES,
+    INTEREST_TIER_CLASS_NAMES, INTEREST_BINARY_CLASS_NAMES, INITIAL_BINARY_CLASS_NAMES,
     make_derived as _make_derived, apply_label_set,
 )
 
@@ -129,6 +129,15 @@ def _fit_and_eval(clf, X_train, y_train, X_test, y_test, class_names,
     else:
         y_pred = clf.predict(X_test)
         y_prob = clf.predict_proba(X_test)
+        # Some classifiers (e.g. RF, KNN) only output columns for classes seen
+        # during training. Expand to full n_classes so evaluate_metrics can index
+        # y_prob[:, i] for every i in range(n_classes).
+        n_classes = len(class_names)
+        if hasattr(clf, "classes_") and y_prob.shape[1] < n_classes:
+            y_prob_full = np.zeros((len(X_test), n_classes), dtype=y_prob.dtype)
+            for _j, _c in enumerate(clf.classes_):
+                y_prob_full[:, int(_c)] = y_prob[:, _j]
+            y_prob = y_prob_full
     return evaluate_metrics(y_test, y_pred, y_prob, class_names,
                             is_binary=label_set.endswith('_individual')), y_pred, y_prob
 
@@ -207,19 +216,13 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     _eff_data_seed   = data_seed if data_seed is not None else seed
     _seed_dir        = run_dir / f"data_seed_{_eff_data_seed}" / f"training_seed_{seed}"
     _fold_dir        = _seed_dir / f"cross_val_{cv_fold}" if cv_fold is not None else _seed_dir
-    clf_dir          = _fold_dir / "data" / "classifiers" / "simple_downstream" / f"{label_set}_{_cw_tag}"
+    clf_dir          = _fold_dir / "data" / "downstream_classifiers" / f"{label_set}_{_cw_tag}"
     rf_path          = clf_dir / f"rf_{feature_type}.json"
     knn_path         = clf_dir / f"knn_{feature_type}.json"
     lr_path          = clf_dir / f"lr_{feature_type}.json"
     gp_path          = clf_dir / f"gp_{feature_type}.json"
-    _frac_cache_path    = clf_dir / "label_fraction_metrics.json"
-    _need_ip_frac       = not label_set.endswith("_pure")
-    _frac_ip_cache_path = clf_dir / "label_fraction_metrics_initial_pure_eval.json"
-
     all_cached = (rf_path.exists() and knn_path.exists() and lr_path.exists()
-                  and gp_path.exists()
-                  and _frac_cache_path.exists()
-                  and (not _need_ip_frac or _frac_ip_cache_path.exists()))
+                  and gp_path.exists())
     if all_cached and not force:
         print(f"  [{run_dir.name}] skipping (all cached — use --force to rerun)", flush=True)
         out = dict(name=run_dir.name)
@@ -337,6 +340,8 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         class_names = INTEREST_TIER_CLASS_NAMES
     elif label_set == "interest_binary":
         class_names = INTEREST_BINARY_CLASS_NAMES
+    elif label_set == "initial_binary":
+        class_names = INITIAL_BINARY_CLASS_NAMES
     else:
         _base_ls    = label_set[:-11] if label_set.endswith('_individual') else label_set
         class_names = [ALL_CLASS_NAMES[i] for i in LABEL_SETS[_base_ls]]
@@ -350,7 +355,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     X_test  = scaler.transform(X_test)
 
     # ── Multiclass vs multi-label ─────────────────────────────────────────────
-    _pure_sets    = {"classical_pure", "initial_pure", "morphology_pure"}
+    _pure_sets    = {"classical_pure", "initial_pure", "morphology_pure", "initial_binary"}
     is_multiclass = label_set in _pure_sets
     if is_multiclass:
         y_train = y_train_raw.argmax(axis=1)
@@ -376,7 +381,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         # → per-sample weight = mean alpha over each sample's positive classes.
         if (class_weight_mode is not None and class_weight_mode != "score"
                 and class_weight_strength > 0.0
-                and label_set not in ("derived", "interest_tier", "interest_binary")):
+                and label_set not in ("derived", "interest_tier", "interest_binary", "initial_binary")):
             _alpha_full = compute_class_weights(
                 y_train_full[train_mask, :20],
                 class_weight_mode,
@@ -424,9 +429,9 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
          MultiOutputClassifier(RandomForestClassifier(n_estimators=n_estimators,
                                                       random_state=seed, n_jobs=-1))),
         ("knn", knn_path,
-         KNeighborsClassifier(n_neighbors=n_neighbors, metric="euclidean", n_jobs=-1)
+         KNeighborsClassifier(n_neighbors=min(n_neighbors, len(X_train)), metric="euclidean", n_jobs=-1)
          if is_multiclass else
-         MultiOutputClassifier(KNeighborsClassifier(n_neighbors=n_neighbors,
+         MultiOutputClassifier(KNeighborsClassifier(n_neighbors=min(n_neighbors, len(X_train)),
                                                     metric="euclidean", n_jobs=-1))),
         ("lr",  lr_path,
          LogisticRegression(max_iter=1000, C=lr_C, random_state=seed)
@@ -456,7 +461,36 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         # KNN and GP do not support sample_weight; RF and LR do
         sw = None if clf_name in ("knn", "gp") else sample_weights
         if clf_name == "gp" and len(X_train) > _MAX_GP_TRAIN:
-            print(f"    GP: skipping (n_train={len(X_train)} > {_MAX_GP_TRAIN})", flush=True)
+            rng = np.random.default_rng(seed)
+            _gp_idx = rng.choice(len(X_train), size=_MAX_GP_TRAIN, replace=False)
+            X_train_gp = X_train[_gp_idx]
+            y_train_gp = y_train[_gp_idx]
+            print(f"    GP: subsampling {_MAX_GP_TRAIN}/{len(X_train)} "
+                  f"train samples (seed={seed})", flush=True)
+            metrics, y_pred_test, y_prob_test = _fit_and_eval(
+                clf, X_train_gp, y_train_gp, X_test, y_test,
+                class_names, label_set, is_multi_output=is_mo, sample_weight=None)
+            print(f"    GP (subsampled): F1={metrics['f1_macro']:.4f}  "
+                  f"AUC={metrics['auc_macro']:.4f}  Acc={metrics['accuracy']:.4f}", flush=True)
+            payload = {
+                "run_dir":      str(run_dir),
+                "feature_type": feature_type,
+                "label_set":    label_set,
+                "n_train":      int(len(X_train)),
+                "n_train_gp":   _MAX_GP_TRAIN,
+                "n_test":       int(len(X_test)),
+                "class_names":  class_names,
+                **metrics,
+            }
+            with open(path, "w") as fh:
+                json.dump(payload, fh, indent=2)
+            np.save(clf_dir / f"gp_{feature_type}_test_preds.npy", y_pred_test)
+            np.save(clf_dir / f"gp_{feature_type}_test_probs.npy", y_prob_test)
+            _lbl_path = clf_dir / f"{feature_type}_test_labels.npy"
+            if not _lbl_path.exists():
+                np.save(_lbl_path, y_test)
+            out["gp"] = {k: metrics[k] for k in
+                         ("f1_macro", "auc_macro", "accuracy", "recall_macro")}
             continue
         metrics, y_pred_test, y_prob_test = _fit_and_eval(
             clf, X_train, y_train, X_test, y_test,
@@ -493,137 +527,6 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     if not label_set.endswith("_pure"):
         _do_ip_eval(out, clf_dir, feature_type, run_dir.name,
                     y_test_full=y_test_full, test_mask=test_mask)
-
-    # ── Label-fraction sweep (all label sets except "derived") ───────────────
-    _do_frac_sweep = label_set != "derived"
-    _do_ip_frac    = _need_ip_frac and (not _frac_ip_cache_path.exists() or force)
-    # Re-run sweep if GP is absent from the existing cache (e.g. newly added classifier)
-    _frac_gp_missing = False
-    if _frac_cache_path.exists() and not force:
-        with open(_frac_cache_path) as _fh_gp:
-            _existing_frac = json.load(_fh_gp)
-        _frac_gp_missing = not any("GP" in v for v in _existing_frac.values())
-    if _do_frac_sweep and (not _frac_cache_path.exists() or _do_ip_frac or force or _frac_gp_missing):
-        _FRACS = [0.01, 0.05, 0.10, 0.25, 0.50, 1.0]
-        _rng   = np.random.default_rng(seed)
-        # Seed from existing cache when only adding missing classifiers (e.g. GP)
-        _frac_out: dict = ({str(_f): dict(v) for _f, v in _existing_frac.items()}
-                           if _frac_gp_missing and not force else {})
-        # Pre-initialise all fraction keys so the notebook's exact-key check always passes
-        _frac_ip_out: dict = {str(_frac): {} for _frac in _FRACS}
-        for _frac in _FRACS:
-            _n   = max(len(class_names) * 2, int(_frac * len(X_train)))
-            _idx = (_rng.choice(len(X_train), size=_n, replace=False)
-                    if _frac < 1.0 else np.arange(len(X_train)))
-            _Xf, _yf = X_train[_idx], y_train[_idx]
-            _Xf_fit, _yf_fit = _Xf, _yf
-            _sw_frac = sample_weights[_idx] if sample_weights is not None else None
-            _Xt_fit, _yt_fit = X_test, y_test
-            _ncls = len(class_names)
-            _frac_out[str(_frac)] = {}
-            _knn_k = min(n_neighbors, max(1, len(_Xf_fit)))
-            # Pre-compute ip mask for this fraction (constant across classifiers)
-            if _do_ip_frac:
-                _ip_mask_frac = (_yt_fit[:, :5].sum(axis=1) == 1)
-                _y_ip_frac    = (_yt_fit[_ip_mask_frac, :5].argmax(axis=1)
-                                 if _ip_mask_frac.any() else None)
-            for _cname, _clf_base in [
-                ("LogReg", LogisticRegression(max_iter=1000, C=lr_C,
-                                              random_state=seed)),
-                ("KNN",    KNeighborsClassifier(n_neighbors=_knn_k,
-                                                metric="euclidean", n_jobs=-1)),
-                ("RF",     RandomForestClassifier(n_estimators=50,
-                                                  random_state=seed, n_jobs=-1)),
-                ("GP",     GaussianProcessClassifier(kernel=RBF(1.0),
-                                                     multi_class="one_vs_rest",
-                                                     random_state=seed)),
-            ]:
-                if len(_Xf_fit) == 0:
-                    continue
-                if _cname == "GP" and len(_Xf_fit) > _MAX_GP_TRAIN:
-                    continue
-                # Skip classifiers already present in the seeded cache
-                if _cname in _frac_out.get(str(_frac), {}):
-                    continue
-                _clf_frac = (MultiOutputClassifier(_clf_base) if not is_multiclass
-                             else _clf_base)
-                _fit_sw = None if _cname in ("KNN", "GP") else _sw_frac
-                try:
-                    if _fit_sw is not None:
-                        _clf_frac.fit(_Xf_fit, _yf_fit, sample_weight=_fit_sw)
-                    else:
-                        _clf_frac.fit(_Xf_fit, _yf_fit)
-                except ValueError:
-                    # Some label columns may be all-zero in small fractions
-                    continue
-                _yp = _clf_frac.predict(_Xt_fit)
-                if not is_multiclass:
-                    def _pos_prob(est, X):
-                        p = est.predict_proba(X)
-                        # If only one class seen during training, proba has shape (N,1)
-                        return p[:, 1] if p.shape[1] > 1 else p[:, 0]
-                    _prob = np.stack(
-                        [_pos_prob(est, _Xt_fit)
-                         for est in _clf_frac.estimators_], axis=1)
-                    _aucs = []
-                    for _i in range(_ncls):
-                        if len(np.unique(_yt_fit[:, _i])) < 2:
-                            _aucs.append(None)
-                        else:
-                            _aucs.append(float(roc_auc_score(
-                                _yt_fit[:, _i], _prob[:, _i])))
-                    _auc = float(np.nanmean([a for a in _aucs if a is not None]))
-                else:
-                    _prob = _clf_frac.predict_proba(_Xt_fit)
-                    if _prob.shape[1] != _ncls:
-                        _full_p = np.zeros((len(_Xt_fit), _ncls), dtype=np.float64)
-                        for _j, _c in enumerate(_clf_frac.classes_):
-                            _full_p[:, int(_c)] = _prob[:, _j]
-                        _prob = _full_p
-                    _y_bin = label_binarize(_yt_fit, classes=list(range(_ncls)))
-                    try:
-                        _auc = float(roc_auc_score(_y_bin, _prob,
-                                                   multi_class="ovr", average="macro"))
-                    except Exception:
-                        _auc = float("nan")
-                _frac_out[str(_frac)][_cname] = {
-                    "f1":       float(f1_score(_yt_fit, _yp, average="macro",
-                                               zero_division=0)),
-                    "auc":      _auc,
-                    "accuracy": (float((_yt_fit == _yp).mean()) if label_set.endswith('_individual')
-                                 else float(accuracy_score(_yt_fit, _yp))),
-                    "recall":   float(recall_score(_yt_fit, _yp, average="macro",
-                                                   zero_division=0)),
-                }
-                # Cross-eval: evaluate on initial_pure (5-class) subset
-                if _do_ip_frac and _y_ip_frac is not None and not is_multiclass:
-                    _p5_f  = _prob[_ip_mask_frac, :5]
-                    _p5_fn = _p5_f / _p5_f.sum(axis=1, keepdims=True).clip(min=1e-9)
-                    _yp_ip_f  = _p5_fn.argmax(axis=1)
-                    _y_ip_bin = label_binarize(_y_ip_frac, classes=list(range(5)))
-                    try:
-                        _ip_auc = float(roc_auc_score(
-                            _y_ip_bin, _p5_fn, multi_class="ovr", average="macro"))
-                    except Exception:
-                        _ip_auc = float("nan")
-                    _frac_ip_out[str(_frac)][_cname] = {
-                        "f1":       float(f1_score(_y_ip_frac, _yp_ip_f,
-                                                   average="macro", zero_division=0)),
-                        "auc":      _ip_auc,
-                        "accuracy": float(accuracy_score(_y_ip_frac, _yp_ip_f)),
-                        "recall":   float(recall_score(_y_ip_frac, _yp_ip_f,
-                                                       average="macro", zero_division=0)),
-                    }
-        if not _frac_cache_path.exists() or force:
-            with open(_frac_cache_path, "w") as _fh:
-                json.dump(_frac_out, _fh, indent=2)
-            print(f"    Saved label-fraction sweep → {_frac_cache_path.name}",
-                  flush=True)
-        if _do_ip_frac and _frac_ip_out:
-            with open(_frac_ip_cache_path, "w") as _fh:
-                json.dump(_frac_ip_out, _fh, indent=2)
-            print(f"    Saved IP cross-eval sweep → {_frac_ip_cache_path.name}",
-                  flush=True)
 
     return out
 

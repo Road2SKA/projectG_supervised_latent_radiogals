@@ -271,6 +271,22 @@ def _train_one_run(
     print(f"Building model: {model_name}")
     model = build_model(model_name, n_classes, img_shape, scat_shape)
     model = model.to(device)
+
+    # Load BYOL-pretrained backbone weights (enb0 only, before torch.compile)
+    if getattr(args, 'byol_checkpoint', None) is not None and model_name == 'enb0':
+        _ckpt = torch.load(args.byol_checkpoint, map_location="cpu", weights_only=True)
+        _sd = {k.replace("_orig_mod.", ""): v
+               for k, v in _ckpt["model_state_dict"].items()}
+        _enc_sd = {k[len("online_encoder."):]: v
+                   for k, v in _sd.items() if k.startswith("online_encoder.")}
+        model[0].load_state_dict(_enc_sd, strict=True)
+        print(f"  BYOL backbone loaded: {len(_enc_sd)} keys from "
+              f"{args.byol_checkpoint.name}")
+        if getattr(args, 'training_mode', 'full') == 'linear':
+            model[0].requires_grad_(False)
+            n_frozen = sum(p.numel() for p in model[0].parameters())
+            print(f"  Linear mode: backbone frozen ({n_frozen:,} params)")
+
     if args.compile:
         model = torch.compile(model)
         print("  torch.compile() applied")
@@ -298,7 +314,8 @@ def _train_one_run(
     print(f"  Train: {len(train_imgs)}, Val: {len(val_imgs) if val_imgs is not None else 0}")
 
     # Optimiser + scheduler
-    optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    _trainable = [p for p in model.parameters() if p.requires_grad]
+    optimiser = torch.optim.AdamW(_trainable, lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode='min', factor=0.5, patience=5)
 
@@ -448,6 +465,9 @@ def _train_one_run(
         with open(run_dir / 'results.json', 'w') as f:
             json.dump(results, f, indent=2)
 
+        np.save(run_dir / 'train_losses.npy', np.array(train_losses))
+        np.save(run_dir / 'test_losses.npy',  np.array(test_losses))
+
         # Per-run training curve
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(train_losses, 'b-',  label='train')
@@ -540,6 +560,16 @@ def main():
     parser.add_argument('--gen_frac', type=float, default=None,
                         help="Pin gen-aug to a single fraction of real data instead of sweeping "
                              "[0.5, 1.0, 2.0]. Requires --gen_dir. E.g. --gen_frac 1.0.")
+    parser.add_argument('--byol_checkpoint', type=Path, default=None,
+                        help="Path to BYOL .pt file. When given, initialises the enb0 backbone "
+                             "from online_encoder weights before training. Fails loudly on key "
+                             "mismatch. Also writes finetuning_metrics.json to --byol_run_dir "
+                             "after training (for notebook comparison).")
+    parser.add_argument('--training_mode', type=str, default='full',
+                        choices=['full', 'linear'],
+                        help="When --byol_checkpoint is provided: 'full' trains all parameters "
+                             "(default, current retrainbase behaviour); 'linear' freezes the "
+                             "backbone and trains only the classification head.")
     args = parser.parse_args()
     _ls_base = args.label_set[:-11] if args.label_set.endswith('_individual') else args.label_set
     if _ls_base not in LABEL_SETS:
@@ -613,7 +643,17 @@ def main():
                 f"Could not find data_splits/{_seed_str}/ in any ancestor of {args.run_dir}")
         split_label = f"data_seed={args.data_seed}"
     elif args.data_seed is not None:
-        _splits_dir = args.byol_run_dir.parent.parent / "data_splits" / str(args.data_seed)
+        _seed_str = str(args.data_seed)
+        _p = args.byol_run_dir
+        _splits_dir = None
+        for _ in range(6):
+            _p = _p.parent
+            if (_p / "data_splits" / _seed_str).exists():
+                _splits_dir = _p / "data_splits" / _seed_str
+                break
+        if _splits_dir is None:
+            raise FileNotFoundError(
+                f"Could not find data_splits/{_seed_str}/ in any ancestor of {args.byol_run_dir}")
         split_label = f"data_seed={args.data_seed}"
     else:
         byol_data = args.byol_run_dir / "data"
@@ -632,17 +672,21 @@ def main():
         return np.load(p)
     trainval_idx = _load_idx("train_idx.npy")
     test_idx     = _load_idx("test_idx.npy")
-    train_idx = trainval_idx  # always train on full training set
     print(f"Using split from: {split_label}")
     print(f"  train+val: {len(trainval_idx)}  test: {len(test_idx)}")
 
+    actual_test_idx = test_idx   # test set is never used for validation
     if args.early_stopping:
-        val_test_idx, actual_test_idx = train_test_split(
-            test_idx, test_size=0.9, random_state=args.seed
+        # Hold out 10% of training data for early-stopping validation.
+        # The test set is kept fully separate.
+        train_idx, val_test_idx = train_test_split(
+            trainval_idx, test_size=0.1, random_state=args.seed
         )
+        print(f"  early-stopping val: {len(val_test_idx)} (from train)  "
+              f"effective train: {len(train_idx)}")
     else:
-        val_test_idx    = None
-        actual_test_idx = test_idx
+        train_idx    = trainval_idx  # train on full training set
+        val_test_idx = None
 
     test_images = images[actual_test_idx]
     if args.label_set == "derived":
@@ -925,6 +969,30 @@ def main():
         with open(out_dir / 'run_summary.json', 'w') as f:
             json.dump(summary_out, f, indent=2)
         print(f"\n  Summary saved to: {out_dir / 'run_summary.json'}")
+
+    # ── finetuning_metrics.json (BYOL-init retraining, for notebook) ─────────
+    if args.byol_checkpoint is not None and args.gen_dir is None and all_run_results:
+        _run_flat = [r for rlist in all_run_results for r in rlist]
+        _ft_metrics = {
+            "f1_macro":     {"test": [r["f1_macro"]    for r in _run_flat]},
+            "auc_macro":    {"test": [r["auc_macro"]   for r in _run_flat]},
+            "recall_macro": {"test": [r["recall_macro"] for r in _run_flat]},
+            "accuracy":     {"test": [r["accuracy"]    for r in _run_flat]},
+        }
+        _mode_suffix = 'lineareval' if getattr(args, 'training_mode', 'full') == 'linear' else 'retrainbase'
+        _rb_dir_name = f"{args.label_set}_{_cw_tag}{_es_tag}_{_mode_suffix}"
+        if args.cv_fold is not None:
+            _ft_clf_dir = (args.byol_run_dir / f"cross_val_{args.cv_fold}"
+                           / "data" / "classifiers" / "finetuning"
+                           / _rb_dir_name)
+        else:
+            _ft_clf_dir = (args.byol_run_dir / "data" / "classifiers" / "finetuning"
+                           / _rb_dir_name)
+        _ft_clf_dir.mkdir(parents=True, exist_ok=True)
+        _ft_out = _ft_clf_dir / "finetuning_metrics.json"
+        with open(_ft_out, "w") as _f:
+            json.dump(_ft_metrics, _f, indent=2)
+        print(f"\nfinetuning_metrics.json written to: {_ft_out}")
 
     # ════════════════════════════════════════════════════════════════════
     # Shared preamble for sweep (Path C) and gen-aug (Path B)

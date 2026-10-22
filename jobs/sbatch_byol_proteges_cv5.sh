@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=byol_prot_cv5
-#SBATCH --array=0-10
+#SBATCH --array=0-11
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.err
 #SBATCH --partition=normal
@@ -22,9 +22,9 @@ cd "${PROJECT}"
 
 mkdir -p outputs/logs
 
-# Same 11 combinations as sbatch_byol_cv5.sh
-SW_VALUES=("0.0"  "0.05" "0.05" "0.05" "0.05" "0.05" "0.1"  "0.1"  "0.1"  "0.1"  "0.1")
-F_VALUES=( "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0")
+# 12 combinations: same as sbatch_byol_cv5.sh + sw=0.5 f=1
+SW_VALUES=("0.0"  "0.05" "0.05" "0.05" "0.05" "0.05" "0.1"  "0.1"  "0.1"  "0.1"  "0.1"  "0.5")
+F_VALUES=( "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "1.0")
 
 i=$SLURM_ARRAY_TASK_ID
 SW=${SW_VALUES[$i]}
@@ -39,7 +39,7 @@ echo "run=${RUN_NAME}  data_seed=2  training_seed=2"
 for FOLD in 0 1 2 3 4; do
     echo "--- fold ${FOLD} ---"
 
-    SEED_DIR="outputs/byol_runs/byol_runs/${RUN_NAME}/data_seed_2/training_seed_2/cross_val_${FOLD}"
+    SEED_DIR="outputs/byol_runs/${RUN_NAME}/data_seed_2/training_seed_2/cross_val_${FOLD}"
     if [ ! -d "${SEED_DIR}" ]; then
         echo "Skipping missing: ${SEED_DIR}"
         continue
@@ -47,7 +47,7 @@ for FOLD in 0 1 2 3 4; do
 
     python scripts/run_protege_scoring.py \
         --outputs-root outputs \
-        --run-glob     "byol_runs/byol_runs/${RUN_NAME}" \
+        --run-glob     "byol_runs/${RUN_NAME}" \
         --byol-seed    2 \
         --byol-data-seed 2 \
         --workers      8 \

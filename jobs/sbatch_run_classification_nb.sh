@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=00:20:00
+#SBATCH --time=00:10:00
 #SBATCH --account=sk036
 #SBATCH --mail-type=END
 #SBATCH --mail-user=markus.bredberg@epfl.ch

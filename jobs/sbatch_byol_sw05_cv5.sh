@@ -34,6 +34,6 @@ python scripts/train_byol.py \
     --data-seed 2 \
     --supervision-weight 0.5 \
     --f-label 1 \
-    --output-dir outputs/byol_runs/ \
+    --output-dir outputs/ \
     --no-timestamp \
     --cross-val

@@ -84,9 +84,14 @@ def parse_args():
                     choices=["full", "classical", "initial", "morphology", "environment", "derived"],
                     help="Label subset to use: 'full'/'all' (all 20), 'classical' (0-1: FRI, FRII), "
                         "'initial' (0-4: FRI, FRII, Hybrids, Spirals, Relaxed doubles), "
-                        "'morphology' (5-14: C-curve, S-curve, Misalignment, Wings, X-shaped, Straight jets, Multiple hotspots, "
-                        "Continuous jets, Banding, One-sided, Restarted), 'environment' (15-18: Cluster, Merger, Diffuse emission, Unknown), "
+                        "'morphology' (5-15: C-curve, S-curve, Misalignment, Wings, X-shaped, Straight jets, Multiple hotspots, "
+                        "Continuous jets, Banding, One-sided, Restarted), 'environment' (16-19: Cluster, Merger, Diffuse emission, Unknown), "
                         "'derived' (19-23: Compact+hybrids, Hybrid FRI/FRII, Curved FRIs, Curved FRIIs, Straight+multi hotspots)")
+    ap.add_argument("--sup-label-type", type=str, default=None,
+                    choices=["full", "classical", "initial", "morphology", "environment", "derived"],
+                    help="Label subset used for friend-pairing supervision. "
+                         "Default: same as --label-type. Allows training with one "
+                         "label axis while evaluating on another.")
 
     # Dataset pairing strategy
     ap.add_argument("--weighting", type=str, default="closest",
@@ -434,6 +439,17 @@ if SUBSAMPLE_SIZE is not None and len(images) > SUBSAMPLE_SIZE:
     labels = labels[indices]
     labels_full = labels_full[indices]
 
+# Supervision label type (may differ from eval --label-type).
+# Placed after subsample so sup_labels stays in sync with images/labels.
+SUP_LABEL_TYPE = args.sup_label_type if args.sup_label_type is not None else args.label_type
+sup_label_start, sup_label_end = LABEL_RANGES[SUP_LABEL_TYPE]
+sup_labels = labels_full[:, sup_label_start:sup_label_end]
+if SUP_LABEL_TYPE != args.label_type:
+    print(f"Supervision label type: {SUP_LABEL_TYPE} "
+          f"(indices {sup_label_start}-{sup_label_end-1}, "
+          f"{sup_label_end - sup_label_start} dims; "
+          f"eval label type remains '{args.label_type}')")
+
 print("\nData loaded")
 print(f"  Images: {images.shape} ({images.dtype})")
 print(f"  Labels: {labels.shape} ({labels.dtype})")
@@ -481,11 +497,11 @@ def _make_dataset_loader(img_data, label_data, shuffle, drop_last=False):
 def byol_collate_fn(batch):
     x1     = torch.stack([b[0] for b in batch])
     x1_aug = torch.stack([b[1] for b in batch])
-    is_labelled = torch.tensor([b[2] is not None for b in batch], dtype=torch.bool)
+    is_labelled = torch.tensor([isinstance(b[2], torch.Tensor) for b in batch], dtype=torch.bool)
     sample_weights = torch.tensor([b[3] for b in batch], dtype=torch.float32)
     if is_labelled.any():
         dummy = torch.zeros_like(batch[0][0])
-        x2_friend = torch.stack([b[2] if b[2] is not None else dummy for b in batch])
+        x2_friend = torch.stack([b[2] if isinstance(b[2], torch.Tensor) else dummy for b in batch])
     else:
         x2_friend = None
     return x1, x1_aug, x2_friend, is_labelled, sample_weights
@@ -970,6 +986,8 @@ def _build_split_datasets_and_loaders(train_idx, test_idx, nw):
 
     lab_images_s   = train_images_s[labelled_mask]
     lab_labels_s   = train_labels_s[labelled_mask]
+    sup_lab_labels_s = sup_labels[train_idx][labelled_mask]
+    assert len(sup_lab_labels_s) == len(lab_labels_s)
     unlab_images_s = train_images_s[~labelled_mask]
     lab_train_idx  = train_idx[labelled_mask]
     unlab_train_idx = train_idx[~labelled_mask]
@@ -983,7 +1001,7 @@ def _build_split_datasets_and_loaders(train_idx, test_idx, nw):
     train_unlab_ds_s = UnlabelledBYOLDataset(unlab_images_s, transform=byol_strong_aug)
 
     if len(lab_images_s) > 0:
-        lab_df_s = pd.DataFrame(lab_labels_s)
+        lab_df_s = pd.DataFrame(sup_lab_labels_s)
         train_lab_ds_s = BYOLSupDataset(tags_data=lab_df_s, img_data=lab_images_s,
                                         transform=byol_strong_aug, friend_transform=byol_strong_aug,
                                         weightfunc=WEIGHTING_FUNC)

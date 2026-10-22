@@ -176,6 +176,9 @@ def main():
     parser.add_argument("--cv-fold", type=int, default=None,
                         help="Cross-validation fold index (0-based). When set, appends cross_val_K "
                              "to seed_dir and loads fold-specific splits.")
+    parser.add_argument("--exclude-sshaped", action="store_true",
+                        help="Remove S-shaped sources (sshaped column) from the test set before "
+                             "computing AUCs.  Output is written to noise_robustness_no_sshaped.json.")
     args = parser.parse_args()
 
     # Extract f-label suffix from run name (e.g. _f1 or _f0.1), normalise 1.0 → 1
@@ -195,7 +198,8 @@ def main():
     BASELINE_OUT_DIR = ROOT / "outputs/anomaly_baselines"
     BYOL_OUT_DIR.mkdir(parents=True, exist_ok=True)
     BASELINE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_json = BYOL_OUT_DIR / "noise_robustness.json"
+    _json_name = "noise_robustness_no_sshaped.json" if args.exclude_sshaped else "noise_robustness.json"
+    out_json = BYOL_OUT_DIR / _json_name
     if out_json.exists() and not args.force:
         print(f"Output exists: {out_json}\nUse --force to overwrite.")
         return
@@ -218,6 +222,13 @@ def main():
         print(f"Derived full test split: {len(test_idx)} entries")
     else:
         print(f"Test set size: {len(test_idx)}")
+
+    if args.exclude_sshaped:
+        _ss_col  = LABEL_COLS.index("sshaped")
+        _ss_mask = labels_all[test_idx, _ss_col].astype(bool)
+        _n_ss    = int(_ss_mask.sum())
+        test_idx = test_idx[~_ss_mask]
+        print(f"Excluded {_n_ss} S-shaped sources from test set → {len(test_idx)} remaining")
 
     test_idx_sha256 = hashlib.sha256(test_idx.astype(np.int64).tobytes()).hexdigest()
     print(f"test_idx sha256: {test_idx_sha256[:16]}…")
@@ -378,7 +389,8 @@ def main():
                       flush=True)
             ell_scores = predict_ell_gp(te_ell_clean, gpr_ell, ell_sc, ell_med)
         else:
-            noisy_ell_dir = BASELINE_OUT_DIR / f"_ell_sigma{sigma}_cache_{args.data_seed}"
+            _noss_sfx     = "_noss" if args.exclude_sshaped else ""
+            noisy_ell_dir = BASELINE_OUT_DIR / f"_ell_sigma{sigma}_cache_{args.data_seed}{_noss_sfx}"
             te_ell_noisy  = extract_ell_features(noisy / 255.0, noisy_ell_dir,
                                                   force_rerun=False)
             n_nan = int(te_ell_noisy.isna().any(axis=1).sum())
@@ -411,10 +423,16 @@ def main():
         "proj_dim":            int(all_p.shape[1]),
         "n_labeled":           int(len(lab_idx)),
         "n_test":              int(len(test_idx)),
+        "exclude_sshaped":     args.exclude_sshaped,
     }
     with open(out_json, "w") as fh:
         json.dump(result, fh, indent=2)
     print(f"Saved JSON → {out_json}")
+
+    # Backwards-compatible JSONs are only written for the standard (non-filtered) run.
+    if args.exclude_sshaped:
+        print("Skipping backwards-compatible JSONs (--exclude-sshaped run).")
+        return
 
     # Backwards-compatible: comp_noise_robustness.json (read by notebook cell 40)
     with open(BASELINE_OUT_DIR / "comp_noise_robustness.json", "w") as fh:

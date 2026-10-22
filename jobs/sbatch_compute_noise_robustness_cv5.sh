@@ -39,7 +39,7 @@ for FOLD in 0 1 2 3 4; do
     echo "Fold ${FOLD}  run=${RUN_NAME}"
     echo "════════════════════════════════════════════════════════"
 
-    SEED_DIR="outputs/byol_runs/byol_runs/${RUN_NAME}/data_seed_2/training_seed_2/cross_val_${FOLD}"
+    SEED_DIR="outputs/byol_runs/${RUN_NAME}/data_seed_2/training_seed_2/cross_val_${FOLD}"
     if [ ! -d "${SEED_DIR}" ]; then
         echo "Skipping missing: ${SEED_DIR}"
         continue

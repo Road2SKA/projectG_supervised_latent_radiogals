@@ -82,7 +82,7 @@ class UnlabelledBYOLDataset(Dataset):
         img = self.img_data[idx]
         img = torch.from_numpy(img).unsqueeze(0).float()
         img_aug = self.transform(img) if self.transform else img.clone()
-        return img, img_aug, None, 0.0
+        return img, img_aug, 0.0, 0.0
 
 
 class ImagesAndLabelsDataset(Dataset):

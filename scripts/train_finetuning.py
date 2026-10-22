@@ -190,16 +190,29 @@ def parse_args():
         help="Early stopping patience (epochs with no improvement on test loss). Default: 15.",
     )
     ap.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=0,
+        help="Linear LR warmup: ramp from lr/100 to lr over N epochs before ReduceLROnPlateau kicks in.",
+    )
+    ap.add_argument(
         "--dropout",
         type=float,
         default=0.0,
         help="Dropout rate applied between projector output and classifier head. Default: 0.0.",
     )
     ap.add_argument(
+        "--head-source",
+        type=str,
+        default="projector",
+        choices=["projector", "encoder"],
+        help="Input to classifier head: 'projector' (128-dim, default) or 'encoder' (backbone dim, e.g. 1280).",
+    )
+    ap.add_argument(
         "--early-stopping",
         action="store_true",
         default=False,
-        help="Use 10%% of test set as validation for early stopping.",
+        help="Use 10%% of training data as validation for early stopping.",
     )
     ap.add_argument(
         "--label-set",
@@ -230,16 +243,18 @@ def parse_args():
 
 
 class BYOLFineTuner(nn.Module):
-    def __init__(self, byol_model, num_classes=21, training_mode=3, dropout_rate=0.0):
+    def __init__(self, byol_model, num_classes=21, training_mode=3, dropout_rate=0.0,
+                 head_source='projector', encoder_dim=1280):
         super().__init__()
 
         self.encoder = byol_model.online_encoder
         self.projector = byol_model.online_projector
         self.training_mode = training_mode
+        self.head_source = head_source
 
-        # BYOL projection_dim = 128 in your case
         self.dropout = nn.Dropout(p=dropout_rate)
-        self.classifier = nn.Linear(128, num_classes)
+        _clf_in = encoder_dim if head_source == 'encoder' else 128
+        self.classifier = nn.Linear(_clf_in, num_classes)
 
         self.apply_training_mode(training_mode)
 
@@ -277,7 +292,8 @@ class BYOLFineTuner(nn.Module):
 
     def forward(self, x):
         z = self.encoder(x)
-        z = self.projector(z)
+        if self.head_source == 'projector':
+            z = self.projector(z)
         z = self.dropout(z)
         logits = self.classifier(z)
         return logits
@@ -352,16 +368,19 @@ print(f"Label set '{LABEL_SET}': train={len(train_images)}, test={len(test_image
 byol_strong_aug = get_augmentation(args.augmentation)
 
 EARLY_STOPPING = args.early_stopping
+test_images_eval, test_labels_eval = test_images, test_labels  # test set is never used for validation
 if EARLY_STOPPING:
-    from sklearn.model_selection import train_test_split as _tts
-    _val_rel, _test_rel = _tts(
-        np.arange(len(test_images)), test_size=0.9, random_state=42
+    _train_rel, _val_rel = train_test_split(
+        np.arange(len(train_images)), test_size=0.1, random_state=DATA_SEED
     )
-    val_images,       val_labels       = test_images[_val_rel],  test_labels[_val_rel]
-    test_images_eval, test_labels_eval = test_images[_test_rel], test_labels[_test_rel]
+    val_images,  val_labels  = train_images[_val_rel],  train_labels[_val_rel]
+    train_images             = train_images[_train_rel]
+    train_labels             = train_labels[_train_rel]
+    _train_labels_full_20    = _train_labels_full_20[_train_rel]
+    print(f"  early-stopping val: {len(val_images)} (from train)  "
+          f"effective train: {len(train_images)}")
 else:
     val_images = val_labels = None
-    test_images_eval, test_labels_eval = test_images, test_labels
 
 test_eval_ds = ImagesAndLabelsDataset(tags_data=pd.DataFrame(test_labels_eval),
                                       img_data=test_images_eval, transform=None)
@@ -469,6 +488,8 @@ def build_finetune_model(model_idx):
         num_classes=num_classes,
         training_mode=TRAINING_MODE,
         dropout_rate=args.dropout,
+        head_source=args.head_source,
+        encoder_dim=checkpoint["config"].get("encoder_dim", 1280),
     )
 
     return finetune_model.to(device), run_seed
@@ -498,6 +519,14 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum,
         # TRAIN
         # ======================
         finetune_model.train()
+
+        # ── LR warmup ──────────────────────────────────────────────────────
+        if args.warmup_epochs > 0 and epoch < args.warmup_epochs:
+            _frac = (epoch + 1) / args.warmup_epochs
+            _wlr  = LEARNING_RATE * (0.01 + 0.99 * _frac)
+            for _pg in optimizer.param_groups:
+                _pg['lr'] = _wlr
+        # ───────────────────────────────────────────────────────────────────
 
         train_loss = 0.0
         train_batches = 0
@@ -580,7 +609,8 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum,
 
             avg_val_loss = val_loss / val_batches
             val_losses.append(avg_val_loss)
-            scheduler.step(avg_val_loss)
+            if epoch >= args.warmup_epochs:
+                scheduler.step(avg_val_loss)
 
             if avg_val_loss < best_loss:
                 best_loss = avg_val_loss
@@ -601,7 +631,8 @@ def train_one_model(finetune_model, train_loader, alpha_t, alpha_sum,
                 print(f"Early stopping at epoch {epoch + 1}")
                 break
         else:
-            scheduler.step(avg_train_loss)
+            if epoch >= args.warmup_epochs:
+                scheduler.step(avg_train_loss)
             print(
                 f"Epoch [{epoch+1}/{NUM_EPOCHS}] "
                 f"| Train: {avg_train_loss:.4f} "
