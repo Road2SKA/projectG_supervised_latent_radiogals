@@ -29,8 +29,7 @@ DERIVED_CLASS_NAMES = [
 ]
 
 INTEREST_TIER_CLASS_NAMES = ['Tier 1', 'Tier 2', 'Tier 3', 'Tier 4']
-INTEREST_BINARY_CLASS_NAMES = ['Common (tier 1–2)', 'Rare (tier 3–4)']
-INITIAL_BINARY_CLASS_NAMES  = ['FRI/FRII', 'Rare initial']
+INTERESTING_CLASS_NAMES = ['Common (tier 1–2)', 'Rare (tier 3–4)']
 
 # Interest-tier column indices (mirrors TIERS in class_weights.py)
 _LCI = {c: i for i, c in enumerate(LABEL_COLS)}
@@ -49,9 +48,11 @@ LABEL_SETS = {
     "derived":                None,
     # interest-tier sets (computed labels, not column slices)
     "interest_tier":          None,
-    "interest_binary":        None,
-    "initial_binary":         None,
-    # _pure variants: same columns, row-filtered to single-positive
+    "interesting":            None,
+    # _binary variants: same columns as base set, N independent sigmoid heads (BCE)
+    "initial_binary":         list(range(0, 5)),
+    "full_binary":            list(range(0, 20)),
+    # _pure variants: same columns, row-filtered to single-positive (CrossEntropy)
     "classical_pure":         [0, 1],
     "initial_pure":           list(range(0, 5)),
     "morphology_pure":        list(range(5, 16)),
@@ -83,7 +84,7 @@ def make_interest_tier(y: np.ndarray) -> np.ndarray:
     return out
 
 
-def make_interest_binary(y: np.ndarray) -> np.ndarray:
+def make_interesting(y: np.ndarray) -> np.ndarray:
     """(N, 2) one-hot: common (tier 1–2) → col0, rare (tier 3–4) → col1."""
     score = _interest_score(y)
     out   = np.zeros((len(y), 2), dtype=np.int64)
@@ -91,14 +92,6 @@ def make_interest_binary(y: np.ndarray) -> np.ndarray:
     out[score >= 3, 1] = 1
     return out
 
-
-def make_initial_binary(y: np.ndarray) -> np.ndarray:
-    """(N, 2) one-hot for pure-initial sources: FRI/FRII (cols 0-1) → col0, Rare (cols 2-4) → col1.
-    Row filtering to pure-initial sources (exactly one positive in cols 0-4) is applied in apply_label_set."""
-    out = np.zeros((len(y), 2), dtype=np.int64)
-    out[:, 0] = y[:, :2].any(axis=1).astype(np.int64)
-    out[:, 1] = y[:, 2:5].any(axis=1).astype(np.int64)
-    return out
 
 
 def make_derived(y: np.ndarray) -> np.ndarray:
@@ -125,13 +118,8 @@ def apply_label_set(labels_20: np.ndarray, label_set: str):
         return make_derived(labels_20), row_mask
     if label_set == "interest_tier":
         return make_interest_tier(labels_20), row_mask
-    if label_set == "interest_binary":
-        return make_interest_binary(labels_20), row_mask
-    if label_set == "initial_binary":
-        initial  = labels_20[:, :5]
-        row_mask = initial.sum(axis=1) == 1
-        return make_initial_binary(labels_20)[row_mask].astype(np.int64), row_mask
-
+    if label_set == "interesting":
+        return make_interesting(labels_20), row_mask
     if label_set == "classical_pure":
         fri_frii = labels_20[:, 0:2]
         rest     = labels_20[:, 2:5]
@@ -159,9 +147,7 @@ def class_names_for(label_set: str) -> list:
         return list(DERIVED_CLASS_NAMES)
     if label_set == "interest_tier":
         return list(INTEREST_TIER_CLASS_NAMES)
-    if label_set == "interest_binary":
-        return list(INTEREST_BINARY_CLASS_NAMES)
-    if label_set == "initial_binary":
-        return list(INITIAL_BINARY_CLASS_NAMES)
+    if label_set == "interesting":
+        return list(INTERESTING_CLASS_NAMES)
     cols = LABEL_SETS[label_set]
     return [ALL_CLASS_NAMES[i] for i in cols]

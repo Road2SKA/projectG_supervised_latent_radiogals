@@ -18,6 +18,8 @@ source .venv/bin/activate
 # sw=0 is run once (f irrelevant when supervision weight=0): index 0
 # sw in {0.05, 0.1} x f in {0.05, 0.1, 0.25, 0.5, 1.0}: indices 1-10
 # Total: 1 + 2*5 = 11
+# Note: sw=0.0/f<1 runs are handled by sbatch_extract_cv_projections.sh
+#       reusing the sw=0.0/f=1 checkpoint — no separate training needed.
 
 SW_VALUES=("0.0"  "0.05" "0.05" "0.05" "0.05" "0.05" "0.1"  "0.1"  "0.1"  "0.1"  "0.1")
 F_VALUES=( "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0")

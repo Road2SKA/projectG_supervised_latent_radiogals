@@ -58,6 +58,11 @@ LABEL_SETS = {**LABEL_SETS, "pure": list(range(0, 20))}
 VAL_FRAC = 0.15
 
 
+def _is_pure_ls(label_set: str) -> bool:
+    """Return True for label sets that use single-label multiclass semantics."""
+    return label_set.endswith('_pure')
+
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class RadioImageDataset(Dataset):
     def __init__(self, images, labels, transform=None):
@@ -107,8 +112,41 @@ def weighted_bce_loss(logits, targets, alpha, n_classes):
     return ((unreduced * alpha).sum(1) / alpha_sum).mean()
 
 
-def evaluate_metrics(y_true, y_pred, y_prob, class_names, is_binary=False):
+def evaluate_metrics(y_true, y_pred, y_prob, class_names, is_binary=False, is_pure=False):
     n = len(class_names)
+
+    if is_pure:
+        # y_true: (N, n_classes) multi-hot with exactly one 1 per row
+        # y_pred: (N,) class indices (argmax)
+        # y_prob: (N, n_classes) softmax probabilities
+        y_true_1d = y_true.argmax(axis=1)
+        labels = list(range(n))
+        aucs = []
+        for i in range(n):
+            if len(np.unique(y_true[:, i])) < 2:
+                aucs.append(float('nan'))
+            else:
+                aucs.append(roc_auc_score(y_true[:, i], y_prob[:, i]))
+        try:
+            mac_auc = roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
+        except Exception:
+            mac_auc = float(np.nanmean(aucs))
+        f1_per  = f1_score(y_true_1d, y_pred, average=None, labels=labels, zero_division=0).tolist()
+        f1_mac  = f1_score(y_true_1d, y_pred, average='macro', zero_division=0)
+        rec_per = recall_score(y_true_1d, y_pred, average=None, labels=labels, zero_division=0).tolist()
+        rec_mac = recall_score(y_true_1d, y_pred, average='macro', zero_division=0)
+        acc     = accuracy_score(y_true_1d, y_pred)
+        return {
+            'f1_macro':         float(f1_mac),
+            'auc_macro':        float(mac_auc),
+            'accuracy':         float(acc),
+            'recall_macro':     float(rec_mac),
+            'f1_per_class':     f1_per,
+            'auc_per_class':    [float(a) if not np.isnan(a) else None for a in aucs],
+            'recall_per_class': rec_per,
+            'class_names':      class_names,
+        }
+
     aucs = []
     for i in range(n):
         if len(np.unique(y_true[:, i])) < 2:
@@ -266,6 +304,7 @@ def _train_one_run(
 
     # Move alpha to device
     alpha = alpha.to(device)
+    is_pure = _is_pure_ls(args.label_set)
 
     # Build model
     print(f"Building model: {model_name}")
@@ -295,18 +334,18 @@ def _train_one_run(
 
     # DataLoaders
     _nw = args.num_workers
-    def _mk(ds, bs, shuf):
+    def _mk(ds, bs, shuf, drop_last=False):
         return DataLoader(ds, batch_size=bs, shuffle=shuf,
-                          num_workers=_nw, pin_memory=True)
+                          num_workers=_nw, pin_memory=True, drop_last=drop_last)
 
     use_scat_only = model_name in ('scatternet', 'simplescatternet')
     if model_name in ('scatternet', 'simplescatternet', 'dualssn'):
-        train_dl = _mk(ScatterDataset(train_imgs, scat_tr, train_lbs),  args.batch_size, True)
+        train_dl = _mk(ScatterDataset(train_imgs, scat_tr, train_lbs),  args.batch_size, True,  drop_last=True)
         test_dl  = _mk(ScatterDataset(test_imgs,  scat_te, test_lbs),   args.batch_size, False)
         val_dl   = (_mk(ScatterDataset(val_imgs, scat_va, val_lbs),      args.batch_size, False)
                     if val_imgs is not None else None)
     else:
-        train_dl = _mk(RadioImageDataset(train_imgs, train_lbs, tf_train), args.batch_size, True)
+        train_dl = _mk(RadioImageDataset(train_imgs, train_lbs, tf_train), args.batch_size, True,  drop_last=True)
         test_dl  = _mk(RadioImageDataset(test_imgs,  test_lbs,  tf_val),   args.batch_size, False)
         val_dl   = (_mk(RadioImageDataset(val_imgs,  val_lbs,   tf_val),   args.batch_size, False)
                     if val_imgs is not None else None)
@@ -345,7 +384,10 @@ def _train_one_run(
         epoch_loss = 0.0
         for batch in train_dl:
             logits, labels_b = _forward(model, batch)
-            loss = weighted_bce_loss(logits, labels_b, alpha, n_classes)
+            if is_pure:
+                loss = F.cross_entropy(logits, labels_b.argmax(dim=1).long())
+            else:
+                loss = weighted_bce_loss(logits, labels_b, alpha, n_classes)
             optimiser.zero_grad()
             loss.backward()
             optimiser.step()
@@ -358,8 +400,12 @@ def _train_one_run(
         with torch.no_grad():
             for batch in test_dl:
                 logits, labels_b = _forward(model, batch)
-                test_loss_total += F.binary_cross_entropy_with_logits(
-                    logits, labels_b.float()).item() * len(labels_b)
+                if is_pure:
+                    test_loss_total += F.cross_entropy(
+                        logits, labels_b.argmax(dim=1).long()).item() * len(labels_b)
+                else:
+                    test_loss_total += F.binary_cross_entropy_with_logits(
+                        logits, labels_b.float()).item() * len(labels_b)
         test_losses.append(test_loss_total / len(test_dl.dataset))
 
         # Validation loss + early stopping (only when val_dl is provided)
@@ -368,8 +414,12 @@ def _train_one_run(
             with torch.no_grad():
                 for batch in val_dl:
                     logits, labels_b = _forward(model, batch)
-                    val_loss_total += F.binary_cross_entropy_with_logits(
-                        logits, labels_b.float()).item() * len(labels_b)
+                    if is_pure:
+                        val_loss_total += F.cross_entropy(
+                            logits, labels_b.argmax(dim=1).long()).item() * len(labels_b)
+                    else:
+                        val_loss_total += F.binary_cross_entropy_with_logits(
+                            logits, labels_b.float()).item() * len(labels_b)
             val_loss = val_loss_total / len(val_dl.dataset)
             val_losses.append(val_loss)
             scheduler.step(val_loss)
@@ -415,8 +465,12 @@ def _train_one_run(
                 imgs, labels_b = batch
                 imgs = imgs.to(device)
                 logits = model(imgs)
-            probs = torch.sigmoid(logits).cpu().numpy()
-            preds = (probs >= 0.5).astype(int)
+            if is_pure:
+                probs = F.softmax(logits, dim=1).cpu().numpy()
+                preds = probs.argmax(axis=1)           # (B,) int
+            else:
+                probs = torch.sigmoid(logits).cpu().numpy()
+                preds = (probs >= 0.5).astype(int)
             all_probs.append(probs)
             all_preds.append(preds)
             all_labels.append(labels_b.numpy())
@@ -427,7 +481,8 @@ def _train_one_run(
 
     # Metrics
     results = evaluate_metrics(test_labels_arr, test_preds, test_probs, class_names,
-                               is_binary=args.label_set.endswith('_individual'))
+                               is_binary=args.label_set.endswith('_individual'),
+                               is_pure=is_pure)
     results['label_set']          = args.label_set
     results['eval_fri_frii_pure'] = args.eval_fri_frii_pure
     if extra_results:
@@ -570,6 +625,10 @@ def main():
                         help="When --byol_checkpoint is provided: 'full' trains all parameters "
                              "(default, current retrainbase behaviour); 'linear' freezes the "
                              "backbone and trains only the classification head.")
+    parser.add_argument('--f_label', type=float, default=None,
+                        help="Label fraction: when set, loads labelled_train_idx_f<f>.npy "
+                             "as the training set instead of train_idx.npy. Use this to match "
+                             "the downstream label budget to the BYOL pretraining label fraction.")
     args = parser.parse_args()
     _ls_base = args.label_set[:-11] if args.label_set.endswith('_individual') else args.label_set
     if _ls_base not in LABEL_SETS:
@@ -671,6 +730,9 @@ def main():
             return np.load(p if p.exists() else byol_data / name)
         return np.load(p)
     trainval_idx = _load_idx("train_idx.npy")
+    if getattr(args, 'f_label', None) is not None:
+        _f_str = str(int(args.f_label)) if args.f_label == int(args.f_label) else str(args.f_label)
+        trainval_idx = _load_idx(f"labelled_train_idx_f{_f_str}.npy")
     test_idx     = _load_idx("test_idx.npy")
     print(f"Using split from: {split_label}")
     print(f"  train+val: {len(trainval_idx)}  test: {len(test_idx)}")

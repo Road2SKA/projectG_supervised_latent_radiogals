@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=byol_clf_cv5
-#SBATCH --array=0-10
+#SBATCH --array=0-14
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.err
 #SBATCH --partition=normal
@@ -25,9 +25,10 @@ cd "${PROJECT}"
 
 mkdir -p outputs/logs
 
-# Same 11 combinations as sbatch_byol_cv5.sh
-SW_VALUES=("0.0"  "0.05" "0.05" "0.05" "0.05" "0.05" "0.1"  "0.1"  "0.1"  "0.1"  "0.1")
-F_VALUES=( "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0")
+# 11 combinations matching sbatch_byol_cv5.sh + 4 sw=0.0/f<1 runs for label-fraction plot
+# (sw=0.0/f<1 dirs are created by sbatch_extract_cv_projections.sh, not trained separately)
+SW_VALUES=("0.0"  "0.05" "0.05" "0.05" "0.05" "0.05" "0.1"  "0.1"  "0.1"  "0.1"  "0.1"  "0.0"  "0.0"  "0.0"  "0.0")
+F_VALUES=( "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "0.05" "0.1"  "0.25" "0.5")
 
 i=$SLURM_ARRAY_TASK_ID
 SW=${SW_VALUES[$i]}

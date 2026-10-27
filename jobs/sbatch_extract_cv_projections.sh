@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=extract_cv_proj
-#SBATCH --array=0-12
+#SBATCH --array=0-15
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.err
 #SBATCH --partition=normal
@@ -19,7 +19,7 @@
 # checkpoint can be re-extracted with different settings (feature type, subset).
 # After this: run sbatch_byol_classifiers_cv5.sh + sbatch_finetuning_cv5.sh (step 3)
 #
-# Extract BYOL projections for all 5 CV folds across 13 run combinations.
+# Extract BYOL projections for all 5 CV folds across 16 run combinations.
 # One array task per (sw, f) run; each task extracts all 5 folds sequentially.
 #
 # Array layout (matches sbatch_byol_cv5.sh indices + extras):
@@ -35,7 +35,10 @@
 #   9:  sw=0.1  f=0.5
 #  10:  sw=0.1  f=1.0
 #  11:  sw=0.5  f=1.0
-#  12:  sw=0.0  f=0.1
+#  12:  sw=0.0  f=0.1   ← reuses sw=0.0/f=1 checkpoint
+#  13:  sw=0.0  f=0.05  ← reuses sw=0.0/f=1 checkpoint
+#  14:  sw=0.0  f=0.25  ← reuses sw=0.0/f=1 checkpoint
+#  15:  sw=0.0  f=0.5   ← reuses sw=0.0/f=1 checkpoint
 #
 # Run BEFORE sbatch_byol_classifiers_cv5.sh and sbatch_mlp_es02_cv5.sh.
 
@@ -49,8 +52,8 @@ cd "${PROJECT}"
 mkdir -p outputs/logs
 export PYTHONUNBUFFERED=1
 
-SW_VALUES=("0.0"  "0.05" "0.05" "0.05" "0.05" "0.05" "0.1"  "0.1"  "0.1"  "0.1"  "0.1"  "0.5"  "0.0")
-F_VALUES=( "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "1.0"  "0.1")
+SW_VALUES=("0.0"  "0.05" "0.05" "0.05" "0.05" "0.05" "0.1"  "0.1"  "0.1"  "0.1"  "0.1"  "0.5"  "0.0"  "0.0"  "0.0"  "0.0")
+F_VALUES=( "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "0.05" "0.1"  "0.25" "0.5"  "1.0"  "1.0"  "0.1"  "0.05" "0.25" "0.5")
 
 i=$SLURM_ARRAY_TASK_ID
 SW=${SW_VALUES[$i]}
@@ -63,14 +66,14 @@ SPLITS_DIR="outputs/data_splits/2"
 echo "=== extract_cv_proj  task=${i}  run=${RUN_NAME} — $(date) ==="
 echo "Node: ${SLURMD_NODENAME:-local}  GPU: ${CUDA_VISIBLE_DEVICES:-?}"
 
-# Task 12 (sw=0.0_f=0.1): reuse the sw=0.0_f=1 checkpoint — labels don't affect
-# sw=0.0 training so both models are identical. The f=0.1 split files differ, so
-# we still need a separate extraction pass with f-label=0.1.
+# Tasks 12-15 (sw=0.0, f<1): reuse the sw=0.0/f=1 checkpoint — labels don't affect
+# sw=0.0 training so all these models are identical. Each task still needs its own
+# extraction pass so the fraction-specific split files (labelled_train_idx_fX.npy) are used.
 EXTRA_ARGS=""
-if [ "${i}" -eq 12 ]; then
+if [ "${i}" -ge 12 ]; then
     SW0_F1_CKPT="outputs/byol_runs/pd128_qext_v1_wd1e-3_lrconst_sw0.0_f1/data_seed_2/training_seed_2/cross_val_0/byol_model_best.pt"
     EXTRA_ARGS="--checkpoint ${SW0_F1_CKPT}"
-    echo "  Task 12: using sw=0.0_f=1 checkpoint: ${SW0_F1_CKPT}"
+    echo "  Task ${i}: using sw=0.0_f=1 checkpoint: ${SW0_F1_CKPT}"
 fi
 
 python scripts/extract_cv_projections.py \

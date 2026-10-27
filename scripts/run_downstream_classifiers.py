@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 from suplat.utils.class_weights import compute_class_weights, compute_sample_weights
 from suplat.data.label_sets import (
     ALL_CLASS_NAMES, DERIVED_CLASS_NAMES, LABEL_SETS,
-    INTEREST_TIER_CLASS_NAMES, INTEREST_BINARY_CLASS_NAMES, INITIAL_BINARY_CLASS_NAMES,
+    INTEREST_TIER_CLASS_NAMES, INTERESTING_CLASS_NAMES,
     make_derived as _make_derived, apply_label_set,
 )
 
@@ -338,10 +338,8 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         class_names = DERIVED_CLASS_NAMES
     elif label_set == "interest_tier":
         class_names = INTEREST_TIER_CLASS_NAMES
-    elif label_set == "interest_binary":
-        class_names = INTEREST_BINARY_CLASS_NAMES
-    elif label_set == "initial_binary":
-        class_names = INITIAL_BINARY_CLASS_NAMES
+    elif label_set == "interesting":
+        class_names = INTERESTING_CLASS_NAMES
     else:
         _base_ls    = label_set[:-11] if label_set.endswith('_individual') else label_set
         class_names = [ALL_CLASS_NAMES[i] for i in LABEL_SETS[_base_ls]]
@@ -355,7 +353,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
     X_test  = scaler.transform(X_test)
 
     # ── Multiclass vs multi-label ─────────────────────────────────────────────
-    _pure_sets    = {"classical_pure", "initial_pure", "morphology_pure", "initial_binary"}
+    _pure_sets    = {"classical_pure", "initial_pure", "morphology_pure"}
     is_multiclass = label_set in _pure_sets
     if is_multiclass:
         y_train = y_train_raw.argmax(axis=1)
@@ -381,7 +379,7 @@ def process_run(run_dir: Path, feature_type: str, label_set: str,
         # → per-sample weight = mean alpha over each sample's positive classes.
         if (class_weight_mode is not None and class_weight_mode != "score"
                 and class_weight_strength > 0.0
-                and label_set not in ("derived", "interest_tier", "interest_binary", "initial_binary")):
+                and label_set not in ("derived", "interest_tier", "interesting")):
             _alpha_full = compute_class_weights(
                 y_train_full[train_mask, :20],
                 class_weight_mode,

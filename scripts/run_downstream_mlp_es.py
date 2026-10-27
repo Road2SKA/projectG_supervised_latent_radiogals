@@ -6,6 +6,7 @@ results (mlp_projections.json, mlp_v2_*_projections.json) are NOT overwritten:
 
   v1  sklearn MLPClassifier — same (256,128) arch as ref, but val_fraction=0.2
       Output: mlp_es02_{feature_type}.json
+      NOTE: only supported for _pure label sets.
 
   v2  PyTorch MLP sweep — same 9 arch×wd configs as run_downstream_mlp_v2.py,
       but with early stopping (val_fraction=0.2, patience=20, max_epochs=300).
@@ -16,6 +17,12 @@ model with the lowest validation loss is restored at the end.  Training stops
 when val loss has not improved for `patience` consecutive epochs.
 
 val_fraction=0.2 for both families.
+
+Label-set semantics:
+  _pure label sets (e.g. initial_pure): single-label multiclass.
+      Loss: CrossEntropyLoss;  prediction: softmax + argmax.
+  All other label sets (no suffix, _binary, _individual): multilabel/multi-binary.
+      Loss: BCEWithLogitsLoss;  prediction: sigmoid + 0.5 threshold.
 
 Usage (single sw/fold, as called from sbatch array):
     python scripts/run_downstream_mlp_es.py \\
@@ -62,35 +69,62 @@ V2_HIDDEN_SPECS  = ["256x128", "512x256", "256"]
 V2_WEIGHT_DECAYS = [0.0, 1e-4, 1e-3]
 
 
+def _is_pure(label_set: str) -> bool:
+    """Return True only for single-label multiclass sets (CrossEntropy/argmax)."""
+    return label_set.endswith("_pure")
+
+
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
-def evaluate_metrics(y_true, y_pred, y_prob, class_names):
+def evaluate_metrics(y_true, y_pred, y_prob, class_names, is_pure=True):
     n = len(class_names)
-    y_true_bin = label_binarize(y_true, classes=list(range(n)))
-    # sklearn returns (N, 1) for binary; expand to (N, 2) so indexing is uniform
-    if y_true_bin.ndim == 2 and y_true_bin.shape[1] == 1:
-        y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
-    aucs = []
-    for i in range(n):
-        if i >= y_prob.shape[1] or len(np.unique(y_true_bin[:, i])) < 2:
-            aucs.append(None)
-        else:
-            aucs.append(float(roc_auc_score(y_true_bin[:, i], y_prob[:, i])))
-    return {
-        "f1_macro":           float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-        "auc_macro":          float(np.nanmean([a for a in aucs if a is not None])),
-        "accuracy":           float(accuracy_score(y_true, y_pred)),
-        "recall_macro":       float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-        "f1_per_class":       f1_score(y_true, y_pred, average=None,
-                                       labels=list(range(n)), zero_division=0).tolist(),
-        "recall_per_class":   recall_score(y_true, y_pred, average=None,
+
+    if is_pure:
+        # Single-label multiclass: y_true/y_pred are 1-D integer class labels.
+        y_true_bin = label_binarize(y_true, classes=list(range(n)))
+        if y_true_bin.ndim == 2 and y_true_bin.shape[1] == 1:
+            y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
+        aucs = []
+        for i in range(n):
+            if i >= y_prob.shape[1] or len(np.unique(y_true_bin[:, i])) < 2:
+                aucs.append(None)
+            else:
+                aucs.append(float(roc_auc_score(y_true_bin[:, i], y_prob[:, i])))
+        return {
+            "f1_macro":           float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+            "auc_macro":          float(np.nanmean([a for a in aucs if a is not None])),
+            "accuracy":           float(accuracy_score(y_true, y_pred)),
+            "recall_macro":       float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+            "f1_per_class":       f1_score(y_true, y_pred, average=None,
                                            labels=list(range(n)), zero_division=0).tolist(),
-        "accuracy_per_class": [float(accuracy_score((y_true == c).astype(int),
-                                                    (y_pred == c).astype(int)))
-                               for c in range(n)],
-        "auc_per_class":      aucs,
-        "class_names":        class_names,
-    }
+            "recall_per_class":   recall_score(y_true, y_pred, average=None,
+                                               labels=list(range(n)), zero_division=0).tolist(),
+            "accuracy_per_class": [float(accuracy_score((y_true == c).astype(int),
+                                                        (y_pred == c).astype(int)))
+                                   for c in range(n)],
+            "auc_per_class":      aucs,
+            "class_names":        class_names,
+        }
+    else:
+        # Multilabel/multi-binary: y_true/y_pred are 2-D multi-hot (N, n_classes).
+        aucs = []
+        for i in range(n):
+            if len(np.unique(y_true[:, i])) < 2:
+                aucs.append(None)
+            else:
+                aucs.append(float(roc_auc_score(y_true[:, i], y_prob[:, i])))
+        return {
+            "f1_macro":           float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+            "auc_macro":          float(np.nanmean([a for a in aucs if a is not None])),
+            "accuracy":           float(accuracy_score(y_true, y_pred)),
+            "recall_macro":       float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+            "f1_per_class":       f1_score(y_true, y_pred, average=None, zero_division=0).tolist(),
+            "recall_per_class":   recall_score(y_true, y_pred, average=None, zero_division=0).tolist(),
+            "accuracy_per_class": [(y_true[:, i] == y_pred[:, i]).mean()
+                                   for i in range(n)],
+            "auc_per_class":      aucs,
+            "class_names":        class_names,
+        }
 
 
 # ── PyTorch helpers ───────────────────────────────────────────────────────────
@@ -105,7 +139,7 @@ def build_mlp(in_dim, hidden, n_classes):
 
 
 def train_mlp_es(X_train_full, y_train_full, hidden, weight_decay, seed,
-                 val_fraction=VAL_FRACTION, patience=PATIENCE,
+                 is_pure=True, val_fraction=VAL_FRACTION, patience=PATIENCE,
                  max_epochs=MAX_EPOCHS_V2):
     """
     Train with early stopping on a held-out val split.
@@ -122,18 +156,25 @@ def train_mlp_es(X_train_full, y_train_full, hidden, weight_decay, seed,
     X_tr, y_tr = X_train_full[tr_idx], y_train_full[tr_idx]
     X_val, y_val = X_train_full[val_idx], y_train_full[val_idx]
 
-    n_classes = int(y_train_full.max()) + 1
-
-    X_tr_t  = torch.from_numpy(X_tr).float()
-    y_tr_t  = torch.from_numpy(y_tr).long()
-    X_val_t = torch.from_numpy(X_val).float()
-    y_val_t = torch.from_numpy(y_val).long()
+    if is_pure:
+        n_classes = int(y_train_full.max()) + 1
+        X_tr_t  = torch.from_numpy(X_tr).float()
+        y_tr_t  = torch.from_numpy(y_tr).long()
+        X_val_t = torch.from_numpy(X_val).float()
+        y_val_t = torch.from_numpy(y_val).long()
+        criterion = nn.CrossEntropyLoss()
+    else:
+        n_classes = y_train_full.shape[1]
+        X_tr_t  = torch.from_numpy(X_tr).float()
+        y_tr_t  = torch.from_numpy(y_tr).float()
+        X_val_t = torch.from_numpy(X_val).float()
+        y_val_t = torch.from_numpy(y_val).float()
+        criterion = nn.BCEWithLogitsLoss()
 
     tr_loader = DataLoader(TensorDataset(X_tr_t, y_tr_t),
                            batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
 
     model = build_mlp(X_train_full.shape[1], hidden, n_classes)
-    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=weight_decay)
 
     best_val_loss  = float("inf")
@@ -148,7 +189,6 @@ def train_mlp_es(X_train_full, y_train_full, hidden, weight_decay, seed,
             criterion(model(Xb), yb).backward()
             optimizer.step()
 
-        # Validation loss
         model.eval()
         with torch.no_grad():
             val_loss = criterion(model(X_val_t), y_val_t).item()
@@ -168,17 +208,27 @@ def train_mlp_es(X_train_full, y_train_full, hidden, weight_decay, seed,
 
 
 @torch.no_grad()
-def predict_mlp(model, X):
+def predict_mlp(model, X, is_pure=True):
     model.eval()
     logits = model(torch.from_numpy(X).float())
-    probs  = torch.softmax(logits, dim=1).numpy()
-    return probs.argmax(axis=1), probs
+    if is_pure:
+        probs = torch.softmax(logits, dim=1).numpy()
+        return probs.argmax(axis=1), probs
+    else:
+        probs = torch.sigmoid(logits).numpy()
+        preds = (probs >= 0.5).astype(np.float32)
+        return preds, probs
 
 
 # ── Data loading (shared between v1 and v2) ───────────────────────────────────
 
 def load_data(run_dir, feature_type, label_set, data_seed, seed, cv_fold):
-    """Returns (X_train, X_test, y_train, y_test, class_names, clf_dir) or None on error."""
+    """Returns (X_train, X_test, y_train, y_test, class_names, clf_dir, is_pure)
+    or None on error.
+
+    For _pure label sets y_train/y_test are 1-D integer class labels.
+    For all other label sets they are 2-D float multi-hot arrays.
+    """
     _eff_ds   = data_seed if data_seed is not None else seed
     _fold_dir = (run_dir / f"data_seed_{_eff_ds}" / f"training_seed_{seed}"
                  / f"cross_val_{cv_fold}") if cv_fold is not None else (
@@ -238,23 +288,35 @@ def load_data(run_dir, feature_type, label_set, data_seed, seed, cv_fold):
         return None
 
     class_names = class_names_for(label_set)
+    pure = _is_pure(label_set)
 
     scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_train_raw[tr_mask])
     X_test  = scaler.transform(X_test_raw[te_mask])
-    y_train = y_tr_raw.argmax(axis=1)
-    y_test  = y_te_raw.argmax(axis=1)
+
+    if pure:
+        y_train = y_tr_raw.argmax(axis=1)
+        y_test  = y_te_raw.argmax(axis=1)
+    else:
+        y_train = y_tr_raw.astype(np.float32)
+        y_test  = y_te_raw.astype(np.float32)
 
     clf_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  train={len(X_train)}  test={len(X_test)}  classes={len(class_names)}",
+    print(f"  train={len(X_train)}  test={len(X_test)}  classes={len(class_names)}"
+          f"  mode={'multiclass' if pure else 'multilabel'}",
           flush=True)
-    return X_train, X_test, y_train, y_test, class_names, clf_dir
+    return X_train, X_test, y_train, y_test, class_names, clf_dir, pure
 
 
 # ── v1: sklearn MLP, val_fraction=0.2 ─────────────────────────────────────────
 
 def run_v1(data, run_dir, feature_type, label_set, seed, force):
-    X_train, X_test, y_train, y_test, class_names, clf_dir = data
+    X_train, X_test, y_train, y_test, class_names, clf_dir, is_pure = data
+
+    if not is_pure:
+        print(f"  mlp_es02: skipped — sklearn v1 only supports _pure label sets", flush=True)
+        return
+
     out = clf_dir / f"mlp_es02_{feature_type}.json"
     if out.exists() and not force:
         print(f"  mlp_es02: cached — skip", flush=True)
@@ -280,7 +342,7 @@ def run_v1(data, run_dir, feature_type, label_set, seed, force):
 
     y_pred = mlp.predict(X_test)
     y_prob = mlp.predict_proba(X_test)
-    metrics = evaluate_metrics(y_test, y_pred, y_prob, class_names)
+    metrics = evaluate_metrics(y_test, y_pred, y_prob, class_names, is_pure=True)
     print(f"    F1={metrics['f1_macro']:.4f}  AUC={metrics['auc_macro']:.4f}", flush=True)
 
     payload = {
@@ -309,7 +371,7 @@ def _wd_tag(wd):
 
 
 def run_v2_es(data, run_dir, feature_type, label_set, seed, force):
-    X_train, X_test, y_train, y_test, class_names, clf_dir = data
+    X_train, X_test, y_train, y_test, class_names, clf_dir, is_pure = data
 
     for hidden_spec in V2_HIDDEN_SPECS:
         hidden   = [int(x) for x in hidden_spec.split("x")]
@@ -324,12 +386,12 @@ def run_v2_es(data, run_dir, feature_type, label_set, seed, force):
 
             print(f"  mlp_v2_{arch_tag}_{wt}_es02: training...", flush=True)
             model, n_ep, best_ep, best_vl = train_mlp_es(
-                X_train, y_train, hidden, float(wd), seed)
+                X_train, y_train, hidden, float(wd), seed, is_pure=is_pure)
             print(f"    stopped ep={n_ep}  best_ep={best_ep}  best_val_loss={best_vl:.4f}",
                   flush=True)
 
-            y_pred, y_prob = predict_mlp(model, X_test)
-            metrics = evaluate_metrics(y_test, y_pred, y_prob, class_names)
+            y_pred, y_prob = predict_mlp(model, X_test, is_pure=is_pure)
+            metrics = evaluate_metrics(y_test, y_pred, y_prob, class_names, is_pure=is_pure)
             print(f"    F1={metrics['f1_macro']:.4f}  AUC={metrics['auc_macro']:.4f}",
                   flush=True)
 

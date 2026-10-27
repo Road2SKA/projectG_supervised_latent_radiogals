@@ -15,8 +15,7 @@
 # Runs LR/KNN/RF (run_downstream_classifiers.py) and MLP-v2 (run_downstream_mlp_es.py)
 # for additional label sets on the 4 sw-sweep f=1 runs × 5 CV folds.
 #
-# Label sets: classical_pure, initial_binary, full, full_individual
-# (initial_pure is already covered by sbatch_byol_classifiers_cv5.sh)
+# Label sets: classical_pure, initial_pure, initial_binary, full_binary
 #
 # Array: 4 runs × 5 folds = 20 tasks  (task_id = run_idx*5 + fold_idx)
 
@@ -37,7 +36,7 @@ RUN_NAMES=(
     "pd128_qext_v1_wd1e-3_lrconst_sw0.5_f1"
 )
 
-LABEL_SETS=("classical_pure" "initial_binary" "full" "full_individual")
+LABEL_SETS=("classical_pure" "initial_pure" "initial_binary" "full_binary")
 
 RUN_IDX=$(( SLURM_ARRAY_TASK_ID / 5 ))
 FOLD=$(( SLURM_ARRAY_TASK_ID % 5 ))
@@ -49,6 +48,9 @@ echo "run=${RUN_NAME}  fold=${FOLD}  data_seed=2  seed=2"
 
 for LS in "${LABEL_SETS[@]}"; do
     echo "--- label-set: ${LS} ---"
+    FORCE_ARG=""
+    [ "${LS}" = "initial_binary" ] && FORCE_ARG="--force"
+
     python scripts/run_downstream_classifiers.py \
         --outputs-root outputs/byol_runs \
         --run-glob     "${RUN_NAME}" \
@@ -58,7 +60,8 @@ for LS in "${LABEL_SETS[@]}"; do
         --workers      8 \
         --seed         2 \
         --data-seed    2 \
-        --cv-fold      "${FOLD}"
+        --cv-fold      "${FOLD}" \
+        ${FORCE_ARG}
 
     python scripts/run_downstream_mlp_es.py \
         --outputs-root outputs/byol_runs \
@@ -67,7 +70,8 @@ for LS in "${LABEL_SETS[@]}"; do
         --label-set    "${LS}" \
         --seed         2 \
         --data-seed    2 \
-        --cv-fold      "${FOLD}"
+        --cv-fold      "${FOLD}" \
+        ${FORCE_ARG}
 done
 
 echo "Done — $(date)"

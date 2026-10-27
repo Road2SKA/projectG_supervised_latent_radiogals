@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=mlp_frac_cv5
-#SBATCH --array=0-44
+#SBATCH --array=0-59
 #SBATCH --output=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.out
 #SBATCH --error=/users/mbredber/p3_SUPLAT/outputs/logs/%x-%A_%a.err
 #SBATCH --partition=normal
@@ -15,18 +15,21 @@
 # MLP classifiers (early stopping) for f<1 runs — fills in the f-sweep in
 # the classification notebook.  sbatch_mlp_es02_cv5.sh already covers f=1.
 #
-# 9 runs × 5 CV folds = 45 tasks.  task_id = run_idx*5 + fold_idx
+# 12 runs × 5 CV folds = 60 tasks.  task_id = run_idx*5 + fold_idx
 #
 # Run layout:
-#   idx 0: sw=0.0  f=0.1
-#   idx 1: sw=0.05 f=0.05
-#   idx 2: sw=0.05 f=0.1
-#   idx 3: sw=0.05 f=0.25
-#   idx 4: sw=0.05 f=0.5
-#   idx 5: sw=0.1  f=0.05
-#   idx 6: sw=0.1  f=0.1
-#   idx 7: sw=0.1  f=0.25
-#   idx 8: sw=0.1  f=0.5
+#   idx 0:  sw=0.0  f=0.05
+#   idx 1:  sw=0.0  f=0.1
+#   idx 2:  sw=0.0  f=0.25
+#   idx 3:  sw=0.0  f=0.5
+#   idx 4:  sw=0.05 f=0.05
+#   idx 5:  sw=0.05 f=0.1
+#   idx 6:  sw=0.05 f=0.25
+#   idx 7:  sw=0.05 f=0.5
+#   idx 8:  sw=0.1  f=0.05
+#   idx 9:  sw=0.1  f=0.1
+#   idx 10: sw=0.1  f=0.25
+#   idx 11: sw=0.1  f=0.5
 
 set -euo pipefail
 
@@ -39,7 +42,10 @@ mkdir -p outputs/logs
 export PYTHONUNBUFFERED=1
 
 RUN_NAMES=(
+    "pd128_qext_v1_wd1e-3_lrconst_sw0.0_f0.05"
     "pd128_qext_v1_wd1e-3_lrconst_sw0.0_f0.1"
+    "pd128_qext_v1_wd1e-3_lrconst_sw0.0_f0.25"
+    "pd128_qext_v1_wd1e-3_lrconst_sw0.0_f0.5"
     "pd128_qext_v1_wd1e-3_lrconst_sw0.05_f0.05"
     "pd128_qext_v1_wd1e-3_lrconst_sw0.05_f0.1"
     "pd128_qext_v1_wd1e-3_lrconst_sw0.05_f0.25"
