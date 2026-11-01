@@ -44,8 +44,8 @@ from suplat.models.byol_models import (
 
 TRAINING_MODE_DESCRIPTIONS = {
     1: "Freeze embeddings: frozen encoder and projector; train linear classifier only.",
-    2: "Freeze features: frozen encoder; fine-tune projector and train linear classifier.",
-    3: "No freeze: fine-tune encoder and projector; train linear classifier.",
+    2: "Finetuning: frozen encoder; train projector and linear classifier.",       # paper: "finetuning"
+    3: "Retraining: train encoder, projector, and linear classifier end-to-end.",  # paper: "retraining"
     4: "Supervised: initialize from scratch and train encoder, projector, and linear classifier.",
 }
 
@@ -262,8 +262,8 @@ class BYOLFineTuner(nn.Module):
         """
         training_mode:
             1 = freeze encoder + projector, train classifier only
-            2 = freeze encoder, train projector + classifier
-            3 = train encoder + projector + classifier
+            2 = freeze encoder, train projector + classifier          [paper: "finetuning"]
+            3 = train encoder + projector + classifier end-to-end     [paper: "retraining"]
             4 = train encoder + projector + classifier from scratch
         """
         if training_mode not in TRAINING_MODE_DESCRIPTIONS:
