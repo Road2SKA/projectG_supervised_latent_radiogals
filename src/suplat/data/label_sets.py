@@ -51,6 +51,8 @@ LABEL_SETS = {
     "interesting":            None,
     # _binary variants: same columns as base set, N independent sigmoid heads (BCE)
     "initial_binary":         list(range(0, 5)),
+    "majority_binary":        [0, 1, 2, 5, 6, 7, 8, 11],
+    "medium_binary":          [2, 5, 6, 7, 8, 11],
     "full_binary":            list(range(0, 20)),
     # _pure variants: same columns, row-filtered to single-positive (CrossEntropy)
     "classical_pure":         [0, 1],
