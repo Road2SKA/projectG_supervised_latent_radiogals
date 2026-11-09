@@ -1,18 +1,13 @@
 """Noise robustness sweep for downstream classifiers.
 
-Two independent experiments:
-  1. Feature noise  — train on clean projections, evaluate on test projections
-                      with additive isotropic Gaussian noise (σ sweep).
-  2. Label noise    — corrupt a fraction τ of training labels (uniform random
-                      class flip), retrain classifiers, evaluate on clean test.
-
-Both use the "train clean / test noisy" paradigm (feature noise) or
-"train noisy / test clean" paradigm (label noise).
+Feature noise: train on clean projections, evaluate on test projections
+with additive isotropic Gaussian noise (σ sweep). Follows the "train
+clean / test noisy" paradigm — the classifier/features are never touched,
+only what happens on the test side.
 
 Outputs
 -------
   <out_dir>/feat_noise/sw{sw}_ls{ls}_fold{k}_sigma{s}.json
-  <out_dir>/label_noise/sw{sw}_ls{ls}_fold{k}_tau{t}.json
 
 Each JSON: sw, label_set, fold, noise_type, noise_level,
            classifier, f1_macro, f1_per_class, accuracy, class_names.
@@ -59,30 +54,6 @@ def _make_clf(name, seed=42):
 
 
 # ---------------------------------------------------------------------------
-# Label noise helpers
-# ---------------------------------------------------------------------------
-
-def _flip_multiclass(y_int, n_classes, tau, rng):
-    """Flip each integer label to a uniform random other class with prob tau."""
-    y_out = y_int.copy()
-    flip  = rng.random(len(y_int)) < tau
-    if not flip.any():
-        return y_out
-    new_cls = rng.integers(0, n_classes - 1, size=int(flip.sum()))
-    # shift labels >= original to avoid same-class assignment
-    orig = y_int[flip]
-    new_cls[new_cls >= orig] += 1
-    y_out[flip] = new_cls
-    return y_out
-
-
-def _flip_binary(y_multihot, tau, rng):
-    """Flip each bit independently with prob tau (for multi-label binary sets)."""
-    flip = rng.random(y_multihot.shape) < tau
-    return np.where(flip, 1 - y_multihot, y_multihot).astype(y_multihot.dtype)
-
-
-# ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
@@ -106,11 +77,11 @@ def _process_fold(
     label_set: str,
     feature_type: str,
     feat_sigmas,
-    label_noise_rates,
     classifiers,
     seed: int,
     out_dir: Path,
     data_seed,
+    force: bool = False,
 ):
     # ── Locate splits_dir ─────────────────────────────────────────────────
     _search = fold_dir.parent
@@ -184,17 +155,12 @@ def _process_fold(
     if is_multiclass:
         y_tr_int = y_tr_sub.argmax(axis=1)
         y_te_int = y_te_sub.argmax(axis=1)
-        n_cls    = len(class_names)
     else:
-        # multi-label: treat each column as independent binary (not supported by
-        # single-output LR/MLP), so we skip non-pure label sets silently here.
-        # They are handled per-bit via _flip_binary for label noise.
-        # For feature noise the classifier is a MultiOutput wrapper — but to keep
-        # this script simple we only support multiclass (pure) for now.
-        # Non-pure sets are supported for label noise only.
+        # Multi-label sets aren't supported by the single-output LR/MLP
+        # classifiers here, so they're silently skipped (feature noise loop
+        # below only runs when is_multiclass).
         y_tr_int = None
         y_te_int = None
-        n_cls    = len(class_names)
 
     # ── Fit scaler on clean train ─────────────────────────────────────────
     scaler = StandardScaler()
@@ -206,9 +172,7 @@ def _process_fold(
 
     # ── Output dirs ───────────────────────────────────────────────────────
     fn_out  = out_dir / "feat_noise"
-    ln_out  = out_dir / "label_noise"
     fn_out.mkdir(parents=True, exist_ok=True)
-    ln_out.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(seed)
 
@@ -224,7 +188,7 @@ def _process_fold(
                 continue
             for sigma in feat_sigmas:
                 _out_path = fn_out / f"sw{sw}_ls{label_set}_fold{fold_idx}_sigma{sigma}_{clf_name}.json"
-                if _out_path.exists():
+                if _out_path.exists() and not force:
                     continue
                 if sigma == 0.0:
                     X_te_noisy = X_te_sc
@@ -250,65 +214,6 @@ def _process_fold(
             print(f"  [fn] sw={sw} ls={label_set} fold={fold_idx} clf={clf_name} done",
                   flush=True)
 
-    # ── Label noise loop ──────────────────────────────────────────────────
-    for tau in label_noise_rates:
-        for clf_name in classifiers:
-            _out_path = ln_out / f"sw{sw}_ls{label_set}_fold{fold_idx}_tau{tau}_{clf_name}.json"
-            if _out_path.exists():
-                continue
-
-            if is_multiclass:
-                if tau == 0.0:
-                    y_tr_noisy = y_tr_int
-                else:
-                    y_tr_noisy = _flip_multiclass(y_tr_int, n_cls, tau, rng)
-                clf = _make_clf(clf_name, seed=seed)
-                try:
-                    clf.fit(X_tr_sc, y_tr_noisy)
-                except Exception as e:
-                    print(f"  [warn] label_noise clf={clf_name} tau={tau} fit failed: {e}",
-                          flush=True)
-                    continue
-                y_pred = clf.predict(X_te_sc)
-                result = {
-                    "sw":          sw,
-                    "label_set":   label_set,
-                    "fold":        fold_idx,
-                    "noise_type":  "label",
-                    "noise_level": tau,
-                    "classifier":  clf_name,
-                    **_metrics(y_te_int, y_pred, class_names),
-                }
-            else:
-                # Multi-label: independent per-bit flip
-                from sklearn.multioutput import MultiOutputClassifier
-                if tau == 0.0:
-                    y_tr_noisy = y_tr_sub
-                else:
-                    y_tr_noisy = _flip_binary(y_tr_sub, tau, rng)
-                _clf_inner = _make_clf(clf_name, seed=seed)
-                clf = MultiOutputClassifier(_clf_inner)
-                try:
-                    clf.fit(X_tr_sc, y_tr_noisy)
-                except Exception as e:
-                    print(f"  [warn] label_noise (multi) clf={clf_name} tau={tau} fit failed: {e}",
-                          flush=True)
-                    continue
-                y_pred = clf.predict(X_te_sc)
-                result = {
-                    "sw":          sw,
-                    "label_set":   label_set,
-                    "fold":        fold_idx,
-                    "noise_type":  "label",
-                    "noise_level": tau,
-                    "classifier":  clf_name,
-                    **_metrics(y_te_sub, y_pred, class_names),
-                }
-
-            with open(_out_path, "w") as fh:
-                json.dump(result, fh)
-        print(f"  [ln] sw={sw} ls={label_set} fold={fold_idx} tau={tau} done", flush=True)
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -331,8 +236,6 @@ def main():
     parser.add_argument("--feat_sigmas",   nargs="+", type=float,
                         default=[0.0, 0.25, 0.5, 1.0, 2.0],
                         help="Gaussian sigma as std units in scaled feature space.")
-    parser.add_argument("--label_noise",   nargs="+", type=float,
-                        default=[0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8])
     parser.add_argument("--out_dir",       required=True,
                         help="Where to write result JSON files.")
     parser.add_argument("--classifiers",   nargs="+", default=["lr", "mlp"])
@@ -340,6 +243,8 @@ def main():
     parser.add_argument("--training_seed", type=int, default=2)
     parser.add_argument("--seed",          type=int, default=42,
                         help="RNG seed for noise and classifier init.")
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite existing result JSONs instead of skipping them.")
     args = parser.parse_args()
 
     outputs_root = Path(args.outputs_root)
@@ -379,11 +284,11 @@ def main():
                     label_set    = label_set,
                     feature_type = args.feature_type,
                     feat_sigmas  = args.feat_sigmas,
-                    label_noise_rates = args.label_noise,
                     classifiers  = args.classifiers,
                     seed         = args.seed,
                     out_dir      = out_dir,
                     data_seed    = args.data_seed,
+                    force        = args.force,
                 )
 
     print("\nDone.")

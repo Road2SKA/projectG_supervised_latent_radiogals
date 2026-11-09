@@ -26,7 +26,7 @@ python /users/mbredber/p3_SUPLAT/scripts/noise_robustness_image_label.py \
     --label_set    initial_pure \
     --sw_vals      0.0 0.05 0.1 \
     --img_sigmas   0.0 0.1 0.25 0.5 1.0 2.0 \
-    --label_noise  0.0 0.05 0.1 0.2 0.4 0.6 0.8 \
+    --blur_sigmas  0.0 1.0 2.0 4.0 6.0 10.0 \
     --data_seed    2 \
     --training_seed 2 \
     --batch_size   256 \

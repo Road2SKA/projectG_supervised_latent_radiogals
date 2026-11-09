@@ -1,14 +1,20 @@
-"""Noise robustness sweep — image noise and label noise for deep models.
+"""Noise robustness sweep — image and resolution noise for deep models.
 
 Three model families:
-  - byol_mlp   : sklearn MLP on BYOL projections (re-extracted from noisy images for image noise)
+  - byol_mlp   : sklearn MLP on BYOL projections (re-extracted from corrupted images)
   - finetuned  : full PyTorch finetuned model (lineareval_byol_sw_cv5_sw{sw}_fold{k})
   - supervised : full PyTorch supervised model (retrain_sup_noes_cv5_fold{k})
+
+Image and resolution noise both follow a "train clean / test noisy"
+paradigm: the model/classifier is fit once on clean train data, then
+evaluated against a corrupted test set (noisy images or blurred images).
+Resolution noise simulates PSF/angular-resolution degradation via Gaussian
+blur of the image (kernel std in pixels), rather than additive per-pixel noise.
 
 Outputs
 -------
   <out_dir>/image_noise/{model_type}_sw{sw}_fold{k}_sigma{s}.json
-  <out_dir>/label_noise_deep/{model_type}_sw{sw}_fold{k}_tau{t}.json
+  <out_dir>/resolution_noise/{model_type}_sw{sw}_fold{k}_blur{b}.json
   For supervised (no sw): sw value is "none" in filename.
 
 Each JSON: model_type, sw, fold, label_set, noise_type, noise_level,
@@ -16,19 +22,24 @@ Each JSON: model_type, sw, fold, label_set, noise_type, noise_level,
 """
 
 import argparse
+import copy
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.linear_model import LogisticRegression
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from scipy.ndimage import gaussian_filter
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from run_downstream_mlp_es import build_mlp, train_mlp_es, predict_mlp
 
 from suplat.data.label_sets import ALL_CLASS_NAMES, LABEL_SETS, apply_label_set
 from suplat.models.byol_models import BYOLEfficientNetB0
@@ -47,17 +58,13 @@ def _metrics(y_true, y_pred, class_names):
     }
 
 
-def _flip_multiclass(y_int, n_classes, tau, rng):
-    """Flip each integer label to a uniform random other class with prob tau."""
-    y_out = y_int.copy()
-    flip  = rng.random(len(y_int)) < tau
-    if not flip.any():
-        return y_out
-    new_cls = rng.integers(0, n_classes - 1, size=int(flip.sum()))
-    orig = y_int[flip]
-    new_cls[new_cls >= orig] += 1
-    y_out[flip] = new_cls
-    return y_out
+def _blur_images(images_arr, sigma_px):
+    """Gaussian-blur each (H, W) image independently; sigma_px in pixels."""
+    if sigma_px == 0.0:
+        return images_arr
+    return np.stack([
+        gaussian_filter(im, sigma=sigma_px) for im in images_arr
+    ]).astype(np.float32)
 
 
 def _images_to_tensor(images_arr, device):
@@ -85,26 +92,6 @@ def _extract_projections(byol_model, images_arr, device, batch_size=256):
         enc  = byol_model.online_encoder(t)   # (B, 1280)
         proj = byol_model.online_projector(enc)  # (B, 128)
         results.append(proj.cpu().numpy())
-    return np.concatenate(results, axis=0).astype(np.float32)
-
-
-@torch.no_grad()
-def _extract_backbone_features(model, images_arr, device, batch_size=256):
-    """Run model[0] (EfficientNet backbone) over images_arr.
-
-    model[1] is a Flatten (no-op since backbone already flattens).
-    Returns (N, 1280) float32.
-    """
-    model.eval()
-    model.to(device)
-    backbone = model[0]
-    results = []
-    n = len(images_arr)
-    for start in range(0, n, batch_size):
-        batch = images_arr[start:start + batch_size]
-        t = _images_to_tensor(batch, device)
-        feat = backbone(t)   # (B, 1280)
-        results.append(feat.cpu().numpy())
     return np.concatenate(results, axis=0).astype(np.float32)
 
 
@@ -139,10 +126,12 @@ def _load_byol_model(byol_runs_root, sw, fold_k, data_seed, training_seed, devic
         hidden_dim=4096,
         feature_compression_mode="mlp",
     )
-    state = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    # Checkpoint is a training dict; model weights live under 'model_state_dict'
+    state = ckpt.get("model_state_dict", ckpt)
     # Strip _orig_mod. prefix added by torch.compile
     state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state, strict=True)
     model.eval()
     return model.to(device)
 
@@ -172,16 +161,6 @@ def _sw_str(sw):
     return str(float(sw))
 
 
-def _make_mlp(seed=42):
-    return MLPClassifier(
-        hidden_layer_sizes=(256,),
-        max_iter=200,
-        early_stopping=True,
-        validation_fraction=0.1,
-        random_state=seed,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
@@ -197,8 +176,9 @@ def main():
     parser.add_argument("--sw_vals",     nargs="+", type=float, default=[0.0, 0.05, 0.1])
     parser.add_argument("--img_sigmas",  nargs="+", type=float,
                         default=[0.0, 0.1, 0.25, 0.5, 1.0, 2.0])
-    parser.add_argument("--label_noise", nargs="+", type=float,
-                        default=[0.0, 0.05, 0.1, 0.2, 0.4])
+    parser.add_argument("--blur_sigmas", nargs="+", type=float,
+                        default=[0.0, 1.0, 2.0, 4.0, 6.0, 10.0],
+                        help="Gaussian blur kernel std, in pixels (images are 89x89).")
     parser.add_argument("--data_seed",   type=int, default=2)
     parser.add_argument("--training_seed", type=int, default=2)
     parser.add_argument("--n_folds",     type=int, default=5)
@@ -219,9 +199,9 @@ def main():
     outputs_root   = Path(args.outputs_root)
     out_dir        = Path(args.out_dir)
     img_noise_dir  = out_dir / "image_noise"
-    lbl_noise_dir  = out_dir / "label_noise_deep"
+    res_noise_dir  = out_dir / "resolution_noise"
     img_noise_dir.mkdir(parents=True, exist_ok=True)
-    lbl_noise_dir.mkdir(parents=True, exist_ok=True)
+    res_noise_dir.mkdir(parents=True, exist_ok=True)
 
     byol_runs_root   = outputs_root / "byol_runs"
     finetuned_root   = outputs_root / "classifiers" / "finetuned_sw_cv5" / "without_generative"
@@ -248,7 +228,6 @@ def main():
                          f"Got: {args.label_set!r}")
     _base_ls   = args.label_set
     class_names = [ALL_CLASS_NAMES[i] for i in LABEL_SETS[_base_ls]]
-    n_cls       = len(class_names)
 
     rng = np.random.default_rng(args.seed)
 
@@ -299,11 +278,9 @@ def main():
 
             scaler = StandardScaler()
             X_tr_sc = scaler.fit_transform(X_tr_proj)
-            X_te_sc = scaler.transform(X_te_proj)
 
-            # Train MLP on clean projections
-            mlp_clean = _make_mlp(seed=args.seed)
-            mlp_clean.fit(X_tr_sc, y_tr_int)
+            # Train MLP on clean projections — same arch/hyperparams as mlp_v2_256_wd1e-3_es02
+            mlp_clean, *_ = train_mlp_es(X_tr_sc, y_tr_int, [256], 1e-3, args.seed)
 
             # ── Image noise ─────────────────────────────────────────────
             for sigma in args.img_sigmas:
@@ -319,7 +296,7 @@ def main():
                         byol, X_te_noisy, device, args.batch_size
                     )
                 X_te_noisy_sc = scaler.transform(X_te_noisy_proj)
-                preds = mlp_clean.predict(X_te_noisy_sc)
+                preds, _ = predict_mlp(mlp_clean, X_te_noisy_sc)
                 result = {
                     "model_type": "byol_mlp",
                     "sw": sw,
@@ -333,30 +310,27 @@ def main():
                     json.dump(result, fh)
             print(f"    image noise done", flush=True)
 
-            # ── Label noise ─────────────────────────────────────────────
-            for tau in args.label_noise:
-                _out = lbl_noise_dir / f"byol_mlp_sw{sw_s}_fold{fold_k}_tau{tau}.json"
+            # ── Resolution noise (Gaussian PSF blur) ─────────────────────
+            for blur_sigma in args.blur_sigmas:
+                _out = res_noise_dir / f"byol_mlp_sw{sw_s}_fold{fold_k}_blur{blur_sigma}.json"
                 if _out.exists() and not args.force:
                     continue
-                if tau == 0.0:
-                    y_tr_noisy = y_tr_int
-                else:
-                    y_tr_noisy = _flip_multiclass(y_tr_int, n_cls, tau, rng)
-                mlp2 = _make_mlp(seed=args.seed)
-                mlp2.fit(X_tr_sc, y_tr_noisy)
-                preds = mlp2.predict(X_te_sc)
+                X_te_blur      = _blur_images(X_te_raw, blur_sigma)
+                X_te_blur_proj = _extract_projections(byol, X_te_blur, device, args.batch_size)
+                X_te_blur_sc   = scaler.transform(X_te_blur_proj)
+                preds, _ = predict_mlp(mlp_clean, X_te_blur_sc)
                 result = {
                     "model_type": "byol_mlp",
                     "sw": sw,
                     "fold": fold_k,
                     "label_set": args.label_set,
-                    "noise_type": "label",
-                    "noise_level": tau,
+                    "noise_type": "resolution",
+                    "noise_level": blur_sigma,
                     **_metrics(y_te_int, preds, class_names),
                 }
                 with open(_out, "w") as fh:
                     json.dump(result, fh)
-            print(f"    label noise done", flush=True)
+            print(f"    resolution noise done", flush=True)
 
         # ==================================================================
         # Finetuned
@@ -371,13 +345,6 @@ def main():
 
             print(f"  [finetuned] sw={sw_s}", flush=True)
             model = _load_full_model(pt_path, device, backbone_bn_train=True)
-
-            # Clean backbone features (for label noise LR) — use [0,255] inputs
-            X_tr_feats = _extract_backbone_features(model, X_tr_raw_255, device, args.batch_size)
-            X_te_feats = _extract_backbone_features(model, X_te_raw_255, device, args.batch_size)
-            scaler_feats = StandardScaler()
-            X_tr_feats_sc = scaler_feats.fit_transform(X_tr_feats)
-            X_te_feats_sc = scaler_feats.transform(X_te_feats)
 
             # ── Image noise ─────────────────────────────────────────────
             for sigma in args.img_sigmas:
@@ -404,30 +371,26 @@ def main():
                     json.dump(result, fh)
             print(f"    image noise done", flush=True)
 
-            # ── Label noise ─────────────────────────────────────────────
-            for tau in args.label_noise:
-                _out = lbl_noise_dir / f"finetuned_sw{sw_s}_fold{fold_k}_tau{tau}.json"
+            # ── Resolution noise (Gaussian PSF blur) ─────────────────────
+            for blur_sigma in args.blur_sigmas:
+                _out = res_noise_dir / f"finetuned_sw{sw_s}_fold{fold_k}_blur{blur_sigma}.json"
                 if _out.exists() and not args.force:
                     continue
-                if tau == 0.0:
-                    y_tr_noisy = y_tr_int
-                else:
-                    y_tr_noisy = _flip_multiclass(y_tr_int, n_cls, tau, rng)
-                clf = LogisticRegression(max_iter=3000, C=1.0, random_state=args.seed)
-                clf.fit(X_tr_feats_sc, y_tr_noisy)
-                preds = clf.predict(X_te_feats_sc)
+                X_te_blur   = _blur_images(X_te_raw_255, blur_sigma)
+                logits_blur = _run_model_logits(model, X_te_blur, device, args.batch_size)
+                preds       = logits_blur.argmax(axis=1)
                 result = {
                     "model_type": "finetuned",
                     "sw": sw,
                     "fold": fold_k,
                     "label_set": args.label_set,
-                    "noise_type": "label",
-                    "noise_level": tau,
+                    "noise_type": "resolution",
+                    "noise_level": blur_sigma,
                     **_metrics(y_te_int, preds, class_names),
                 }
                 with open(_out, "w") as fh:
                     json.dump(result, fh)
-            print(f"    label noise done", flush=True)
+            print(f"    resolution noise done", flush=True)
 
         # ==================================================================
         # Supervised (no sw dimension)
@@ -439,16 +402,6 @@ def main():
         else:
             print(f"  [supervised] fold={fold_k}", flush=True)
             sup_model = _load_full_model(sup_pt_path, device)
-
-            X_tr_feats = _extract_backbone_features(
-                sup_model, X_tr_raw_255, device, args.batch_size
-            )
-            X_te_feats = _extract_backbone_features(
-                sup_model, X_te_raw_255, device, args.batch_size
-            )
-            scaler_sup = StandardScaler()
-            X_tr_feats_sc = scaler_sup.fit_transform(X_tr_feats)
-            X_te_feats_sc = scaler_sup.transform(X_te_feats)
 
             # ── Image noise ─────────────────────────────────────────────
             for sigma in args.img_sigmas:
@@ -475,30 +428,26 @@ def main():
                     json.dump(result, fh)
             print(f"    image noise done", flush=True)
 
-            # ── Label noise ─────────────────────────────────────────────
-            for tau in args.label_noise:
-                _out = lbl_noise_dir / f"supervised_swnone_fold{fold_k}_tau{tau}.json"
+            # ── Resolution noise (Gaussian PSF blur) ─────────────────────
+            for blur_sigma in args.blur_sigmas:
+                _out = res_noise_dir / f"supervised_swnone_fold{fold_k}_blur{blur_sigma}.json"
                 if _out.exists() and not args.force:
                     continue
-                if tau == 0.0:
-                    y_tr_noisy = y_tr_int
-                else:
-                    y_tr_noisy = _flip_multiclass(y_tr_int, n_cls, tau, rng)
-                clf = LogisticRegression(max_iter=3000, C=1.0, random_state=args.seed)
-                clf.fit(X_tr_feats_sc, y_tr_noisy)
-                preds = clf.predict(X_te_feats_sc)
+                X_te_blur   = _blur_images(X_te_raw_255, blur_sigma)
+                logits_blur = _run_model_logits(sup_model, X_te_blur, device, args.batch_size)
+                preds       = logits_blur.argmax(axis=1)
                 result = {
                     "model_type": "supervised",
                     "sw": None,
                     "fold": fold_k,
                     "label_set": args.label_set,
-                    "noise_type": "label",
-                    "noise_level": tau,
+                    "noise_type": "resolution",
+                    "noise_level": blur_sigma,
                     **_metrics(y_te_int, preds, class_names),
                 }
                 with open(_out, "w") as fh:
                     json.dump(result, fh)
-            print(f"    label noise done", flush=True)
+            print(f"    resolution noise done", flush=True)
 
     print("\nDone.")
 
