@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --account=sk036
 #SBATCH --mail-type=END
 #SBATCH --mail-user=markus.bredberg@epfl.ch
@@ -27,6 +27,7 @@ python /users/mbredber/p3_SUPLAT/scripts/noise_robustness_image_label.py \
     --sw_vals      0.0 0.05 0.1 \
     --img_sigmas   0.0 0.1 0.25 0.5 1.0 2.0 \
     --blur_sigmas  0.0 1.0 2.0 4.0 6.0 10.0 \
+    --occlusion_sizes 0.0 10.0 20.0 30.0 45.0 60.0 \
     --data_seed    2 \
     --training_seed 2 \
     --batch_size   256 \

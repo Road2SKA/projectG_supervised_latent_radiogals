@@ -15,6 +15,7 @@ Outputs
 -------
   <out_dir>/image_noise/{model_type}_sw{sw}_fold{k}_sigma{s}.json
   <out_dir>/resolution_noise/{model_type}_sw{sw}_fold{k}_blur{b}.json
+  <out_dir>/occlusion/{model_type}_sw{sw}_fold{k}_patch{p}.json
   For supervised (no sw): sw value is "none" in filename.
 
 Each JSON: model_type, sw, fold, label_set, noise_type, noise_level,
@@ -65,6 +66,31 @@ def _blur_images(images_arr, sigma_px):
     return np.stack([
         gaussian_filter(im, sigma=sigma_px) for im in images_arr
     ]).astype(np.float32)
+
+
+def _occlude_images(images_arr, patch_px, border_px=10):
+    """Replace a centered (patch_px, patch_px) square with each image's own
+    local background level (median of its outer `border_px`-wide ring).
+
+    Works on either the [0, 1] or [0, 255] scale since the median is
+    scale-equivariant — call with whichever array matches the model's
+    expected input range.
+    """
+    if patch_px <= 0:
+        return images_arr
+    n, h, w = images_arr.shape
+    patch_px = int(patch_px)
+    border_mask = np.ones((h, w), dtype=bool)
+    border_mask[border_px:h - border_px, border_px:w - border_px] = False
+    y0 = max((h - patch_px) // 2, 0)
+    x0 = max((w - patch_px) // 2, 0)
+    y1 = min(y0 + patch_px, h)
+    x1 = min(x0 + patch_px, w)
+    result = images_arr.copy()
+    for i in range(n):
+        bg = np.median(images_arr[i][border_mask])
+        result[i, y0:y1, x0:x1] = bg
+    return result.astype(np.float32)
 
 
 def _images_to_tensor(images_arr, device):
@@ -179,6 +205,12 @@ def main():
     parser.add_argument("--blur_sigmas", nargs="+", type=float,
                         default=[0.0, 1.0, 2.0, 4.0, 6.0, 10.0],
                         help="Gaussian blur kernel std, in pixels (images are 89x89).")
+    parser.add_argument("--occlusion_sizes", nargs="+", type=float,
+                        default=[0.0, 10.0, 20.0, 30.0, 45.0, 60.0],
+                        help="Centered square occlusion patch side length, in "
+                             "pixels (images are 89x89). Occluded region is "
+                             "filled with each image's own local background "
+                             "level (median of its outer border ring).")
     parser.add_argument("--data_seed",   type=int, default=2)
     parser.add_argument("--training_seed", type=int, default=2)
     parser.add_argument("--n_folds",     type=int, default=5)
@@ -200,8 +232,10 @@ def main():
     out_dir        = Path(args.out_dir)
     img_noise_dir  = out_dir / "image_noise"
     res_noise_dir  = out_dir / "resolution_noise"
+    occ_noise_dir  = out_dir / "occlusion"
     img_noise_dir.mkdir(parents=True, exist_ok=True)
     res_noise_dir.mkdir(parents=True, exist_ok=True)
+    occ_noise_dir.mkdir(parents=True, exist_ok=True)
 
     byol_runs_root   = outputs_root / "byol_runs"
     finetuned_root   = outputs_root / "classifiers" / "finetuned_sw_cv5" / "without_generative"
@@ -332,6 +366,28 @@ def main():
                     json.dump(result, fh)
             print(f"    resolution noise done", flush=True)
 
+            # ── Occlusion (centered patch, local-background fill) ────────
+            for patch_px in args.occlusion_sizes:
+                _out = occ_noise_dir / f"byol_mlp_sw{sw_s}_fold{fold_k}_patch{patch_px}.json"
+                if _out.exists() and not args.force:
+                    continue
+                X_te_occ      = _occlude_images(X_te_raw, patch_px)
+                X_te_occ_proj = _extract_projections(byol, X_te_occ, device, args.batch_size)
+                X_te_occ_sc   = scaler.transform(X_te_occ_proj)
+                preds, _ = predict_mlp(mlp_clean, X_te_occ_sc)
+                result = {
+                    "model_type": "byol_mlp",
+                    "sw": sw,
+                    "fold": fold_k,
+                    "label_set": args.label_set,
+                    "noise_type": "occlusion",
+                    "noise_level": patch_px,
+                    **_metrics(y_te_int, preds, class_names),
+                }
+                with open(_out, "w") as fh:
+                    json.dump(result, fh)
+            print(f"    occlusion done", flush=True)
+
         # ==================================================================
         # Finetuned
         # ==================================================================
@@ -392,6 +448,27 @@ def main():
                     json.dump(result, fh)
             print(f"    resolution noise done", flush=True)
 
+            # ── Occlusion (centered patch, local-background fill) ────────
+            for patch_px in args.occlusion_sizes:
+                _out = occ_noise_dir / f"finetuned_sw{sw_s}_fold{fold_k}_patch{patch_px}.json"
+                if _out.exists() and not args.force:
+                    continue
+                X_te_occ    = _occlude_images(X_te_raw_255, patch_px)
+                logits_occ  = _run_model_logits(model, X_te_occ, device, args.batch_size)
+                preds       = logits_occ.argmax(axis=1)
+                result = {
+                    "model_type": "finetuned",
+                    "sw": sw,
+                    "fold": fold_k,
+                    "label_set": args.label_set,
+                    "noise_type": "occlusion",
+                    "noise_level": patch_px,
+                    **_metrics(y_te_int, preds, class_names),
+                }
+                with open(_out, "w") as fh:
+                    json.dump(result, fh)
+            print(f"    occlusion done", flush=True)
+
         # ==================================================================
         # Supervised (no sw dimension)
         # ==================================================================
@@ -448,6 +525,27 @@ def main():
                 with open(_out, "w") as fh:
                     json.dump(result, fh)
             print(f"    resolution noise done", flush=True)
+
+            # ── Occlusion (centered patch, local-background fill) ────────
+            for patch_px in args.occlusion_sizes:
+                _out = occ_noise_dir / f"supervised_swnone_fold{fold_k}_patch{patch_px}.json"
+                if _out.exists() and not args.force:
+                    continue
+                X_te_occ    = _occlude_images(X_te_raw_255, patch_px)
+                logits_occ  = _run_model_logits(sup_model, X_te_occ, device, args.batch_size)
+                preds       = logits_occ.argmax(axis=1)
+                result = {
+                    "model_type": "supervised",
+                    "sw": None,
+                    "fold": fold_k,
+                    "label_set": args.label_set,
+                    "noise_type": "occlusion",
+                    "noise_level": patch_px,
+                    **_metrics(y_te_int, preds, class_names),
+                }
+                with open(_out, "w") as fh:
+                    json.dump(result, fh)
+            print(f"    occlusion done", flush=True)
 
     print("\nDone.")
 
