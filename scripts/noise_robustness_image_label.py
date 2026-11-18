@@ -11,9 +11,18 @@ evaluated against a corrupted test set (noisy images or blurred images).
 Resolution noise simulates PSF/angular-resolution degradation via Gaussian
 blur of the image (kernel std in pixels), rather than additive per-pixel noise.
 
+Image noise is run twice per model/sw/fold/sigma combo: once with plain
+i.i.d. white Gaussian noise ("image_noise/"), and once with the same noise
+amplitude spatially smoothed by a synthetic Gaussian beam ("image_noise_beam/",
+see `_beam_shaped_noise`) to approximate the spatially-correlated noise of a
+real interferometric synthesized beam, since no FITS/uv data is available to
+derive the true beam shape. Both are kept so the plain-white-noise results
+remain comparable to earlier runs.
+
 Outputs
 -------
   <out_dir>/image_noise/{model_type}_sw{sw}_fold{k}_sigma{s}.json
+  <out_dir>/image_noise_beam/{model_type}_sw{sw}_fold{k}_sigma{s}.json
   <out_dir>/resolution_noise/{model_type}_sw{sw}_fold{k}_blur{b}.json
   <out_dir>/occlusion/{model_type}_sw{sw}_fold{k}_patch{p}.json
   For supervised (no sw): sw value is "none" in filename.
@@ -66,6 +75,31 @@ def _blur_images(images_arr, sigma_px):
     return np.stack([
         gaussian_filter(im, sigma=sigma_px) for im in images_arr
     ]).astype(np.float32)
+
+
+def _beam_shaped_noise(shape, rng, beam_sigma_px, truncate=4.0):
+    """Unit-variance noise, spatially correlated to approximate a synthesized beam.
+
+    Real interferometric thermal noise is i.i.d. complex Gaussian in the
+    (Hermitian-symmetric) uv-plane, which after imaging becomes spatially
+    correlated real-valued noise shaped by the dirty beam/PSF. Without FITS
+    data we don't have the real beam, so this approximates it: draw white
+    noise per (H, W) image, smooth with an isotropic Gaussian kernel (the
+    assumed beam), then rescale by the kernel's exact variance-reduction
+    factor so the per-pixel variance stays 1 regardless of beam_sigma_px —
+    keeping `sigma * img_std` the controlling noise amplitude as before.
+    """
+    noise = rng.standard_normal(shape).astype(np.float32)
+    if beam_sigma_px == 0.0:
+        return noise
+    noise = gaussian_filter(noise, sigma=(0, beam_sigma_px, beam_sigma_px),
+                             truncate=truncate)
+    radius = int(truncate * beam_sigma_px + 0.5)
+    x = np.arange(-radius, radius + 1)
+    k1d = np.exp(-0.5 * (x / beam_sigma_px) ** 2)
+    k1d /= k1d.sum()
+    renorm = 1.0 / np.sum(k1d ** 2)
+    return (noise * renorm).astype(np.float32)
 
 
 def _occlude_images(images_arr, patch_px, border_px=10):
@@ -202,6 +236,11 @@ def main():
     parser.add_argument("--sw_vals",     nargs="+", type=float, default=[0.0, 0.05, 0.1])
     parser.add_argument("--img_sigmas",  nargs="+", type=float,
                         default=[0.0, 0.1, 0.25, 0.5, 1.0, 2.0])
+    parser.add_argument("--beam_sigma_px", type=float, default=1.0,
+                        help="Std (pixels) of the synthetic Gaussian beam used to "
+                             "spatially correlate the image noise, approximating a "
+                             "synthesized-beam PSF in the absence of real FITS/uv "
+                             "data. Set to 0 for plain i.i.d. white noise.")
     parser.add_argument("--blur_sigmas", nargs="+", type=float,
                         default=[0.0, 1.0, 2.0, 4.0, 6.0, 10.0],
                         help="Gaussian blur kernel std, in pixels (images are 89x89).")
@@ -231,9 +270,11 @@ def main():
     outputs_root   = Path(args.outputs_root)
     out_dir        = Path(args.out_dir)
     img_noise_dir  = out_dir / "image_noise"
+    beam_noise_dir = out_dir / "image_noise_beam"
     res_noise_dir  = out_dir / "resolution_noise"
     occ_noise_dir  = out_dir / "occlusion"
     img_noise_dir.mkdir(parents=True, exist_ok=True)
+    beam_noise_dir.mkdir(parents=True, exist_ok=True)
     res_noise_dir.mkdir(parents=True, exist_ok=True)
     occ_noise_dir.mkdir(parents=True, exist_ok=True)
 
@@ -344,6 +385,35 @@ def main():
                     json.dump(result, fh)
             print(f"    image noise done", flush=True)
 
+            # ── Image noise, beam-shaped (synthetic uv-plane approximation) ─
+            for sigma in args.img_sigmas:
+                _out = beam_noise_dir / f"byol_mlp_sw{sw_s}_fold{fold_k}_sigma{sigma}.json"
+                if _out.exists() and not args.force:
+                    continue
+                if sigma == 0.0:
+                    X_te_noisy_proj = X_te_proj
+                else:
+                    noise = _beam_shaped_noise(X_te_raw.shape, rng, args.beam_sigma_px)
+                    X_te_noisy = X_te_raw + sigma * img_std * noise
+                    X_te_noisy_proj = _extract_projections(
+                        byol, X_te_noisy, device, args.batch_size
+                    )
+                X_te_noisy_sc = scaler.transform(X_te_noisy_proj)
+                preds, _ = predict_mlp(mlp_clean, X_te_noisy_sc)
+                result = {
+                    "model_type": "byol_mlp",
+                    "sw": sw,
+                    "fold": fold_k,
+                    "label_set": args.label_set,
+                    "noise_type": "image_beam",
+                    "noise_level": sigma,
+                    "beam_sigma_px": args.beam_sigma_px,
+                    **_metrics(y_te_int, preds, class_names),
+                }
+                with open(_out, "w") as fh:
+                    json.dump(result, fh)
+            print(f"    image noise (beam) done", flush=True)
+
             # ── Resolution noise (Gaussian PSF blur) ─────────────────────
             for blur_sigma in args.blur_sigmas:
                 _out = res_noise_dir / f"byol_mlp_sw{sw_s}_fold{fold_k}_blur{blur_sigma}.json"
@@ -427,6 +497,32 @@ def main():
                     json.dump(result, fh)
             print(f"    image noise done", flush=True)
 
+            # ── Image noise, beam-shaped (synthetic uv-plane approximation) ─
+            for sigma in args.img_sigmas:
+                _out = beam_noise_dir / f"finetuned_sw{sw_s}_fold{fold_k}_sigma{sigma}.json"
+                if _out.exists() and not args.force:
+                    continue
+                if sigma == 0.0:
+                    X_te_input = X_te_raw_255
+                else:
+                    noise = _beam_shaped_noise(X_te_raw_255.shape, rng, args.beam_sigma_px)
+                    X_te_input = X_te_raw_255 + sigma * img_std_255 * noise
+                logits = _run_model_logits(model, X_te_input, device, args.batch_size)
+                preds  = logits.argmax(axis=1)
+                result = {
+                    "model_type": "finetuned",
+                    "sw": sw,
+                    "fold": fold_k,
+                    "label_set": args.label_set,
+                    "noise_type": "image_beam",
+                    "noise_level": sigma,
+                    "beam_sigma_px": args.beam_sigma_px,
+                    **_metrics(y_te_int, preds, class_names),
+                }
+                with open(_out, "w") as fh:
+                    json.dump(result, fh)
+            print(f"    image noise (beam) done", flush=True)
+
             # ── Resolution noise (Gaussian PSF blur) ─────────────────────
             for blur_sigma in args.blur_sigmas:
                 _out = res_noise_dir / f"finetuned_sw{sw_s}_fold{fold_k}_blur{blur_sigma}.json"
@@ -504,6 +600,32 @@ def main():
                 with open(_out, "w") as fh:
                     json.dump(result, fh)
             print(f"    image noise done", flush=True)
+
+            # ── Image noise, beam-shaped (synthetic uv-plane approximation) ─
+            for sigma in args.img_sigmas:
+                _out = beam_noise_dir / f"supervised_swnone_fold{fold_k}_sigma{sigma}.json"
+                if _out.exists() and not args.force:
+                    continue
+                if sigma == 0.0:
+                    X_te_input = X_te_raw_255
+                else:
+                    noise = _beam_shaped_noise(X_te_raw_255.shape, rng, args.beam_sigma_px)
+                    X_te_input = X_te_raw_255 + sigma * img_std_255 * noise
+                logits = _run_model_logits(sup_model, X_te_input, device, args.batch_size)
+                preds  = logits.argmax(axis=1)
+                result = {
+                    "model_type": "supervised",
+                    "sw": None,
+                    "fold": fold_k,
+                    "label_set": args.label_set,
+                    "noise_type": "image_beam",
+                    "noise_level": sigma,
+                    "beam_sigma_px": args.beam_sigma_px,
+                    **_metrics(y_te_int, preds, class_names),
+                }
+                with open(_out, "w") as fh:
+                    json.dump(result, fh)
+            print(f"    image noise (beam) done", flush=True)
 
             # ── Resolution noise (Gaussian PSF blur) ─────────────────────
             for blur_sigma in args.blur_sigmas:

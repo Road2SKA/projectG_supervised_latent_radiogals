@@ -1,0 +1,55 @@
+\begin{table*}[ht]
+\centering
+\caption{Training hyperparameters for the four model families, as configured for the
+$w_{\rm sup}\in\{0,0.05,0.1,0.5,1,10\}$, five-fold cross-validation runs with a 128-d
+projector. Dashes (--) mark hyperparameters that do not apply to a given model.}
+\label{tab:hyperparams}
+\begin{tabular}{lcccc}
+\toprule
+ & LI-BYOL & MLP & Finetuned & Supervised \\
+\midrule
+Optimiser                     & Adam                        & Adam\tablefootmark{a}            & AdamW                        & AdamW \\
+Learning rate                 & $3\times10^{-4}$            & $10^{-3}$                        & $10^{-2}$                    & $10^{-3}$ \\
+Weight decay / L2              & $10^{-3}$                  & $10^{-4}$                        & $3\times10^{-1}$             & $10^{-4}$\tablefootmark{b} \\
+Scheduler                     & constant (no decay)        & n/a\tablefootmark{a}             & plateau (0.5, 5)\tablefootmark{b} & plateau (0.5, 5)\tablefootmark{b} \\
+Epochs                        & 300 (fixed)\tablefootmark{c} & early stop (max 500, patience 15) & 40 (fixed)\tablefootmark{d}  & 20 (fixed)\tablefootmark{d} \\
+Batch size                    & 512                         & $\min(200,N)$\tablefootmark{e}   & 256\tablefootmark{e}         & 64 \\
+Dropout                       & 0.2\tablefootmark{e}        & --                                & 0.2                          & 0.2\tablefootmark{b} \\
+Validation / patience          & --\tablefootmark{c}        & 20\,\% / 15                      & --\tablefootmark{d}          & --\tablefootmark{d} \\
+EMA $\tau$                    & 0.996 (constant)           & --                                & --                           & -- \\
+Projector dim (in$\to$hidden$\to$out) & $1280\to4\,096\tablefootmark{e}\to128$ & -- & $1280\to4\,096\to128$\tablefootmark{f} & -- \\
+Predictor dim (in$\to$hidden$\to$out) & $128\to4\,096\tablefootmark{e}\to128$  & -- & -- & -- \\
+VICReg ($\alpha_{\rm var}$, $\alpha_{\rm cov}$, $\gamma$) & (2.0,\ 0.2,\ 0.25) & -- & -- & -- \\
+Loss                           & BYOL sym.\ MSE + VICReg\tablefootmark{g} & cross-entropy\tablefootmark{h} & weighted BCE\tablefootmark{i} & cross-entropy \\
+\bottomrule
+\end{tabular}
+\tablefoot{
+All values read from the saved \texttt{configuration\_log.txt} / checkpoint configs and
+launch scripts for the $w_{\rm sup}\in\{0,0.05,0.1,0.5,1,10\}$ sweep (five-fold CV,
+data/training seed 2, projector dim 128); identical across all six $w_{\rm sup}$ values
+except $w_{\rm sup}$ itself.
+\tablefoottext{a}{\texttt{scikit-learn} \texttt{MLPClassifier(solver='adam')}; the
+\texttt{learning\_rate} schedule argument is not used by the \texttt{adam} solver.}
+\tablefoottext{b}{Hard-coded in the training script; not exposed as a command-line option.}
+\tablefoottext{c}{Five-fold CV folds the held-out images into the unsupervised training
+pool, so there is no validation split or early-stopping rule; the saved checkpoint is
+always the last-epoch model.}
+\tablefoottext{d}{The early-stopping flag was not passed in any of the sw-sweep launch
+scripts, so training always runs the fixed epoch budget; the validation-fraction/patience
+code path exists but was unused for these runs.}
+\tablefoottext{e}{Left at the training script's (or library's) default; not set explicitly
+in the launch command.}
+\tablefoottext{f}{Training mode 2 (``finetuning''): encoder frozen; the same
+$1280\to4\,096\to128$ projector is unfrozen and retrained jointly with the linear head.}
+\tablefoottext{g}{Symmetric BYOL MSE on the augmentation pair and, when $w_{\rm sup}>0$,
+the friend pair, combined as $(L_{\rm aug}+w_{\rm sup}L_{\rm friend})/(1+w_{\rm sup})$, plus
+$\alpha_{\rm var}\mathcal{L}_{\rm var}+\alpha_{\rm cov}\mathcal{L}_{\rm cov}$ computed on the
+\emph{online} projector's outputs for the augmentation pair (both views of every image in
+the batch, labelled and unlabelled).}
+\tablefoottext{h}{\texttt{initial\_pure} is single-label, 5-class; both the
+\texttt{scikit-learn} and \texttt{PyTorch} MLP heads use softmax cross-entropy.}
+\tablefoottext{i}{Class/tier-weighted \texttt{BCEWithLogitsLoss} is used even for the
+single-label \texttt{initial\_pure} set (one-hot targets treated as independent binary
+targets) -- unlike the Supervised and MLP columns, which use true softmax cross-entropy.}
+}
+\end{table*}
