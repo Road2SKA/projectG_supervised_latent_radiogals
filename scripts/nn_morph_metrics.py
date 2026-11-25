@@ -44,7 +44,7 @@ import cv2                                          # OpenCV, for Hu moments
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as mgs
 import numpy as np
-from scipy.stats import wilcoxon                   # non-parametric paired test
+from scipy.stats import wilcoxon, gaussian_kde      # non-parametric paired test; KDE for ridgeline plot
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from skimage.metrics import structural_similarity  # SSIM
@@ -54,7 +54,7 @@ C_BYOL   = "#2196F3"   # blue
 C_RANDOM = "#FF7043"   # red-orange
 C_PCA    = "#43A047"   # green
 COLORS   = [C_BYOL, C_RANDOM, C_PCA]
-LABELS   = ["BYOL NN", "Random", "PCA NN"]
+LABELS   = ["BYOL", "Random", "PCA"]
 
 # Metrics where HIGHER = more similar (displayed as-is)
 # Metrics where LOWER  = more similar (displayed with a note)
@@ -69,6 +69,10 @@ METRIC_LABELS = [
     "Cosine dist ↓",
 ]
 N_METRICS = len(METRIC_KEYS)
+
+# Keys where lower = more similar; sign-flipped in fig1 so "better" is always
+# to the right, matching the higher-is-better metrics.
+FLIP_KEYS = {"hu_dist", "ell_diff", "conc_diff", "cos_dist"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,58 +358,74 @@ def pval_str(p):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fig1_distributions(metrics_byol, metrics_rand, metrics_pca, out_path):
-    """One panel per metric: overlaid violin plots for BYOL / Random / PCA.
-    Medians are marked. Each panel is annotated with the Wilcoxon p-value
-    and rank-biserial effect size (BYOL vs Random)."""
-    n_cols = 4
-    n_rows = (N_METRICS + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols,
-                             figsize=(n_cols * 3.5, n_rows * 3.2))
-    axes_flat = axes.flatten()
+    """One row of panels, one per metric, sharing a single y-axis.
+    Each condition (BYOL / Random / PCA) is drawn as a horizontal density
+    curve with a flat baseline stacked top-to-bottom, ridgeline-style, rather
+    than a mirrored violin. Medians are marked. Each panel is annotated with
+    the Wilcoxon p-value and rank-biserial effect size (BYOL vs Random)."""
+    # cos_dist is excluded here (shown separately in fig2, and is only
+    # meaningful for the BYOL condition, not Random/PCA).
+    plot_keys   = [k for k in METRIC_KEYS if k != "cos_dist"]
+    plot_labels = [l for k, l in zip(METRIC_KEYS, METRIC_LABELS) if k != "cos_dist"]
+    n_panels    = len(plot_keys)
 
-    for ai, (key, label) in enumerate(zip(METRIC_KEYS, METRIC_LABELS)):
-        ax = axes_flat[ai]
-        all_data = [
-            metrics_byol[key][np.isfinite(metrics_byol[key])],
-            metrics_rand[key][np.isfinite(metrics_rand[key])],
-            metrics_pca [key][np.isfinite(metrics_pca [key])],
+    fig, axes = plt.subplots(1, n_panels, figsize=(n_panels * 3.6, 4.4),
+                             sharey=True)
+
+    y_pos       = [3, 2, 1]   # BYOL on top, PCA on bottom
+    row_height  = 0.8         # density peak height, in y-axis units
+
+    for ai, (key, label) in enumerate(zip(plot_keys, plot_labels)):
+        ax = axes[ai]
+        sign  = -1.0 if key in FLIP_KEYS else 1.0
+        disp_label = "−" + label.replace(" ↓", "") if sign < 0 else label.replace(" ↑", "")
+        datasets = [
+            sign * metrics_byol[key][np.isfinite(metrics_byol[key])],
+            sign * metrics_rand[key][np.isfinite(metrics_rand[key])],
+            sign * metrics_pca [key][np.isfinite(metrics_pca [key])],
         ]
-        positions  = [p for p, d in zip([1, 2, 3], all_data) if len(d) > 1]
-        data_sets  = [d for d in all_data if len(d) > 1]
-        plot_cols  = [c for c, d in zip(COLORS, all_data) if len(d) > 1]
-        if not data_sets:
-            ax.set_title(label + " (no data)", fontsize=10)
+        if all(len(d) < 2 for d in datasets):
+            ax.set_title(disp_label + " (no data)", fontsize=16)
             continue
-        parts = ax.violinplot(data_sets, positions=positions,
-                              showmedians=True, showextrema=False)
-        for pc, col in zip(parts["bodies"], plot_cols):
-            pc.set_facecolor(col)
-            pc.set_alpha(0.6)
-        parts["cmedians"].set_color("black")
-        parts["cmedians"].set_linewidth(2)
 
-        ax.set_xticks([1, 2, 3])
-        ax.set_xticklabels(LABELS, fontsize=9)
-        ax.set_title(label, fontsize=10)
-        ax.grid(axis="y", alpha=0.3)
+        for y, d, col in zip(y_pos, datasets, COLORS):
+            if len(d) < 2:
+                continue
+            try:
+                kde     = gaussian_kde(d)
+                x_grid  = np.linspace(d.min(), d.max(), 200)
+                density = kde(x_grid)
+                density = density / density.max() * row_height
+                ax.fill_between(x_grid, y, y + density, color=col, alpha=0.6, linewidth=0)
+                ax.plot(x_grid, y + density, color=col, lw=1)
+            except np.linalg.LinAlgError:
+                pass   # degenerate (near-zero variance) data: skip the curve
+            ax.plot([np.median(d)], [y], marker="|", color="black",
+                    markersize=10, markeredgewidth=1.5)
+
+        ax.set_title(disp_label, fontsize=16)
+        ax.grid(axis="x", alpha=0.3)
+        ax.set_ylim(0.9, 4.2)
+        ax.tick_params(axis="x", labelsize=13)
 
         # Annotate with Wilcoxon (BYOL vs Random) and effect size
-        p, r = wilcoxon_effect(metrics_byol[key], metrics_rand[key])
+        p, r = wilcoxon_effect(sign * metrics_byol[key], sign * metrics_rand[key])
         ax.text(0.97, 0.97,
                 f"BYOL vs Rand\n{pval_str(p)}, r={r:+.2f}",
-                transform=ax.transAxes, fontsize=7,
+                transform=ax.transAxes, fontsize=13,
                 ha="right", va="top",
                 bbox=dict(facecolor="white", alpha=0.7, pad=2, linewidth=0))
 
-    # Hide unused panels
-    for ax in axes_flat[N_METRICS:]:
-        ax.set_visible(False)
+    axes[0].set_yticks(y_pos)
+    axes[0].set_yticklabels(LABELS, fontsize=15)
+    for ax in axes[1:]:
+        ax.tick_params(labelleft=False)
 
-    fig.suptitle("Morphology metric distributions for 2-NN pairs", fontsize=12)
     fig.tight_layout()
+    fig.subplots_adjust(wspace=0.08)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
     print(f"Saved {out_path}")
+    return fig
 
 
 def fig2_ssim_vs_cosdist(metrics_byol, out_path):
@@ -427,12 +447,12 @@ def fig2_ssim_vs_cosdist(metrics_byol, out_path):
 
     ax.set_xlabel("Mean cosine distance (embedding)", fontsize=11)
     ax.set_ylabel("Mean SSIM (best dihedral)", fontsize=11)
-    ax.set_title("SSIM vs embedding distance — BYOL 2-NN", fontsize=11)
+    ax.set_title("SSIM vs embedding distance — BYOL", fontsize=11)
     ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
     print(f"Saved {out_path}")
+    return fig
 
 
 def fig3_extremes(test_imgs, nn_idxs_byol, metrics_byol, out_path, n_show=10):
@@ -464,14 +484,14 @@ def fig3_extremes(test_imgs, nn_idxs_byol, metrics_byol, out_path, n_show=10):
             ax.imshow(test_imgs[qi], cmap="viridis", origin="lower")
             ax.set_xticks([]); ax.set_yticks([])
             if col == 0:
-                ax.set_ylabel("Query", fontsize=7)
+                ax.set_ylabel("Query", fontsize=10)
             if half == 0 and col == n_show // 2:
-                ax.set_title(title, fontsize=9, pad=4)
+                ax.set_title(title, fontsize=13, pad=4)
             elif half == 1 and col == n_show // 2:
-                ax.set_title(title, fontsize=9, pad=4)
+                ax.set_title(title, fontsize=13, pad=4)
             ssim_v = float(ssim_vals[qi])
             ax.text(0.02, 0.98, f"{ssim_v:.2f}",
-                    transform=ax.transAxes, fontsize=6,
+                    transform=ax.transAxes, fontsize=9,
                     color="white", va="top", ha="left",
                     bbox=dict(facecolor="black", alpha=0.45, pad=1, linewidth=0))
 
@@ -482,11 +502,11 @@ def fig3_extremes(test_imgs, nn_idxs_byol, metrics_byol, out_path, n_show=10):
                 ax2.imshow(test_imgs[ni], cmap="viridis", origin="lower")
                 ax2.set_xticks([]); ax2.set_yticks([])
                 if col == 0:
-                    ax2.set_ylabel(f"NN{row}", fontsize=7)
+                    ax2.set_ylabel(f"{row}", fontsize=10)
 
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
     print(f"Saved {out_path}")
+    return fig
 
 
 def fig4_cdf(metrics_byol, metrics_rand, metrics_pca, out_path):
@@ -512,8 +532,8 @@ def fig4_cdf(metrics_byol, metrics_rand, metrics_pca, out_path):
     ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
     print(f"Saved {out_path}")
+    return fig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -579,14 +599,14 @@ def main():
     m_pca  = compute_all_metrics(test_imgs, nn_idxs_pca,  None,        desc="PCA ")
 
     # ── Figures ───────────────────────────────────────────────────────────────
-    fig1_distributions(m_byol, m_rand, m_pca,
-                       figures_dir / "fig1_metric_distributions.png")
-    fig2_ssim_vs_cosdist(m_byol,
-                         figures_dir / "fig2_ssim_vs_embedding_distance.png")
-    fig3_extremes(test_imgs, nn_idxs_byol, m_byol,
-                  figures_dir / "fig3_extremes.png")
-    fig4_cdf(m_byol, m_rand, m_pca,
-             figures_dir / "fig4_cdf.png")
+    plt.close(fig1_distributions(m_byol, m_rand, m_pca,
+                       figures_dir / "fig1_metric_distributions.png"))
+    plt.close(fig2_ssim_vs_cosdist(m_byol,
+                         figures_dir / "fig2_ssim_vs_embedding_distance.png"))
+    plt.close(fig3_extremes(test_imgs, nn_idxs_byol, m_byol,
+                  figures_dir / "fig3_extremes.png"))
+    plt.close(fig4_cdf(m_byol, m_rand, m_pca,
+             figures_dir / "fig4_cdf.png"))
 
     print_summary(m_byol, m_rand, m_pca)
     print(f"\nAll figures written to: {figures_dir.resolve()}/")
